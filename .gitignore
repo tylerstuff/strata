@@ -1,0 +1,35 @@
+# Local system and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# JavaScript build and dependency output
+node_modules/
+.pnpm-store/
+dist/
+build/
+coverage/
+.cache/
+.turbo/
+*.tsbuildinfo
+
+# Rust and generated WASM bindings
+target/
+pkg/
+
+# Browser-test output
+playwright-report/
+test-results/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local logs and scratch files
+*.log
+tmp/
+.tmp/

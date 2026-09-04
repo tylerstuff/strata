@@ -1,0 +1,36 @@
+name: Development task
+description: Define an implementation or feasibility task with measurable completion criteria.
+labels: ["type:task"]
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What should a user or developer be able to do after this task?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Describe the intended change and any important boundaries.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List observable conditions for completing this task.
+      placeholder: "- [ ] ..."
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Link prerequisite issues and unresolved decisions.
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation and performance evidence
+      description: Describe checks or experiments. Rendering results should identify hardware, browser, resolution, and scene.
