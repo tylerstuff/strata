@@ -2,7 +2,21 @@
 
 Strata is a browser game engine being designed for high-quality real-time graphics through a simple JavaScript/TypeScript package.
 
-**Status: project initialization.** This repository records the architecture and development workflow. There is no implemented engine, runnable demo, published npm package, or measured performance result yet.
+**Status: runtime foundation.** The first package initializes WebGPU and a Rust/WASM worker, draws a clear frame, resizes, and disposes cleanly. Scene rendering, virtualized geometry, lighting, and the editor are still planned. No npm package has been published and no performance target has been demonstrated.
+
+## Try the foundation
+
+With Node.js 22.13+ and rustup installed:
+
+```sh
+npm ci
+npm run build
+npm run example
+```
+
+Open `http://127.0.0.1:4173` in a browser with WebGPU. The example uses the built package directly; it needs no cross-origin-isolation headers. To create an archive for another website, run `npm pack --workspace @strata-engine/core` after building. Consumers receive precompiled WASM and need no Rust tools.
+
+See [the runtime guide](docs/runtime.md) for the API, packaging, ownership, device loss, and validation commands. The API is experimental; TypeScript declarations currently target TypeScript 7+.
 
 ## Product requirements
 
@@ -32,7 +46,7 @@ Read [the architecture brief](docs/architecture.md) for the design boundaries an
 2. **M2 — Rendering feasibility:** a conventional renderer and measured geometry, lighting, and reflection prototypes.
 3. **M3 — Editor prototype:** an editor that consumes the runtime through supported APIs.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue and pull-request workflow. Build and installation instructions will be added when the runtime foundation exists.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue, pull-request, and validation workflow.
 
 ## Repository
 

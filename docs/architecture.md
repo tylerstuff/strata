@@ -1,6 +1,6 @@
 # Strata architecture
 
-Status: accepted direction; implementation and performance remain to be demonstrated.
+Status: accepted direction. The lifecycle and package foundation is implemented; rendering systems and performance remain to be demonstrated. See [the runtime guide](runtime.md) for the current implementation boundary.
 
 ## Product boundary
 

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Strata · Runtime foundation</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #101217; color: #e6eaf2; }
+      body { margin: 0 auto; max-width: 1000px; padding: 40px 24px; }
+      h1 { margin: 0; font-size: 38px; letter-spacing: -1.5px; }
+      p { color: #aeb8c9; line-height: 1.6; }
+      .eyebrow { text-transform: uppercase; letter-spacing: 2px; color: #8be3bf; font-size: 12px; }
+      canvas { display: block; width: 100%; aspect-ratio: 16 / 9; background: #161c29; border: 1px solid #303744; border-radius: 12px; }
+      .controls { display: flex; gap: 12px; margin: 20px 0; }
+      button { border: 1px solid #52606f; background: #242e3b; color: inherit; font: inherit; padding: 10px 16px; border-radius: 7px; cursor: pointer; }
+      button:disabled { opacity: .4; cursor: default; }
+      output { display: block; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 13px; line-height: 1.7; }
+    </style>
+  </head>
+  <body>
+    <p class="eyebrow">Strata / First runtime</p>
+    <h1>A browser engine starts here.</h1>
+    <p>This canvas exercises WebGPU, a Rust/WASM worker, resizing, and cleanup. It draws a clear frame; scene rendering and lighting come next.</p>
+    <canvas width="960" height="540" aria-label="Strata WebGPU clear frame"></canvas>
+    <div class="controls">
+      <button id="initialize" disabled>Initialize</button>
+      <button id="dispose" disabled>Dispose</button>
+    </div>
+    <output role="status">Initializing…</output>
+    <script type="module">
+      import { createEngine } from '../../packages/core/dist/index.js';
+
+      const canvas = document.querySelector('canvas');
+      const initializeButton = document.querySelector('#initialize');
+      const disposeButton = document.querySelector('#dispose');
+      const output = document.querySelector('output');
+      let engine;
+
+      function draw() {
+        if (engine?.state !== 'ready') return;
+        const ratio = window.devicePixelRatio || 1;
+        const limit = engine.info.maxTextureDimension2D;
+        engine.resize(Math.min(limit, Math.max(1, Math.round(canvas.clientWidth * ratio))), Math.min(limit, Math.max(1, Math.round(canvas.clientHeight * ratio))));
+        engine.render();
+      }
+
+      async function initialize() {
+        initializeButton.disabled = true;
+        output.textContent = 'Initializing WebGPU and Rust/WASM…';
+        try {
+          engine = await createEngine({ canvas });
+          draw();
+          disposeButton.disabled = false;
+          output.textContent = `State: ${engine.state}\nCanvas: ${canvas.width} × ${canvas.height}\nWASM ABI: ${engine.info.cpu.abiVersion}\nWASM linear memory: ${engine.info.cpu.memoryBytes.toLocaleString()} bytes\nCross-origin isolated: ${crossOriginIsolated}`;
+        } catch (error) {
+          output.textContent = `${error.code ?? error.name}: ${error.message}`;
+          initializeButton.disabled = false;
+        }
+      }
+
+      function dispose() {
+        engine?.dispose();
+        output.textContent = 'Disposed. GPU and worker resources have been released.';
+        initializeButton.disabled = false;
+        disposeButton.disabled = true;
+      }
+
+      initializeButton.addEventListener('click', initialize);
+      disposeButton.addEventListener('click', dispose);
+      window.addEventListener('resize', draw);
+      window.addEventListener('pagehide', () => engine?.dispose());
+      initialize();
+    </script>
+  </body>
+</html>

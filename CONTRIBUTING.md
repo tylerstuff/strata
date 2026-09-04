@@ -20,7 +20,14 @@ Keep generated assets, secrets, and local build outputs out of commits. Commit d
 
 ## Validation
 
-Run checks appropriate to the change. The first runtime task will establish build, type-check, unit-test, package-consumer, and CI commands; none exist yet.
+Run checks appropriate to the change. Install dependencies with `npm ci`; rustup installs the pinned toolchain from `rust-toolchain.toml`. The complete runtime checks are:
+
+```sh
+npx playwright install chromium
+npm run check
+```
+
+Individual commands are `npm run typecheck`, `npm run test:rust`, `npm run test:unit`, `npm run build`, and `npm run test:consumers`. Unit tests build the actual WASM module; packed consumer tests need an existing package build. If the Playwright browser download is unavailable, a locally installed Chrome can be selected with `STRATA_TEST_BROWSER_CHANNEL=chrome npm run check`. GitHub Actions runs the same checks with an explicitly selected software WebGPU adapter for functional validation.
 
 For performance-sensitive changes, record the device/GPU, OS, browser version, power conditions, internal rendering resolution, scene, camera path, warm-up, and measurement method. Distinguish CPU and GPU timings, include memory and startup costs where relevant, and test sustained moving scenes rather than only static screenshots. Describe target frame rates as targets until measured.
 

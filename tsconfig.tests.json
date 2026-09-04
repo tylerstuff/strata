@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "skipLibCheck": true
+  },
+  "include": ["packages/core/src/**/*.ts", "tests/unit/**/*.ts", "vitest.config.ts"]
+}
