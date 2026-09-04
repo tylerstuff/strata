@@ -165,7 +165,7 @@ async function checkConsumer(kind, url) {
     await page.evaluate(() => strataTest.dispose());
     assert.deepEqual(errors, [], 'Consumer should not produce uncaught browser errors');
     console.log(`${kind}: packed WASM initialization, rendering, resize, repeated disposal, load failure, timeout, cancellation, and recovery passed`);
-    return { kind, adapter, softwareGpu, browser: browser.version() };
+    return { kind, adapter, softwareGpu, browser: browser.version(), platform: process.platform, headed: process.env.STRATA_TEST_HEADED === '1' };
   } finally {
     await context.close();
   }
@@ -218,9 +218,15 @@ try {
   const viteServer = await serveConsumer(join(vite, 'dist'));
   servers.push(viteServer);
   const args = ['--enable-unsafe-webgpu'];
-  if (softwareGpu) args.push('--use-angle=swiftshader', '--enable-unsafe-swiftshader');
+  if (softwareGpu && process.platform === 'linux') {
+    // Keep WebGPU and canvas composition on the same software Vulkan backend.
+    args.push('--enable-features=Vulkan', '--use-angle=vulkan', '--use-vulkan=swiftshader',
+      '--use-webgpu-adapter=swiftshader', '--disable-vulkan-surface');
+  } else if (softwareGpu) {
+    args.push('--use-angle=swiftshader', '--enable-unsafe-swiftshader');
+  }
   browser = await chromium.launch({
-    headless: true,
+    headless: process.env.STRATA_TEST_HEADED !== '1',
     args,
     channel: process.env.STRATA_TEST_BROWSER_CHANNEL ?? 'chromium',
   });

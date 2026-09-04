@@ -34,3 +34,6 @@ test-results/
 *.log
 tmp/
 .tmp/
+
+# External benchmark collection; never copy it into the repository.
+Strata-Benchmark-Assets/

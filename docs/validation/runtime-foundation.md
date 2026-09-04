@@ -37,6 +37,6 @@ STRATA_TEST_BROWSER_CHANNEL=chrome npm run test:consumers
 STRATA_TEST_BROWSER_CHANNEL=chrome STRATA_TEST_SOFTWARE_GPU=1 npm run test:consumers
 ```
 
-The Playwright-managed browser download timed out locally. Installed Chrome was selected explicitly instead. GitHub Actions installs its own Chromium and selects software WebGPU for functional checks.
+The Playwright-managed browser download timed out locally. Installed Chrome was selected explicitly instead. GitHub Actions installs its own Chromium and selects software Vulkan/WebGPU with a virtual Xvfb display for functional checks. The image check captures the presented canvas, keeps its screenshot as evidence, and checks the expected clear color and dimensions.
 
 Screenshots and environment JSON are generated under `test-results/` and are not committed. The CI workflow uploads consumer artifacts. These correctness tests do not measure rendering performance, establish a minimum laptop GPU, or validate the 60 FPS/visual-quality targets; those require the later benchmark and rendering tasks.

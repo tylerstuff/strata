@@ -76,7 +76,7 @@ npm run check
 
 The checks cover type declarations, Rust formatting/Clippy/tests, actual WASM loading, browser/worker lifecycle and failure cleanup, and installation of a packed archive into isolated plain HTML and Vite consumers. Consumer tests verify ordinary hosting without cross-origin isolation, worker termination, real WebGPU clear-frame pixels, and SSR import without touching browser globals.
 
-`npm run test:consumers` expects an existing build. It saves screenshots and browser/adapter details in `test-results/consumers/`. Linux CI explicitly uses a software WebGPU adapter with `STRATA_TEST_SOFTWARE_GPU=1`; that validates functionality, not hardware performance. Real performance measurement belongs to GitHub issue #2.
+`npm run test:consumers` expects an existing build. It saves screenshots and browser/adapter details in `test-results/consumers/`. Linux CI explicitly uses a software WebGPU adapter with `STRATA_TEST_SOFTWARE_GPU=1` and headed Chromium on an Xvfb virtual display for canvas presentation; that validates functionality, not hardware performance. Real performance measurement belongs to GitHub issue #2.
 
 If downloading the Playwright browser is unavailable, select installed Chrome with `STRATA_TEST_BROWSER_CHANNEL=chrome npm run check`. This uses a separate temporary browser profile.
 
