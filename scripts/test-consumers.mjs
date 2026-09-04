@@ -183,7 +183,7 @@ try {
   browser = await chromium.launch({
     headless: true,
     args,
-    ...(process.env.STRATA_TEST_BROWSER_CHANNEL ? { channel: process.env.STRATA_TEST_BROWSER_CHANNEL } : {}),
+    channel: process.env.STRATA_TEST_BROWSER_CHANNEL ?? 'chromium',
   });
 
   const results = [];
