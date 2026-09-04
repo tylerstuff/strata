@@ -2,6 +2,7 @@
 export function installHarness(createEngine) {
   const canvas = document.querySelector('canvas');
   let engine;
+  let animationFrame;
 
   const snapshot = () => ({
     state: engine.state,
@@ -41,16 +42,18 @@ export function installHarness(createEngine) {
       engine.resize(width, height);
       return snapshot();
     },
-    renderPixel() {
-      engine.render();
-      const readback = document.createElement('canvas');
-      readback.width = 1;
-      readback.height = 1;
-      const context = readback.getContext('2d');
-      context.drawImage(canvas, 0, 0, 1, 1);
-      return [...context.getImageData(0, 0, 1, 1).data];
+    startRendering() {
+      return new Promise((resolve) => {
+        const frame = () => {
+          engine.render();
+          animationFrame = requestAnimationFrame(frame);
+          resolve();
+        };
+        animationFrame = requestAnimationFrame(frame);
+      });
     },
     dispose() {
+      cancelAnimationFrame(animationFrame);
       engine.dispose();
       engine.dispose();
       return snapshot();

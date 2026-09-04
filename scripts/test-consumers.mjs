@@ -72,6 +72,40 @@ async function openConsumer(url, options = {}) {
   return { context, page, errors };
 }
 
+const expectedClearPixel = [10, 15, 23, 255];
+function isClearPixel(pixel) {
+  return pixel.every((channel, index) => Math.abs(channel - expectedClearPixel[index]) <= (index === 3 ? 0 : 2));
+}
+
+async function presentedCanvas(page) {
+  // Verify browser-composited output while frames render, rather than depending
+  // on an immediate cross-context Canvas2D snapshot of a WebGPU canvas.
+  // Allow a bounded wait for the first presented frame; incorrect colors still fail.
+  const deadline = Date.now() + 5_000;
+  let result;
+  do {
+    const png = await page.locator('canvas').screenshot({ timeout: 5_000 });
+    const decoded = await page.evaluate(async (base64) => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${base64}`;
+      await image.decode();
+      const sample = document.createElement('canvas');
+      sample.width = sample.height = 1;
+      const context = sample.getContext('2d');
+      context.drawImage(image, Math.floor(image.naturalWidth / 2), Math.floor(image.naturalHeight / 2), 1, 1, 0, 0, 1, 1);
+      return {
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        pixel: [...context.getImageData(0, 0, 1, 1).data],
+      };
+    }, png.toString('base64'));
+    result = { png, ...decoded };
+    if (isClearPixel(result.pixel)) break;
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+  } while (Date.now() < deadline);
+  return result;
+}
+
 async function checkConsumer(kind, url) {
   const { context, page, errors } = await openConsumer(url);
   try {
@@ -97,11 +131,16 @@ async function checkConsumer(kind, url) {
       const resized = await page.evaluate(() => strataTest.resize(128, 96));
       assert.equal(resized.width, 128);
       assert.equal(resized.height, 96);
-      const pixel = await page.evaluate(() => strataTest.renderPixel());
+      await page.evaluate(() => strataTest.startRendering());
+      const { pixel, width, height, png } = await presentedCanvas(page);
+      // Preserve the exact evidence used by the assertions, including failed runs.
+      if (cycle === 0 || !isClearPixel(pixel)) {
+        await writeFile(join(artifacts, `${kind}${artifactSuffix}.png`), png);
+      }
+      assert.equal(width, 128);
+      assert.equal(height, 96);
       assert.equal(pixel[3], 255, `Rendered canvas must be opaque: ${pixel}`);
-      assert.ok(pixel[0] > 0 && pixel[0] < pixel[1] && pixel[1] < pixel[2] && pixel[2] < 128,
-        `Expected the dark blue WebGPU clear color, got ${pixel}`);
-      if (cycle === 0) await page.screenshot({ path: join(artifacts, `${kind}${artifactSuffix}.png`) });
+      assert.ok(isClearPixel(pixel), `Expected presented WebGPU clear pixel ${expectedClearPixel}, got ${pixel}`);
       const disposed = await page.evaluate(() => strataTest.dispose());
       assert.equal(disposed.state, 'disposed');
       assert.equal(disposed.workers, 0);

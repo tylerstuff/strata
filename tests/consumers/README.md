@@ -13,6 +13,9 @@ declarations and that importing it in Node does not access browser globals.
 Both browser fixtures run on localhost without COOP/COEP headers and verify the
 real WebGPU clear frame, WASM ABI and memory, worker lifecycle, resizing,
 initialization failures, cancellation, timeout, and recovery on the same canvas.
+Rendering uses an animation loop. The test decodes a screenshot of the presented
+canvas and checks its pixel color, allowing at most five seconds for the first
+frame. It does not depend on immediate Canvas2D snapshots of a WebGPU canvas.
 Screenshots and the reported adapter/browser are written to
 `test-results/consumers/`. A separate case simulates an unavailable WebGPU API.
 
