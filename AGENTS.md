@@ -10,5 +10,6 @@ Read README.md and docs/architecture.md before changing engine design. This is a
 - Treat 60 FPS on a representative laptop and Switch 2-inspired visual quality as unverified targets. Record named hardware and total-frame evidence before making performance claims.
 - Browser WebGPU feature support determines available GPU functionality. Native-only Rust wgpu or graphics API features do not become available through WASM.
 - Use `codex/<issue-number>-<description>` working branches. Do not overwrite unrelated work. Run meaningful checks for the change; document unavailable checks honestly.
+- Keep the Sketchfab benchmark collection local and outside this repository. Never commit or upload its models, textures, archives, converted/derived files, or cooked copies to GitHub, Git LFS, releases, or CI artifacts. Future benchmark tooling must accept a configurable external asset path; read docs/benchmark-assets.md before asset work.
 
-The repository currently contains planning and workflow files only. Do not describe proposed APIs, packages, tools, or rendering features as implemented.
+The runtime currently implements initialization, a Rust/WASM worker, clear-pass rendering, resize, and disposal. Scene rendering and advanced graphics remain planned. Read docs/runtime.md for build, package, ownership, and validation details. Use `npm run check` for the complete checks; consumer tests require a browser with WebGPU and a built package. Do not describe planned graphics features or performance targets as implemented or achieved.

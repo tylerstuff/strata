@@ -14,6 +14,7 @@ coverage/
 .cache/
 .turbo/
 *.tsbuildinfo
+*.tgz
 
 # Rust and generated WASM bindings
 target/
@@ -33,3 +34,6 @@ test-results/
 *.log
 tmp/
 .tmp/
+
+# External benchmark collection; never copy it into the repository.
+Strata-Benchmark-Assets/

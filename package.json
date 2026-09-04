@@ -1,0 +1,27 @@
+{
+  "name": "strata-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:wasm": "cargo build --package strata-runtime --target wasm32-unknown-unknown --release --locked",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.tests.json",
+    "test": "npm run test:unit",
+    "test:unit": "npm run build:wasm && vitest run",
+    "test:rust": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked",
+    "test:consumers": "node scripts/test-consumers.mjs",
+    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run build && npm run test:consumers",
+    "example": "node scripts/serve-example.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "0.28.2",
+    "playwright": "1.63.0",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "5.0.0"
+  }
+}
