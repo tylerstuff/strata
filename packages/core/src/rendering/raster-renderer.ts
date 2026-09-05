@@ -16,7 +16,7 @@ const shadowSize = 2048;
 const materialSize = 64;
 const frameUniformBytes = 352;
 const presentationUniformBytes = 16;
-const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility'] as const;
+const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility', 'reflections', 'reflection-source'] as const;
 
 export function normalizeRasterControls(controls: RasterControls = {}): Required<RasterControls> {
   if (!controls || typeof controls !== 'object'
@@ -206,8 +206,8 @@ export class RasterRenderer {
   passNames(controls: RasterControls = {}): readonly RasterPassName[] {
     const geometryPass: RasterPassName[] = this.geometry?.selectionPass ? ['selection'] : [];
     return [
-      ...(this.gi?.active ? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, 'shadow', 'raster',
-      ...(this.gi?.active ? ['gi-shade'] as const : []),
+      ...(this.gi?.active ? this.gi.preparePassNames ?? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, 'shadow', 'raster',
+      ...(this.gi?.active ? this.gi.composePassNames ?? ['gi-shade'] as const : []),
       ...(normalizeRasterControls(controls).temporal ? ['temporal'] as const : []), 'presentation',
     ];
   }

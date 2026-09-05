@@ -106,7 +106,7 @@ describe('bounded GPU timestamps', () => {
     ]);
     expect(profiler.pendingSamples).toBe(0);
     expect(profiler.droppedSamples).toBe(1);
-    expect(profiler.allocatedBufferBytes).toBe(512);
+    expect(profiler.allocatedBufferBytes).toBe(640);
     profiler.dispose();
   });
 
@@ -311,7 +311,7 @@ describe('engine telemetry and scene ownership', () => {
     expect(f.adapter.requestDevice).toHaveBeenCalledWith(expect.objectContaining({ requiredFeatures: ['timestamp-query'] }));
     expect(engine.info.profiling.reason).toBe('available');
     const frame = engine.render();
-    expect(frame.allocatedGpuBufferBytes).toBe(1024);
+    expect(frame.allocatedGpuBufferBytes).toBe(1280);
     expect(engine.getTelemetry().pendingGpuSamples).toBe(1);
     expect(f.encoder.beginRenderPass).toHaveBeenCalledWith(expect.objectContaining({ timestampWrites: expect.any(Object) }));
     f.buffers[1]!.mapping.resolve();

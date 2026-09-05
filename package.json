@@ -25,8 +25,9 @@
     "test:raster": "node scripts/test-raster.mjs",
     "test:geometry": "node scripts/test-geometry.mjs",
     "test:gi": "node scripts/test-gi.mjs",
-    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run build && npm run test:consumers && npm run benchmark:smoke && npm run test:raster && npm run test:geometry && npm run test:gi",
-    "example": "node scripts/serve-example.mjs"
+    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run build && npm run test:consumers && npm run benchmark:smoke && npm run test:raster && npm run test:geometry && npm run test:gi && npm run test:reflections",
+    "example": "node scripts/serve-example.mjs",
+    "test:reflections": "node scripts/test-reflections.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -10,7 +10,7 @@ export function giTraceShader(options: { group?: number; firstBinding?: number }
 struct GiBvhNode { minimum: vec3f, first: u32, maximum: vec3f, count: u32, };
 struct GiTraceTriangle { p0: vec3f, materialId: u32, edge1: vec3f, boxId: u32, edge2: vec3f, sourceId: u32, normal: vec3f, padding: f32, };
 struct GiTraceBox { center: vec3f, materialId: u32, halfSize: vec3f, boxId: u32, rotation: vec4f, };
-struct GiTraceMaterial { albedo: vec3f, roughness: f32, emission: vec3f, padding: f32, };
+struct GiTraceMaterial { albedo: vec3f, roughness: f32, emission: vec3f, metallic: f32, };
 struct GiTraceConfiguration { lightDirection: vec3f, rayEpsilon: f32, lightRadiance: vec3f, maxDistance: f32, counts: vec4u, };
 struct GiRay { origin: vec3f, tMin: f32, direction: vec3f, tMax: f32, };
 struct GiTraceHit {

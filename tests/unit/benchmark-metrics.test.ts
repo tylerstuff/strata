@@ -80,3 +80,21 @@ describe('benchmark measurements', () => {
     expect(() => normalizeOptions({ renderer: 'gi', giScenario: 'unknown' as 'static' })).toThrow();
   });
 });
+
+
+describe('reflection benchmark controls', () => {
+  it('keeps the mirror fixture fixed across world, probe-only and disabled baselines', () => {
+    for (const reflectionMode of ['world', 'probe-only', 'off'] as const) {
+      const options = normalizeOptions({ renderer: 'reflections', reflectionMode });
+      expect(options).toMatchObject({ instanceCount: 0, seed: 1337, cameraMode: 'receiver', giScenario: 'static',
+        reflectionMode, reflectionResolutionScale: 0.25, reflectionMaxRays: 32768, reflectionRoughness: 0.08,
+        reflectionMaxDistance: 16, reflectionUpdateEvery: 1 });
+    }
+    expect(normalizeOptions({ renderer: 'reflections', reflectionResolutionScale: 1, reflectionMaxRays: 131072,
+      reflectionRoughness: 0.35, reflectionMaxDistance: 32, reflectionUpdateEvery: 4 }).reflectionUpdateEvery).toBe(4);
+    for (const patch of [{ reflectionResolutionScale: 0.75 }, { reflectionMaxRays: 0 }, { reflectionMaxRays: 131073 },
+      { reflectionRoughness: 0.351 }, { reflectionMaxDistance: 33 }, { reflectionUpdateEvery: 1.5 }]) {
+      expect(() => normalizeOptions({ renderer: 'reflections', ...patch } as Parameters<typeof normalizeOptions>[0])).toThrow();
+    }
+  });
+});

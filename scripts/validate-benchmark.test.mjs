@@ -94,6 +94,54 @@ function giFixture({ enabled = true, temporal = true, probes = 32, rays = 64, dy
   return report;
 }
 
+function reflectionFixture({ enabled = true, temporal = true, timed = false, dynamic = false,
+  mode = 'world', scale = 0.25, budget = 32768, updateEvery = 1, height = 720 } = {}) {
+  const report = giFixture({ enabled, temporal, timed, dynamic }); const run = report.runs[0];
+  const width = height === 1080 ? 1920 : 1280;
+  Object.assign(run.resolution, { width, height, cssWidth: width, cssHeight: height });
+  const active = enabled || mode !== 'off'; const world = mode === 'world';
+  Object.assign(run.workload, { id: 'selected-software-reflections-v1', renderer: 'reflections',
+    renderPath: 'world-space-selective-reflections-v1', cameraPath: 'reflections-receiver-v1',
+    sourceTriangleCount: 156, reflectionMode: mode });
+  Object.assign(run.quality, { reflectionMode: mode, resolutionScale: scale, maxRaysPerFrame: budget, roughness: 0.08,
+    maxDistance: 16, updateEvery, materialFixture: 'shared-metallic-reflector-v1' });
+  const names = [...(enabled ? ['gi-trace', 'gi-update'] : []), 'shadow', 'raster',
+    ...(world ? ['reflection-trace', 'reflection-resolve'] : []), ...(active ? ['gi-shade'] : []),
+    ...(temporal ? ['temporal'] : []), 'presentation'];
+  const region = world ? 4096 : 0; const perUpdate = Math.min(region, budget);
+  let traceFrames = world ? 1 : 0; let totalCandidates = world ? perUpdate : 0; // One warm-up submission.
+  for (const [index, frame] of run.frames.entries()) {
+    const age = active ? (dynamic && index > 0 ? 1 : frame.frameId) : 0;
+    const candidates = world && (age - 1) % updateEvery === 0 ? perUpdate : 0;
+    traceFrames += Number(candidates > 0); totalCandidates += candidates;
+    Object.assign(frame.gi, { traceGeometryBytes: 14624, composeTextureBytes: active ? width * height * 8 : 0 });
+    frame.reflections = { sourceFrameId: active ? frame.frameId : null, worldRevision: frame.gi.worldRevision,
+      cacheEpoch: active ? frame.gi.worldRevision : 0, mode, resolutionScale: scale,
+      reflectionWidth: world ? Math.ceil(width * scale) : 1, reflectionHeight: world ? Math.ceil(height * scale) : 1,
+      roughness: 0.08, maxDistance: 16, updateEvery, maxRaysPerFrame: budget, scheduledCandidates: candidates,
+      candidateRegionPixels: region, maxPrimaryRays: candidates, maxShadowRays: candidates, framesSinceReset: age,
+      submittedFrames: active ? frame.frameId : 0, traceFrames, totalScheduledCandidates: totalCandidates,
+      maxHistoryAge: active ? Math.min(16, Math.max(updateEvery, Math.ceil(region / budget) * updateEvery)) : 16,
+      actualPrimaryRays: null, actualShadowRays: null, traceFailures: null, historyReusedPixels: null,
+      screenTracing: false, gpuBufferBytes: 512, gpuTextureBytes: world ? Math.ceil(width * scale) * Math.ceil(height * scale) * 88 : 88,
+      objectOffset: 0, giEnabled: enabled, traceRepresentation: 'triangle-bvh-v1', traceGeometryBytes: frame.gi.traceGeometryBytes,
+      composeBufferBytes: frame.gi.composeBufferBytes, composeTextureBytes: frame.gi.composeTextureBytes };
+    Object.assign(frame, { triangles: 313 + Number(temporal),
+      dispatchCalls: Number(enabled) * 2 + Number(active) + Number(world) + Number(candidates > 0),
+      allocatedGpuBufferBytes: frame.gi.traceGeometryBytes + frame.gi.cacheBufferBytes + 96 + 512 + 65536,
+      allocatedGpuTextureBytes: frame.gi.cacheTextureBytes + frame.gi.composeTextureBytes + frame.reflections.gpuTextureBytes + 16777216,
+      gpuPasses: timed ? Object.fromEntries(names.map(name => [name, 0])) : {} });
+  }
+  const count = run.frames.length;
+  Object.assign(run.allocations, { gi: { ...run.frames.at(-1).gi }, reflections: { ...run.frames.at(-1).reflections },
+    allocatedGpuBufferBytes: run.frames[0].allocatedGpuBufferBytes, allocatedGpuTextureBytes: run.frames[0].allocatedGpuTextureBytes });
+  Object.assign(run.summary, { dispatchCalls: run.frames.reduce((sum, frame) => sum + frame.dispatchCalls, 0),
+    maxTrackedGpuBufferBytes: run.frames[0].allocatedGpuBufferBytes, maxTrackedGpuTextureBytes: run.frames[0].allocatedGpuTextureBytes });
+  run.profiling.capturedPassSampleCount = timed ? count * names.length : 0;
+  run.gpuPasses = timed ? Object.fromEntries(names.map(name => [name, { ...sampleDistribution(run.frames.map(() => 0)), sampleCount: count, totalMs: 0 }])) : {};
+  return report;
+}
+
 test('valid unavailable GPU timings remain null; quantized zero timings remain valid measurements', () => {
   const unavailable = fixture();
   assert.equal(validateBenchmarkReport(unavailable), unavailable);
@@ -296,4 +344,107 @@ test('requires exactly the active GI passes and rejects orphaned pass summaries'
   delete run.frames[0].gpuPasses['gi-shade'];
   run.gpuPasses['gi-shade'] = { ...sampleDistribution([]), sampleCount: 0, totalMs: 0 };
   assert.throws(() => validateBenchmarkReport(report), /pass summaries contain measurements absent/);
+});
+
+test('accepts reflection modes with independent GI/TAA, exact layout and unknown GPU counts', () => {
+  for (const mode of ['off', 'probe-only', 'world']) for (const enabled of [false, true]) {
+    for (const temporal of [false, true]) for (const timed of [false, true]) {
+      const report = reflectionFixture({ mode, enabled, temporal, timed });
+      assert.equal(validateBenchmarkReport(report), report);
+      assert.equal(report.runs[0].allocations.reflections.actualPrimaryRays, null);
+    }
+  }
+  for (const scale of [0.25, 0.5, 1]) for (const budget of [1, 131072]) for (const height of [720, 1080]) {
+    const report = reflectionFixture({ scale, budget, height, updateEvery: 4, timed: true });
+    assert.equal(validateBenchmarkReport(report), report);
+    assert.equal(report.runs[0].frames[0].reflections.scheduledCandidates, 0);
+    assert.ok(Object.hasOwn(report.runs[0].frames[0].gpuPasses, 'reflection-trace'));
+  }
+});
+
+test('validates shared door/light changes and reflection epoch invalidation in every mode', () => {
+  for (const mode of ['off', 'probe-only', 'world']) for (const enabled of [false, true]) {
+    const report = reflectionFixture({ mode, enabled, dynamic: true });
+    assert.equal(validateBenchmarkReport(report), report);
+  }
+  const stale = reflectionFixture({ dynamic: true });
+  const frame = stale.runs[0].frames[1];
+  frame.reflections.cacheEpoch = 1; frame.reflections.framesSinceReset = 3;
+  assert.throws(() => validateBenchmarkReport(stale), /changed reflection world reused an old cache epoch/);
+});
+
+test('rejects missing reflection contracts, altered fixtures, invalid limits and fabricated GPU counters', () => {
+  for (const [mutate, expected] of [
+    [run => { delete run.frames[0].reflections; }, /schema/],
+    [run => { delete run.allocations.reflections; }, /schema/],
+    [run => { delete run.quality.reflectionMode; }, /schema/],
+    [run => { run.workload.sourceTriangleCount = 132; }, /schema/],
+    [run => { run.workload.renderPath = 'world-space-diffuse-gi-v1'; }, /schema/],
+    [run => { run.quality.materialFixture = 'shared-flat-lambertian-v1'; }, /schema/],
+    [run => { run.quality.resolutionScale = 0.75; }, /schema/],
+    [run => { run.quality.maxRaysPerFrame = 131073; }, /schema/],
+    [run => { run.quality.roughness = 0.36; }, /schema/],
+    [run => { run.quality.maxDistance = 33; }, /schema/],
+    [run => { run.quality.updateEvery = 5; }, /schema/],
+    [run => { run.frames[0].reflections.screenTracing = true; }, /schema/],
+    [run => { run.frames[0].reflections.objectOffset = 0.1; }, /schema/],
+    [run => { run.frames[0].reflections.actualPrimaryRays = 0; }, /unread reflection GPU counters/],
+    [run => { run.frames[0].reflections.actualShadowRays = 0; }, /unread reflection GPU counters/],
+    [run => { run.frames[0].reflections.traceFailures = 0; }, /unread reflection GPU counters/],
+    [run => { run.frames[0].reflections.historyReusedPixels = 0; }, /unread reflection GPU counters/],
+    [run => { run.frames[0].reflections.roughness = 0.2; }, /differs from its quality setting/],
+    [run => { run.frames[0].reflections.mode = 'off'; }, /reflection mode differs/],
+    [run => { run.frames[0].reflections.worldRevision++; }, /shared scene/],
+    [run => { run.frames[0].reflections.giEnabled = false; }, /shared scene/],
+  ]) {
+    const report = reflectionFixture(); mutate(report.runs[0]);
+    assert.throws(() => validateBenchmarkReport(report), expected);
+  }
+});
+
+test('rejects reflection allocation, candidate scheduling, cumulative work and source-label mismatches', () => {
+  for (const [mutate, expected] of [
+    [run => { run.frames[0].gi.traceGeometryBytes = 11392; }, /GI allocation estimates/],
+    [run => { run.frames[0].reflections.gpuBufferBytes++; }, /reflection allocation estimates/],
+    [run => { run.frames[0].reflections.gpuTextureBytes++; }, /reflection allocation estimates/],
+    [run => { run.frames[0].reflections.reflectionWidth++; }, /reflection allocation estimates/],
+    [run => { run.frames[0].reflections.composeTextureBytes = 0; }, /reflection allocation estimates/],
+    [run => { run.frames[0].allocatedGpuTextureBytes = run.frames[0].gi.cacheTextureBytes + run.frames[0].gi.composeTextureBytes; }, /combined reflection resources/],
+    [run => { run.frames[0].reflections.maxPrimaryRays++; }, /ray budget/],
+    [run => { run.frames[0].reflections.maxShadowRays++; }, /ray budget/],
+    [run => { run.frames[0].reflections.candidateRegionPixels = 1280 * 720; }, /candidate bounds/],
+    [run => { const r = run.frames[0].reflections; r.scheduledCandidates--; r.maxPrimaryRays--; r.maxShadowRays--; }, /update schedule/],
+    [run => { run.frames[0].reflections.maxHistoryAge++; }, /bounded schedule/],
+    [run => { run.frames[0].reflections.sourceFrameId--; }, /source frame/],
+    [run => { run.frames[0].reflections.submittedFrames--; }, /source frame/],
+    [run => { run.frames[1].reflections.totalScheduledCandidates++; }, /cumulative work/],
+    [run => { run.frames[1].reflections.cacheEpoch++; run.frames[1].reflections.framesSinceReset = 1; }, /static reflection camera unexpectedly reset/],
+    [run => { run.frames[0].dispatchCalls--; }, /draw\/dispatch\/triangle/],
+    [run => { run.frames[0].triangles = 265; }, /draw\/dispatch\/triangle/],
+    [run => { run.allocations.reflections.sourceFrameId--; }, /final reflection telemetry/],
+  ]) {
+    const report = reflectionFixture(); mutate(report.runs[0]);
+    assert.throws(() => validateBenchmarkReport(report), expected);
+  }
+  const disabled = reflectionFixture({ enabled: false, mode: 'off' });
+  disabled.runs[0].frames[0].reflections.sourceFrameId = 2;
+  assert.throws(() => validateBenchmarkReport(disabled), /fully disabled reflections report submitted cache work/);
+  const probeOnly = reflectionFixture({ mode: 'probe-only' });
+  probeOnly.runs[0].frames[0].reflections.traceFrames = 1;
+  assert.throws(() => validateBenchmarkReport(probeOnly), /disabled\/probe-only reflection mode claims traced work/);
+});
+
+test('requires both world reflection timing passes even on frames with no scheduled trace candidates', () => {
+  const report = reflectionFixture({ timed: true, updateEvery: 4 });
+  const run = report.runs[0];
+  assert.equal(run.frames[0].reflections.scheduledCandidates, 0);
+  assert.equal(validateBenchmarkReport(report), report);
+  delete run.frames[0].gpuPasses['reflection-trace'];
+  assert.throws(() => validateBenchmarkReport(report), /incomplete frame pass timings/);
+  const extra = reflectionFixture({ timed: true, mode: 'probe-only' });
+  extra.runs[0].frames[0].gpuPasses['reflection-resolve'] = 0;
+  assert.throws(() => validateBenchmarkReport(extra), /incomplete frame pass timings/);
+  const orphan = reflectionFixture({ timed: true, mode: 'off' });
+  orphan.runs[0].gpuPasses['reflection-trace'] = { ...sampleDistribution([]), sampleCount: 0, totalMs: 0 };
+  assert.throws(() => validateBenchmarkReport(orphan), /pass summaries contain measurements absent/);
 });

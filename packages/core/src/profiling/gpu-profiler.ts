@@ -30,7 +30,7 @@ export class GpuProfiler {
 
   constructor(
     device: GPUDevice, readonly capacity = 4, private readonly resultCapacity = 256,
-    private readonly maxPasses = 8,
+    private readonly maxPasses = 10,
   ) {
     if (!Number.isInteger(capacity) || capacity < 1 || !Number.isInteger(resultCapacity) || resultCapacity < 1
       || !Number.isInteger(maxPasses) || maxPasses < 1 || maxPasses > 32) {

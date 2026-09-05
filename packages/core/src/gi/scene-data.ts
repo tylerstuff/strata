@@ -2,7 +2,7 @@ import { StrataError } from '../errors.js';
 
 export type GiVec3 = readonly [number, number, number];
 export interface GiSceneOptions { doorOpen?: boolean; wallColor?: 'red' | 'neutral'; lightIntensity?: number }
-export interface GiMaterial { readonly id: number; readonly albedo: GiVec3; readonly emission: GiVec3; readonly roughness: number }
+export interface GiMaterial { readonly id: number; readonly albedo: GiVec3; readonly emission: GiVec3; readonly roughness: number; readonly metallic?: number }
 export interface GiBox {
   readonly id: number; readonly name: string; readonly center: GiVec3; readonly halfSize: GiVec3;
   readonly yaw: number; readonly materialId: number;

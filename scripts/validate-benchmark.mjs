@@ -51,6 +51,8 @@ function validateGiWorkload(run, prefix) {
 
 function validateGiFrame(run, frame, prior, prefix) {
   const gi = frame.gi;
+  const reflections = run.workload.renderer === 'reflections';
+  const composeActive = gi.enabled || (reflections && run.workload.reflectionMode !== 'off');
   const { probesPerUpdate, raysPerProbe } = run.quality;
   const rayBudget = probesPerUpdate * raysPerProbe;
   ensure(gi.enabled === run.workload.giEnabled && gi.probesPerUpdate === probesPerUpdate && gi.raysPerProbe === raysPerProbe,
@@ -64,8 +66,10 @@ function validateGiFrame(run, frame, prior, prefix) {
   ensure(gi.traceFailures === null || gi.traceFailures === 0, `${prefix} records GI traversal failures`);
   if (gi.validProbeCount !== null) ensure(gi.validProbeCount <= Math.min(384, gi.probeUpdatesSinceReset), `${prefix} GI valid-probe count exceeds updated coverage`);
   ensure(frame.triangleCountSourceFrameId === frame.frameId, `${prefix} GI geometry counters have a mismatched source frame`);
-  ensure(frame.drawCalls === 3 + Number(run.workload.temporal) && frame.dispatchCalls === (gi.enabled ? 3 : 0)
-    && frame.triangles === 265 + Number(run.workload.temporal), `${prefix} GI draw/dispatch/triangle counts do not match the fixture`);
+  const dispatches = (gi.enabled ? 2 : 0) + Number(composeActive)
+    + (reflections && run.workload.reflectionMode === 'world' ? 1 + Number(frame.reflections.scheduledCandidates > 0) : 0);
+  ensure(frame.drawCalls === 3 + Number(run.workload.temporal) && frame.dispatchCalls === dispatches
+    && frame.triangles === (reflections ? 313 : 265) + Number(run.workload.temporal), `${prefix} GI draw/dispatch/triangle counts do not match the fixture`);
 
   const phase = run.workload.giScenario === 'static' ? 0 : Math.floor((frame.elapsedMs / 1000) % 60 / 10);
   ensure(gi.doorOpen === (phase !== 1) && gi.wallColor === (phase === 5 ? 'neutral' : 'red')
@@ -84,11 +88,72 @@ function validateGiFrame(run, frame, prior, prefix) {
     ensure(gi.worldRevision === previous.worldRevision + Number(changed), `${prefix} GI world revision does not match scene changes`);
     if (gi.enabled) ensure(gi.framesSinceReset === (changed ? 1 : previous.framesSinceReset + 1), `${prefix} GI cache age did not reset or advance correctly`);
   }
-  ensure(gi.traceGeometryBytes === 11392 && gi.cacheBufferBytes === 6368 + rayBudget * 32
+  // Median subdivision with <=4 triangles per leaf: 156 triangles produce 119 nodes.
+  const traceBytes = reflections ? 119 * 32 + 156 * 64 + 13 * 48 + 5 * 32 + 48 : 11392;
+  ensure(gi.traceGeometryBytes === traceBytes && gi.cacheBufferBytes === 6368 + rayBudget * 32
     && gi.cacheTextureBytes === 1966080 && gi.composeBufferBytes === 96
-    && gi.composeTextureBytes === (gi.enabled ? run.resolution.width * run.resolution.height * 8 : 0), `${prefix} GI allocation estimates violate the fixed layout`);
+    && gi.composeTextureBytes === (composeActive ? run.resolution.width * run.resolution.height * 8 : 0), `${prefix} GI allocation estimates violate the fixed layout`);
   ensure(frame.allocatedGpuBufferBytes >= gi.traceGeometryBytes + gi.cacheBufferBytes + gi.composeBufferBytes
     && frame.allocatedGpuTextureBytes >= gi.cacheTextureBytes + gi.composeTextureBytes, `${prefix} GI resources exceed total tracked allocations`);
+}
+
+function validateReflectionFrame(run, frame, prior, prefix) {
+  const reflected = frame.reflections; const gi = frame.gi; const quality = run.quality;
+  const world = quality.reflectionMode === 'world'; const active = world || quality.reflectionMode === 'probe-only' || gi.enabled;
+  ensure(run.workload.reflectionMode === quality.reflectionMode && reflected.mode === quality.reflectionMode,
+    `${prefix} reflection mode differs from its workload`);
+  for (const name of ['resolutionScale', 'maxRaysPerFrame', 'roughness', 'maxDistance', 'updateEvery']) {
+    ensure(reflected[name] === quality[name], `${prefix} reflection ${name} differs from its quality setting`);
+  }
+  ensure(reflected.worldRevision === gi.worldRevision && reflected.giEnabled === gi.enabled,
+    `${prefix} reflection world revision or GI state differs from the shared scene`);
+  ensure(reflected.actualPrimaryRays === null && reflected.actualShadowRays === null && reflected.traceFailures === null
+    && reflected.historyReusedPixels === null, `${prefix} unread reflection GPU counters must remain null`);
+  const width = world ? Math.ceil(run.resolution.width * quality.resolutionScale) : 1;
+  const height = world ? Math.ceil(run.resolution.height * quality.resolutionScale) : 1;
+  ensure(reflected.reflectionWidth === width && reflected.reflectionHeight === height && reflected.gpuBufferBytes === 512
+    && reflected.gpuTextureBytes === width * height * 88 && reflected.traceGeometryBytes === gi.traceGeometryBytes
+    && reflected.composeBufferBytes === gi.composeBufferBytes && reflected.composeTextureBytes === gi.composeTextureBytes,
+  `${prefix} reflection allocation estimates violate the fixed layout`);
+  ensure(frame.allocatedGpuBufferBytes >= gi.traceGeometryBytes + gi.cacheBufferBytes + gi.composeBufferBytes + reflected.gpuBufferBytes
+    && frame.allocatedGpuTextureBytes >= gi.cacheTextureBytes + gi.composeTextureBytes + reflected.gpuTextureBytes,
+  `${prefix} combined reflection resources exceed total tracked allocations`);
+  ensure(reflected.candidateRegionPixels <= width * height && reflected.scheduledCandidates <= Math.min(quality.maxRaysPerFrame, reflected.candidateRegionPixels)
+    && reflected.maxPrimaryRays === reflected.scheduledCandidates && reflected.maxShadowRays === reflected.scheduledCandidates,
+  `${prefix} reflection ray budget or candidate bounds are inconsistent`);
+  if (!world) ensure(reflected.scheduledCandidates === 0 && reflected.candidateRegionPixels === 0
+    && reflected.traceFrames === 0 && reflected.totalScheduledCandidates === 0, `${prefix} disabled/probe-only reflection mode claims traced work`);
+  if (active) {
+    ensure(reflected.sourceFrameId === frame.frameId && reflected.submittedFrames === frame.frameId
+      && reflected.cacheEpoch >= 1 && reflected.framesSinceReset >= 1 && reflected.framesSinceReset <= reflected.submittedFrames,
+    `${prefix} reflection cache epoch, age or source frame is inconsistent`);
+    const expectedAge = Math.min(16, Math.max(quality.updateEvery, Math.ceil(reflected.candidateRegionPixels / quality.maxRaysPerFrame) * quality.updateEvery));
+    ensure(reflected.maxHistoryAge === expectedAge, `${prefix} reflection history age exceeds its bounded schedule`);
+    if (world) {
+      const update = (reflected.framesSinceReset - 1) % quality.updateEvery === 0;
+      ensure(reflected.scheduledCandidates === (update ? Math.min(quality.maxRaysPerFrame, reflected.candidateRegionPixels) : 0),
+        `${prefix} reflection candidate count differs from the update schedule`);
+    }
+  } else {
+    ensure(reflected.sourceFrameId === null && reflected.submittedFrames === 0 && reflected.cacheEpoch === 0
+      && reflected.framesSinceReset === 0 && reflected.maxHistoryAge === 16, `${prefix} fully disabled reflections report submitted cache work`);
+  }
+  ensure(reflected.traceFrames <= reflected.submittedFrames && reflected.totalScheduledCandidates >= reflected.scheduledCandidates
+    && reflected.totalScheduledCandidates <= reflected.traceFrames * quality.maxRaysPerFrame,
+  `${prefix} reflection cumulative work is inconsistent`);
+  if (prior) {
+    const previous = prior.reflections;
+    ensure(reflected.traceFrames === previous.traceFrames + Number(reflected.scheduledCandidates > 0)
+      && reflected.totalScheduledCandidates === previous.totalScheduledCandidates + reflected.scheduledCandidates,
+    `${prefix} reflection cumulative work does not match submitted candidates`);
+    if (active) {
+      const reset = reflected.cacheEpoch === previous.cacheEpoch + 1;
+      ensure((reset && reflected.framesSinceReset === 1) || (reflected.cacheEpoch === previous.cacheEpoch
+        && reflected.framesSinceReset === previous.framesSinceReset + 1), `${prefix} reflection epoch and age did not advance consistently`);
+      if (gi.worldRevision !== prior.gi.worldRevision) ensure(reset, `${prefix} changed reflection world reused an old cache epoch`);
+      else if (run.workload.cameraPath !== 'reflections-tour-v1') ensure(!reset, `${prefix} static reflection camera unexpectedly reset its cache`);
+    }
+  }
 }
 
 /** Validate a completed session and the relationships JSON Schema cannot express. */
@@ -108,7 +173,8 @@ export function validateBenchmarkReport(report) {
     ensure((run.resolution.width === 1280 && run.resolution.height === 720)
       || (run.resolution.width === 1920 && run.resolution.height === 1080), `${prefix} has a mismatched resolution pair`);
     const virtual = run.workload.renderer === 'virtual';
-    const gi = run.workload.renderer === 'gi';
+    const reflections = run.workload.renderer === 'reflections';
+    const gi = run.workload.renderer === 'gi' || reflections;
     ensure(run.workload.seed <= 0xffff_ffff && (virtual || gi ? run.workload.instanceCount === 0
       : run.workload.instanceCount >= 1 && run.workload.instanceCount <= 16_384), `${prefix} has an invalid procedural workload`);
     if (virtual) {
@@ -150,6 +216,7 @@ export function validateBenchmarkReport(report) {
         if (run.workload.geometryMode === 'streamed') ensure(geometry.poolBytes <= run.quality.poolBytes, `${prefix} exceeds its configured geometry pool`);
       }
       if (gi) validateGiFrame(run, frame, frames[frameIndex - 1], `${prefix}.frames[${frameIndex}]`);
+      if (reflections) validateReflectionFrame(run, frame, frames[frameIndex - 1], `${prefix}.frames[${frameIndex}]`);
       if (frame.gpuSpanMs !== undefined || frame.gpuPassIntervals !== undefined) {
         ensure(frame.gpuPassIntervals !== undefined && frame.gpuSpanMs !== undefined, `${prefix} GPU span requires pass intervals`);
         const intervals = Object.entries(frame.gpuPassIntervals);
@@ -174,7 +241,9 @@ export function validateBenchmarkReport(report) {
           close(frame.gpuMs, entries.reduce((sum, [, value]) => sum + value, 0), `${prefix} frame pass sum`);
           const expected = run.workload.renderer === 'raster' || virtual || gi ? [
             ...(virtual && run.workload.geometryMode !== 'mesh-lod' ? ['selection'] : []),
-            ...(gi && run.workload.giEnabled ? ['gi-trace', 'gi-update', 'gi-shade'] : []),
+            ...(gi && run.workload.giEnabled ? ['gi-trace', 'gi-update'] : []),
+            ...(reflections && run.workload.reflectionMode === 'world' ? ['reflection-trace', 'reflection-resolve'] : []),
+            ...(gi && (run.workload.giEnabled || (reflections && run.workload.reflectionMode !== 'off')) ? ['gi-shade'] : []),
             'shadow', 'raster', 'presentation', ...(run.workload.temporal ? ['temporal'] : []),
           ] : ['procedural'];
           ensure(entries.length === expected.length && expected.every(name => Object.hasOwn(frame.gpuPasses, name)), `${prefix} contains incomplete frame pass timings`);
@@ -196,6 +265,8 @@ export function validateBenchmarkReport(report) {
       ensure(Object.entries(final).every(([key, value]) => run.allocations.gi[key] === value), `${prefix} final GI telemetry differs from the last submitted frame`);
       ensure(Object.keys(run.gpuPasses).length === namedPasses.size, `${prefix} GI pass summaries contain measurements absent from captured frames`);
     }
+    if (reflections) ensure(Object.entries(frames.at(-1).reflections).every(([key, value]) => run.allocations.reflections[key] === value),
+      `${prefix} final reflection telemetry differs from the last submitted frame`);
     const intervalTotal = frames.reduce((sum, frame) => sum + frame.frameIntervalMs, 0);
     close(capture.actualDurationMs, intervalTotal, `${prefix} capture duration`);
     ensure(capture.actualDurationMs + 1e-5 >= capture.requestedDurationSeconds * 1000, `${prefix} ended before its requested capture duration`);

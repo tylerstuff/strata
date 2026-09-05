@@ -52,7 +52,7 @@ export function probeTraceShader(): string {
         let point = origin + direction * hit.distance + hit.normal * 0.002;
         let shadow = giTraceAnyBvh(GiRay(point, 0.002, giTraceConfig.lightDirection, probeConfig.settings.y));
         atomicAdd(&probeStats[4], 1u);
-        if (shadow.status == 0u) { radiance += material.albedo * giTraceConfig.lightRadiance * (cosine / 3.141592653589793); }
+        if (shadow.status == 0u) { radiance += material.albedo * (1.0 - material.metallic) * giTraceConfig.lightRadiance * (cosine / 3.141592653589793); }
         else { atomicAdd(&probeStats[5], 1u); if (shadow.status == 2u) { atomicAdd(&probeStats[3], 1u); } }
       }
     }

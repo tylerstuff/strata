@@ -19,7 +19,9 @@ export function initializeBenchmarkControls(): void {
   const renderer = select('#renderer'); const debug = select('#debug');
   const enabled = document.querySelector<HTMLInputElement>('#gi-enabled')!;
   const sync = (): void => {
-    const gi = renderer.value === 'gi';
+    const reflections = renderer.value === 'reflections';
+    const gi = renderer.value === 'gi' || reflections;
+    document.querySelector<HTMLElement>('#reflection-controls')!.hidden = !reflections;
     document.querySelector<HTMLElement>('#gi-controls')!.hidden = !gi;
     document.querySelector<HTMLElement>('#geometry')!.hidden = renderer.value !== 'virtual';
     document.querySelector<HTMLInputElement>('#temporal')!.disabled = renderer.value === 'diffuse';
@@ -38,6 +40,16 @@ export function initializeBenchmarkControls(): void {
       ? 'The door stays open and the light stays fixed.'
       : 'A 60-second cycle closes and reopens the door, dims and restores the light, then changes the wall color.';
   };
+  renderer.addEventListener('change', () => {
+    if (renderer.value === 'reflections') { select('#gi-camera').value = 'receiver'; select('#gi-scenario').value = 'static'; }
+  });
   for (const control of [renderer, enabled, select('#gi-scenario'), select('#gi-probes'), select('#gi-rays')]) control.addEventListener('change', sync);
   sync();
+}
+
+export function readReflectionBenchmarkControls(): Pick<BenchmarkOptions, 'reflectionMode' | 'reflectionResolutionScale' | 'reflectionMaxRays' | 'reflectionRoughness' | 'reflectionMaxDistance' | 'reflectionUpdateEvery'> {
+  return { reflectionMode: select('#reflection-mode').value as BenchmarkOptions['reflectionMode'],
+    reflectionResolutionScale: Number(select('#reflection-scale').value) as BenchmarkOptions['reflectionResolutionScale'],
+    reflectionMaxRays: Number(select('#reflection-rays').value), reflectionRoughness: Number(select('#reflection-roughness').value),
+    reflectionMaxDistance: Number(select('#reflection-distance').value), reflectionUpdateEvery: Number(select('#reflection-update').value) };
 }
