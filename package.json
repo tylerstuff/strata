@@ -32,6 +32,7 @@
     "test:raster": "node scripts/test-raster.mjs",
     "test:geometry": "node scripts/test-geometry.mjs && node scripts/test-geometry-fallback.mjs && node scripts/test-geometry-retention.mjs && node scripts/test-geometry-initialization.mjs",
     "test:geometry:initialization": "node scripts/test-geometry-initialization.mjs",
+    "test:geometry:regions": "node scripts/test-region-initialization.mjs",
     "test:gi": "node scripts/test-gi.mjs",
     "test:gi-motion": "node scripts/test-gi-motion.mjs --smoke",
     "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run test:gallery:unit && npm run build && npm run test:consumers && npm run test:gallery && npm run benchmark:smoke && npm run test:raster && npm run test:imported && npm run test:imported-indirect && npm run test:imported-spatial && npm run test:geometry && npm run test:gi && npm run test:probe-volume && npm run test:gi-motion && npm run test:reflections && npm run test:integrated && npm run test:authored-boxes && npm run test:authored-motion && npm run check:authoring && npm run check:preview && npm run test:preview:browser",
