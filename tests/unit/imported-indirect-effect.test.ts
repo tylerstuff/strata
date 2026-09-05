@@ -93,7 +93,12 @@ describe('imported progressive indirect effect ownership and submission', () => 
     const moved = camera(); moved.viewProjection[12] = .1; let frame = encode(effect, g, moved); expect(frame.encoder.clearBuffer).toHaveBeenCalledTimes(2); effect.submitted();
     const oldBuffer = effect.accumulationBuffer; frame = encode(effect, g, moved, 8, 3); expect(frame.encoder.clearBuffer).toHaveBeenCalledTimes(2); expect(effect.accumulationBuffer).not.toBe(oldBuffer); effect.submitted();
     effect.updateLighting(input.lighting, { ...input.environment, intensity: 0 }); expect(effect.progress.pendingReset).toBe(true); encode(effect, g); effect.submitted();
-    effect.updateSettings({ maxSamples: 32 }); expect(effect.progress.pendingReset).toBe(true); encode(effect, g); effect.submitted();
+    effect.updateSettings({ maxSamples: 32 }); expect(effect.progress.pendingReset).toBe(true);
+    expect(effect.progress.limits).toEqual({ ...input.options, maxSamples: 32 }); encode(effect, g); effect.submitted();
+    const before = effect.progress;
+    expect(() => effect.updateSettings(null as unknown as NonNullable<ImportedIndirectCreateOptions['options']>)).toThrow(/options must be an object/);
+    expect(effect.progress).toEqual(before);
+    effect.updateSettings({ maxSamples: 32 }); expect(effect.progress.pendingReset).toBe(false);
     effect.setEnabled(false); expect(effect.active).toBe(false); expect(() => effect.prepare(g.encoder() as unknown as GPUCommandEncoder, camera(), 7, 3, 0, {})).toThrow(/disabled/);
     effect.setEnabled(true); expect(effect.progress.pendingReset).toBe(true); encode(effect, g); effect.submitted();
     expect(effect.progress.revision).toBe(6); effect.dispose();
