@@ -66,21 +66,21 @@ Validation covers frozen descriptors, numerical caps and independent packing ref
 
 ### Hardware correctness checkpoint
 
-At immutable source `2ec49d4a4eb3d2266829a224c376ea191a3e32eb`, Chrome152.0.7977.82 on the Apple Metal adapter passed 154 offscreen production-renderer frames plus three built-public-Engine submissions. The fixture has16 boxes at512×512, 55-degree vertical FOV, near0.1/far32:15 independently predicted visible boxes and one intentionally occluded box. This is a functional test, with no performance claim.
+At immutable source `2ec49d4a4eb3d2266829a224c376ea191a3e32eb`, Chrome 152.0.7977.82 on the Apple Metal adapter passed 154 offscreen production-renderer frames plus three built-public-Engine submissions. The fixture has 16 boxes at 512×512, 55-degree vertical FOV, near 0.1/far 32: 15 independently predicted visible boxes and one intentionally occluded box. This is a functional test, with no performance claim.
 
 | Check | Observed result |
 | --- | --- |
-| Static reference coverage | Minimum per-object IoU0.996422 for the dyadic fixture and1.0 for the decimal fixture |
-| Reference depth on eroded object interiors | 9,247/13,288 tested pixels; zero rejected pixels; maximum errors1.25838e-6/7.06473e-7 |
-| Signed common offsets through1,000km | Both fixture variants produced bit-identical color/depth to their origin captures in this run |
-| Camera motion at origin and1,000km | 32 paired steps per variant,31 visible changes each; each near/far pair had identical color/depth |
-| Early-f32 negative control at1,000km | The right small box lost all of its64/100 predicted visible pixels; the left witness also moved |
-| Direct PBR, edited materials and reversed light | 360 independently computed samples each, zero8-bit channel differences; zero radiance was black |
+| Static reference coverage | Minimum per-object IoU 0.996422 for the dyadic fixture and 1.0 for the decimal fixture |
+| Reference depth on eroded object interiors | 9,247/13,288 tested pixels; zero rejected pixels; maximum errors 1.25838e-6/7.06473e-7 |
+| Signed common offsets through 1,000 km | Both fixture variants produced bit-identical color/depth to their origin captures in this run |
+| Camera motion at origin and 1,000 km | 32 paired steps per variant, 31 visible changes each; every near/far pair had identical color/depth |
+| Early-f32 negative control at 1,000 km | The right small box lost all of its 64/100 predicted visible pixels; the left witness also moved |
+| Direct PBR, edited materials and reversed light | 360 independently computed samples each, zero 8-bit channel differences; zero radiance was black |
 | Public Engine | Commit/submission receipts, per-frame camera override, resize/aspect, repeated revision, clear and disposal passed |
 
-Acceptance thresholds remain distinct from those observations. Coverage IoU thresholds are0.98 against the independent oracle and0.995 for offset comparisons; centroid limits are0.5/0.25pixels. The depth threshold is2e-6 over eroded interior samples with an aggregate allowed rejection fraction of0.1%; this is not a per-object maximum-error guarantee. Paired motion tests establish offset equivalence and visible motion, not an independently verified camera trajectory at every step. The PBR sample oracle covers the dyadic origin fixture. Box axis normals test orientation/sign/stride; the need for inverse-transpose normals under nonuniform scale is established by the separate oblique CPU reference.
+Acceptance thresholds remain distinct from those observations. Coverage IoU thresholds are 0.98 against the independent oracle and 0.995 for offset comparisons; centroid limits are 0.5/0.25 pixels. The depth threshold is 2e-6 over eroded interior samples with an aggregate allowed rejection fraction of 0.1%; this is not a per-object maximum-error guarantee. Paired motion tests establish offset equivalence and visible motion, not an independently verified camera trajectory at every step. The PBR sample oracle covers the dyadic origin fixture. Box axis normals test orientation/sign/stride; the need for inverse-transpose normals under nonuniform scale is established by the separate oblique CPU reference.
 
-The100km negative control is reported without a mandatory visible failure: the dyadic gap changed geometrically but remained between the same pixel centers, whereas the decimal witness changed pixels. The1,000km negative control must fail both fixtures. No positive threshold was relaxed for these results.
+The 100 km negative control is reported without a mandatory visible failure: the dyadic gap changed geometrically but remained between the same pixel centers, whereas the decimal witness changed pixels. The 1,000 km negative control must fail both fixtures. No positive threshold was relaxed for these results.
 
 The source/built-runtime hashes remained unchanged throughout the run, with zero GPU, browser, device-loss or cleanup errors. Reports and GPU-readback PNGs are external at `~/Downloads/Strata-Benchmark-Results/2026-09-05T06-52-41.359Z-authored-box-validation/`; report SHA-256 is `f5b284a2b0f14a77228d103a0852d4488488f5ec8aa2387356ce4af367bfd6ef`. These PNGs are encoded GPU readbacks, not compositor presentation receipts. Separately, the packed b17b8ac implementation passed ordinary HTML and production Vite hardware playback.
 
