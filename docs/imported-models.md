@@ -66,9 +66,11 @@ contributions (four per skinned vertex, including zero weights), and 1 MiB of
 cumulative deduplication allocations. Each primitive allocates one bit per
 accessor vertex; shared-buffer instances have separate visited sets. Pose
 preflight also limits primitives and nodes to 4,096 each, skins to 1,024, total
-skin joints to 32,768, clips to 256, channels to 4,096 and copied source pose
-arrays to 8 MiB. These bound the synchronous evaluator stage; its JS object and
-allocation overhead are not a process-memory estimate. Cancellation is checked
+skin joints to 32,768, clips to 256, channels to 4,096 and accounted node
+transform, matrix and animation-array bytes to 8 MiB. The byte budget excludes
+copied skin joint-index lists, which are bounded separately by the joint-count
+limit. These bound the synchronous evaluator stage; its JS object and allocation
+overhead are not a process-memory estimate. Cancellation is checked
 before/after evaluation and at task yields after approximately 4,096 index or
 joint-contribution work units. `SCENE_LOAD_ABORTED` reports cancellation,
 `UNSUPPORTED_LIMIT` reports budget or unsafe float32-magnitude rejection, and
