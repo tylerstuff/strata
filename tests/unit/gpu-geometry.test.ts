@@ -92,4 +92,19 @@ describe('GPU geometry metadata and frame ownership', () => {
     expect(geometry.geometryTelemetry).toMatchObject({ sourceSeed: 42, sourceTriangleCount: 1, pixelError: 2, pageLoadDelayMs: 17 });
     geometry.dispose();
   });
+
+  it('requests the desired LOD while reporting the actual cost of a finer resident fallback', async () => {
+    const { gpu, cache, create } = setup(); const geometry = await create();
+    const feedback = gpu.buffers.find(buffer => buffer.label.startsWith('Strata geometry feedback'))!;
+    geometry.prepare(gpu.encoder, geometry.camera(800, 600, 0, [0, 0]), 800, 600, false, {});
+    const words = new Uint32Array(feedback.bytes.buffer);
+    words[0] = 3; words[4] = 3; words[8] = 1; words[9] = 1;
+    // Actual GPU feedback: target level 1 is absent, complete finer level 0 remains.
+    words.set([1, 0, 1, 0, 0], 16); new Float32Array(words.buffer)[21] = 2;
+    geometry.submitted(1); await geometry.flushFeedback();
+    expect(cache.setDemand).toHaveBeenCalledExactlyOnceWith([{ tileId: 0, lod: 1, priority: 2 }]);
+    expect(geometry.geometryTelemetry).toMatchObject({ selectedTriangles: 1, shadowTriangles: 1,
+      missingDetailTiles: 0, coverageMissingTiles: 0, maxProjectedError: 0, sourceFrameId: 1 });
+    geometry.dispose();
+  });
 });
