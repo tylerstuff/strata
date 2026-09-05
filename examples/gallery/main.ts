@@ -121,7 +121,7 @@ function update() {
   error.hidden = state.error === null;
   error.textContent = state.error ? `${state.error.code}: ${state.error.message}` : '';
   canvas.setAttribute('aria-busy', String(state.phase === 'loading' || state.busy !== null));
-  for (const control of [sceneSelect, lightSelect, debugSelect, resolutionSelect, element<HTMLButtonElement>('reset-camera'), liveButton, element<HTMLButtonElement>('render-frame')]) control.disabled = !ready;
+  for (const control of [sceneSelect, lightSelect, debugSelect, resolutionSelect, element<HTMLButtonElement>('reset-camera'), element<HTMLButtonElement>('frame-current-pose'), liveButton, element<HTMLButtonElement>('render-frame')]) control.disabled = !ready;
   sceneSelect.value = state.settings.scenePreset;
   lightSelect.value = state.settings.lightingPreset;
   debugSelect.value = state.settings.debugView;
@@ -175,8 +175,8 @@ function update() {
   liveButton.setAttribute('aria-pressed', String(state.live));
   for (const button of modelList.querySelectorAll<HTMLButtonElement>('button[data-model-id]')) {
     button.setAttribute('aria-pressed', String(button.dataset.modelId === state.requestedModelId));
-    button.disabled = state.phase === 'initializing' || state.phase === 'disposed' || state.busy !== null || (ready && progressive);
-    button.title = ready && progressive ? 'Return to ordinary rendering before selecting another model.' : '';
+    button.disabled = state.phase === 'initializing' || state.phase === 'disposed' || (state.busy !== null && state.busy !== 'pose-frame') || (state.phase === 'ready' && progressive);
+    button.title = state.phase === 'ready' && progressive ? 'Return to ordinary rendering before selecting another model.' : '';
   }
   if (shownModel !== selected?.id) {
     shownModel = selected?.id ?? null;
@@ -248,7 +248,7 @@ function update() {
   element<HTMLOutputElement>('animation-time-label').value = `${(scrubbing ? Number(timeline.value) : animation.timeSeconds).toFixed(2)} / ${(activeClip?.duration ?? 0).toFixed(2)} s`;
   loopToggle.disabled = !ready || progressive || !activeClip;
   loopToggle.checked = animation.loop;
-  element('animation-status').textContent = progressive ? 'Progressive diffuse preview supports static geometry only. Animation and ground are unavailable in this mode.' : known ? clips.length ? `${clips.length} runtime-supported clips. Authored motion; camera fit uses rest pose. Looping returns to the clip start.` : 'The runtime exposes no playable clips for this model.' : 'Animation support is reported by the runtime.';
+  element('animation-status').textContent = progressive ? 'Progressive diffuse preview supports static geometry only. Animation and ground are unavailable in this mode.' : known ? clips.length ? `${clips.length} runtime-supported clips. Initial framing and Reset use rest pose; Frame current pose fits once. Looping returns to the clip start.` : 'The runtime exposes no playable clips for this model.' : 'Animation support is reported by the runtime.';
 
   const metrics = state.measurements;
   element('metric-cpu').textContent = milliseconds(metrics.cpuSubmissionMs);
@@ -258,7 +258,7 @@ function update() {
   element('metric-gpu').title = metrics.gpu.frameId === null ? state.engineInfo?.profiling.reason ?? 'No matching GPU samples yet.' : `Measured pass span for frame ${metrics.gpu.frameId}; ${metrics.gpu.passCount} pass samples. Not total frame or presentation time.`;
   const adapter = state.engineInfo?.adapter;
   element('metric-device').textContent = adapter ? [adapter.description || adapter.device || adapter.architecture || adapter.vendor || 'WebGPU adapter', ...(adapter.isFallbackAdapter ? ['software adapter'] : [])].join(' · ') : 'Waiting for runtime';
-  element('operation-status').textContent = viewportError ?? actionError ?? (state.busy ? `Preparing ${state.busy}…` : state.phase === 'ready' ? `${state.viewport.width} × ${state.viewport.height} · ${state.frame?.triangles.toLocaleString() ?? '—'} submitted triangles · ${state.telemetry?.gpuErrorCount ?? 0} GPU errors` : state.error?.message ?? catalog?.diagnostics.join(' ') ?? 'Loading catalog…');
+  element('operation-status').textContent = viewportError ?? actionError ?? (state.busy === 'pose-frame' ? 'Framing current pose…' : state.busy ? `Preparing ${state.busy}…` : state.phase === 'ready' ? `${state.viewport.width} × ${state.viewport.height} · ${state.frame?.triangles.toLocaleString() ?? '—'} submitted triangles · ${state.telemetry?.gpuErrorCount ?? 0} GPU errors` : state.error?.message ?? catalog?.diagnostics.join(' ') ?? 'Loading catalog…');
   updateDisplayStatus();
 }
 
@@ -355,6 +355,7 @@ resolutionSelect.addEventListener('change', () => run(async () => {
   }
 }), { signal: events.signal });
 element('reset-camera').addEventListener('click', () => run(() => runtime.resetCamera()), { signal: events.signal });
+element('frame-current-pose').addEventListener('click', () => run(() => runtime.frameCurrentPose()), { signal: events.signal });
 liveButton.addEventListener('click', () => run(() => runtime.setLive(!runtime.getState().live)), { signal: events.signal });
 element('render-frame').addEventListener('click', () => run(() => runtime.renderFrames()), { signal: events.signal });
 clipSelect.addEventListener('change', () => run(() => runtime.setAnimation({ clipId: clipSelect.value || null, timeSeconds: 0, playing: false })), { signal: events.signal });
@@ -453,6 +454,7 @@ const api = {
   setIndirectEnabled: (enabled: boolean) => runtime.setIndirectEnabled(enabled),
   setOrbit: (orbit: Partial<GalleryOrbit>) => runtime.setOrbit(orbit),
   resetCamera: () => runtime.resetCamera(),
+  frameCurrentPose: () => runtime.frameCurrentPose(),
   setAnimation: (animation: Partial<GalleryAnimation>) => runtime.setAnimation(animation),
   setLive: (live: boolean) => runtime.setLive(live),
   setViewport,

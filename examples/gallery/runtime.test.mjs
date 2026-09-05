@@ -22,7 +22,8 @@ try {
         plugin.onLoad({ filter: /.*/, namespace: 'gallery-cpu' }, args => ({
           loader: 'js', contents: args.path.endsWith('/gltf')
             ? `export const loadGltf = (...args) => globalThis[${JSON.stringify(hookKey)}].loadGltf(...args);
-               export const estimateImportedTextureAllocation = (...args) => globalThis[${JSON.stringify(hookKey)}].estimate(...args);`
+               export const estimateImportedTextureAllocation = (...args) => globalThis[${JSON.stringify(hookKey)}].estimate(...args);
+               export const measureImportedPoseBounds = (...args) => globalThis[${JSON.stringify(hookKey)}].measure(...args);`
             : `export class SceneCommitError extends Error {
                  constructor(committedScene, cause) { super('Scene committed but retirement failed.', {cause});
                    this.name='SceneCommitError'; this.code='SCENE_LOAD_FAILED'; this.stage='retire'; this.commitOccurred=true; this.committedScene=committedScene; }
@@ -77,6 +78,11 @@ function progressiveAsset(sourceUrl) {
   value.primitives = [{ material: 0 }, { material: 0 }];
   value.stats.materials = 2;
   return value;
+}
+function measuredPose(bounds, animation) {
+  return { bounds: structuredClone(bounds), unpaddedBounds: structuredClone(bounds), padding: [0, 0, 0], animation: structuredClone(animation),
+    work: { primitives: 1, indexEntries: 36, uniqueVertices: 8, staticVertices: 0, rigidVertices: 0, skinnedVertices: 8,
+      jointContributions: 8, dedupBytes: 8, yields: 1 }, cpuMs: 0.25, elapsedMs: 0.5 };
 }
 
 function assertFrameFits(frame, bounds) {
@@ -159,7 +165,10 @@ class FakeEngine {
     }
     const frameId = this.frames.length + 1;
     this.frames.push({ frameId, scene: this.sceneIdentity, sourceUrl: this.scene?.sourceUrl ?? null, options: structuredClone(options), width: this.canvas.width, height: this.canvas.height });
-    return { frameId, scene: this.sceneIdentity, ...(this.indirect ? { imported: { indirect: structuredClone(this.indirect) } } : {}), cpuSubmissionMs: 0.1, drawCalls: 1, dispatchCalls: 0, triangles: 12,
+    const requested = options.imported.animation, clip = this.scene.clips.find(item => item.id === requested.clipId);
+    const animation = { ...requested, timeSeconds: clip ? requested.loop && clip.duration > 0
+      ? requested.timeSeconds % clip.duration : Math.min(clip.duration, requested.timeSeconds) : 0 };
+    return { frameId, scene: this.sceneIdentity, imported: { animation, ...(this.indirect ? { indirect: structuredClone(this.indirect) } : {}) }, cpuSubmissionMs: 0.1, drawCalls: 1, dispatchCalls: 0, triangles: 12,
       uploadBytes: 0, allocatedGpuBufferBytes: 0, allocatedGpuTextureBytes: 0, wasmMemoryBytes: 0 };
   }
   async waitForIdle() {
@@ -183,11 +192,13 @@ class FakeEngine {
 }
 
 describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering proof', { concurrency: false, timeout: 5000 }, () => {
-  let canvas, engine, runtime, loadCalls, loadHook, estimateCalls, estimateHook, onChanged, raf, nextRafId, savedGlobals;
+  let canvas, engine, runtime, loadCalls, loadHook, estimateCalls, estimateHook, measureCalls, measureHook, onChanged, raf, nextRafId, savedGlobals;
   beforeEach(async () => {
     canvas = { width: 512, height: 512 }; engine = new FakeEngine(canvas);
     loadCalls = []; loadHook = async url => asset(url); onChanged = () => {};
     estimateCalls = [];
+    measureCalls = [];
+    measureHook = async (prepared, animation) => measuredPose(prepared.bounds, animation);
     estimateHook = (_asset, options) => ({ requestedMaxTextureDimension: options.maxTextureDimension,
       effectiveMaxTextureDimension: Math.min(options.maxTextureDimension, options.maxTextureDimension2D),
       gpuTextureBytes: 4096, textureBudgetBytes: 512 * 1024 * 1024, fitsBudget: true, textures: [] });
@@ -201,6 +212,7 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
         createEngine: async options => { assert.equal(options.canvas, canvas); return engine; },
         loadGltf: (url, options) => { loadCalls.push({ url, options }); return loadHook(url, options); },
         estimate: (asset, options) => { estimateCalls.push({ asset, options }); return estimateHook(asset, options); },
+        measure: (asset, animation, options) => { measureCalls.push({ asset, animation, options }); return measureHook(asset, animation, options); },
       },
     };
     for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
@@ -309,6 +321,273 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     await assert.rejects(runtime.resetCamera(), /maximum camera distance/);
     assert.deepEqual(runtime.getState(), manual);
     assert.equal(manual.phase, 'ready');
+  });
+
+  test('current-pose framing fences the exact submitted pose and fits once without an elapsed-job playback jump', async () => {
+    loadHook = async url => asset(url, [{ id: 'idle', name: 'Idle', duration: 4 }]);
+    await runtime.selectModel(model());
+    await runtime.setOrbit({ azimuth: 1.1, elevation: .35 });
+    tick(1000); tick(1100);
+    const before = runtime.getState(), frameCount = engine.frames.length, loadCount = loadCalls.length;
+    const bounds = { min: [5, -1, 3], max: [7, 4, 5] };
+    const measuring = deferred(), measured = deferred();
+    measureHook = async (prepared, animation, options) => {
+      assert.equal(prepared, engine.scene, 'Measure the retained prepared asset, not a reload');
+      measuring.resolve(); await measured.promise;
+      assert.equal(options.signal.aborted, false);
+      return measuredPose(bounds, animation);
+    };
+    const firstFence = engine.holdFence();
+    const framing = runtime.frameCurrentPose();
+    await firstFence.entered.promise;
+    assert.equal(runtime.getState().busy, 'pose-frame');
+    assert.equal(measureCalls.length, 0, 'CPU measurement must follow the submitted-frame fence');
+    tick(9000);
+    assert.equal(engine.frames.length, frameCount);
+    firstFence.done.resolve(); await measuring.promise;
+    assert.deepEqual(measureCalls[0].animation, before.submittedView.controls.animation);
+    assert.deepEqual(runtime.getState().settings.orbit, before.settings.orbit);
+    for (const operation of [() => runtime.setAnimation({ timeSeconds: 2 }), () => runtime.setOrbit({ azimuth: 2 }),
+      () => runtime.setTextureCap(2048), () => runtime.frameCurrentPose(), () => runtime.captureState(1)]) {
+      await assert.rejects(operation(), /ready and idle/);
+    }
+    assert.throws(() => runtime.setLive(false), /ready and idle/);
+    const finalFence = engine.holdFence();
+    measured.resolve(); await finalFence.entered.promise;
+    assert.equal(engine.frames.length, frameCount + 1);
+    assert.equal(engine.frames.at(-1).options.cameraCut, true);
+    assert.deepEqual(engine.frames.at(-1).options.imported.animation, before.submittedView.controls.animation);
+    assertFrameFits(engine.frames.at(-1), bounds);
+    tick(15000); assert.equal(engine.frames.length, frameCount + 1);
+    finalFence.done.resolve();
+    const receipt = await framing, after = runtime.getState();
+    assert.equal(receipt.format, 'strata.gallery.pose-frame');
+    assert.deepEqual(receipt.source, { engineEpoch: before.engineEpoch, sceneCommit: before.sceneCommit, modelId: before.modelId,
+      viewRevision: before.viewRevision, frameId: before.frame.frameId, viewport: before.viewport,
+      requestedAnimation: before.submittedView.controls.animation, animation: before.frame.imported.animation });
+    assert.equal(receipt.applied.frameId, after.frame.frameId);
+    assert.equal(receipt.applied.viewRevision, before.viewRevision + 1);
+    assert.deepEqual(receipt.applied.orbit.target, [6, 1.5, 4]);
+    assert.equal(receipt.applied.orbit.azimuth, before.settings.orbit.azimuth);
+    assert.equal(receipt.applied.orbit.elevation, before.settings.orbit.elevation);
+    assert.equal(after.live, true); assert.deepEqual(after.settings.animation, before.settings.animation);
+    assert.equal(loadCalls.length, loadCount);
+    receipt.measurement.bounds.min[0] = -99; receipt.source.animation.timeSeconds = 99;
+    assert.equal(runtime.getState().poseFrame.measurement.bounds.min[0], 5);
+    assert.equal(runtime.getState().poseFrame.source.animation.timeSeconds, before.settings.animation.timeSeconds);
+    tick(20000);
+    assert.equal(runtime.getState().settings.animation.timeSeconds, before.settings.animation.timeSeconds);
+    tick(20100);
+    assert.ok(Math.abs(runtime.getState().settings.animation.timeSeconds - before.settings.animation.timeSeconds - .1) < 1e-12);
+    const fitted = runtime.getState().settings.orbit;
+    runtime.resize(288, 480);
+    assert.deepEqual(runtime.getState().settings.orbit, fitted, 'Later playback/resize must not refit rest bounds');
+    await runtime.resetCamera();
+    assert.equal(runtime.getState().poseFrame, null);
+    assertFrameFits(engine.frames.at(-1), engine.scene.bounds);
+  });
+
+  test('a live zero-duration clip remains at the Core-resolved time and can be framed', async () => {
+    loadHook = async url => asset(url, [{ id: 'idle', name: 'Idle', duration: 0 }]);
+    await runtime.selectModel(model());
+    tick(1000); tick(1500); tick(3000);
+    const before = runtime.getState();
+    assert.equal(before.live, true); assert.equal(before.settings.animation.playing, true);
+    assert.equal(before.settings.animation.timeSeconds, 0);
+    assert.equal(before.submittedView.controls.animation.timeSeconds, 0);
+    assert.equal(before.frame.imported.animation.timeSeconds, 0);
+    // Normalize independently of the requested time instead of echoing it: a
+    // zero-duration Core pose is always time zero, even after live callbacks.
+    measureHook = async prepared => measuredPose(prepared.bounds, { clipId: 'idle', timeSeconds: 0, loop: true });
+    const receipt = await runtime.frameCurrentPose();
+    assert.deepEqual(receipt.source.animation, before.frame.imported.animation);
+    assert.deepEqual(receipt.source.requestedAnimation, before.submittedView.controls.animation);
+    assert.deepEqual(receipt.measurement.animation, receipt.source.animation);
+    assert.deepEqual(receipt.applied.animation, runtime.getState().frame.imported.animation);
+    assert.equal(runtime.getState().settings.animation.playing, true);
+    tick(9000); tick(9500);
+    assert.equal(runtime.getState().settings.animation.timeSeconds, 0);
+  });
+
+  test('current-pose framing keeps a paused view paused and returns a receipt before unlock callbacks change settings', async () => {
+    await runtime.selectModel(model());
+    const before = runtime.getState();
+    let followup;
+    onChanged = () => {
+      if (runtime.getState().busy === null && runtime.getState().poseFrame && !followup) {
+        onChanged = () => {};
+        followup = runtime.setLightingPreset('daylight');
+      }
+    };
+    const receipt = await runtime.frameCurrentPose();
+    await followup;
+    assert.equal(receipt.source.frameId, before.frame.frameId);
+    assert.equal(receipt.applied.viewRevision, before.viewRevision + 1);
+    assert.equal(runtime.getState().viewRevision, receipt.applied.viewRevision + 1);
+    assert.equal(runtime.getState().settings.lightingPreset, 'daylight');
+    assert.equal(runtime.getState().live, false); assert.equal(raf.size, 0);
+  });
+
+  for (const reason of ['budget', 'impossible-fit', 'animation-mismatch']) {
+    test(`current-pose ${reason} rejection preserves the healthy ready camera and playback preference`, async () => {
+      loadHook = async url => asset(url, [{ id: 'idle', name: 'Idle', duration: 4 }]);
+      await runtime.selectModel(model()); tick(1000); tick(1250);
+      const before = runtime.getState(), count = engine.frames.length;
+      measureHook = async (prepared, animation) => {
+        if (reason === 'budget') throw Object.assign(new Error('Pose measurement exceeded its budget.'), { code: 'UNSUPPORTED_LIMIT' });
+        return measuredPose(reason === 'impossible-fit' ? { min: [-1000, -1000, -1000], max: [1000, 1000, 1000] } : prepared.bounds,
+          reason === 'animation-mismatch' ? { ...animation, timeSeconds: animation.timeSeconds + 1 } : animation);
+      };
+      await assert.rejects(runtime.frameCurrentPose(), /budget|maximum camera distance|does not match/);
+      const after = runtime.getState();
+      assert.equal(after.phase, 'ready'); assert.equal(after.busy, null); assert.equal(after.error, null);
+      assert.equal(after.viewRevision, before.viewRevision); assert.equal(engine.frames.length, count);
+      assert.deepEqual(after.settings, before.settings); assert.equal(after.live, before.live);
+      assert.equal(after.poseFrame, null);
+      tick(9000); assert.equal(runtime.getState().settings.animation.timeSeconds, before.settings.animation.timeSeconds);
+    });
+  }
+
+  test('responsive resize cancels pose measurement and fences the requested size without moving the camera', async () => {
+    await runtime.selectModel(model());
+    const before = runtime.getState();
+    const measuring = deferred(), release = deferred();
+    measureHook = async (prepared, animation) => { measuring.resolve(); await release.promise; return measuredPose(prepared.bounds, animation); };
+    const framing = runtime.frameCurrentPose();
+    const rejection = assert.rejects(framing, /resize canceled/);
+    await measuring.promise;
+    runtime.resize(288, 480);
+    assert.equal(measureCalls[0].options.signal.aborted, true);
+    assert.deepEqual(runtime.getState().settings.orbit, before.settings.orbit);
+    assert.deepEqual([canvas.width, canvas.height], [512, 512]);
+    const resized = engine.holdFence();
+    release.resolve(); await resized.entered.promise;
+    assert.deepEqual([canvas.width, canvas.height], [288, 480]);
+    assert.deepEqual(runtime.getState().settings.orbit, before.settings.orbit);
+    assert.equal(runtime.getState().busy, 'pose-frame');
+    resized.done.resolve(); await rejection;
+    assert.equal(runtime.getState().phase, 'ready'); assert.equal(runtime.getState().busy, null);
+    assert.deepEqual(runtime.getState().settings.orbit, before.settings.orbit);
+    assert.equal(runtime.getState().poseFrame, null);
+    runtime.resize(192, 480);
+    assert.notEqual(runtime.getState().settings.orbit.distance, before.settings.orbit.distance,
+      'A later independent resize retains the previous automatic rest-fit policy');
+    assertFrameFits(engine.frames.at(-1), engine.scene.bounds);
+  });
+
+  test('model selection aborts measurement and late CPU completion cannot clear a newer settings fence', async () => {
+    loadHook = async url => asset(url, url.includes('/fixture/') ? [{ id: 'idle', name: 'Idle', duration: 4 }] : []);
+    await runtime.selectModel(model());
+    const measuring = deferred(), release = deferred();
+    measureHook = async (prepared, animation) => { measuring.resolve(); await release.promise; return measuredPose(prepared.bounds, animation); };
+    const framing = runtime.frameCurrentPose();
+    const rejection = assert.rejects(framing, /superseded/);
+    await measuring.promise;
+    await runtime.selectModel(model('other'));
+    assert.equal(measureCalls[0].options.signal.aborted, true);
+    const gate = engine.holdFence(), changing = runtime.setLightingPreset('daylight');
+    await gate.entered.promise;
+    const beforeLate = runtime.getState();
+    release.resolve(); await rejection;
+    assert.deepEqual(runtime.getState(), beforeLate);
+    assert.equal(runtime.getState().busy, 'settings');
+    gate.done.resolve(); await changing;
+    assert.equal(runtime.getState().modelId, 'other'); assert.equal(runtime.getState().live, false);
+    assert.equal(runtime.getState().poseFrame, null);
+  });
+
+  test('the helper cancellation wrapper preserves a superseded action AbortError without touching the newer model', async () => {
+    await runtime.selectModel(model());
+    const measuring = deferred(), release = deferred();
+    measureHook = async (_prepared, _animation, options) => {
+      measuring.resolve(); await release.promise;
+      throw Object.assign(new Error('Imported pose bounds measurement was canceled.', { cause: options.signal.reason }), { code: 'SCENE_LOAD_ABORTED' });
+    };
+    const framing = runtime.frameCurrentPose();
+    const rejection = assert.rejects(framing, error => error instanceof DOMException && error.name === 'AbortError');
+    await measuring.promise; await runtime.selectModel(model('other'));
+    const beforeLate = runtime.getState();
+    release.resolve(); await rejection;
+    assert.deepEqual(runtime.getState(), beforeLate);
+  });
+
+  test('a responsive resize during the final framing fence preserves the fitted camera and returns the final frame identity', async () => {
+    await runtime.selectModel(model());
+    const measuring = deferred(), release = deferred();
+    const bounds = { min: [2, 0, -2], max: [3, 2, -1] };
+    measureHook = async (_prepared, animation) => { measuring.resolve(); await release.promise; return measuredPose(bounds, animation); };
+    const source = runtime.getState(), framing = runtime.frameCurrentPose();
+    await measuring.promise;
+    const fitted = engine.holdFence(); release.resolve(); await fitted.entered.promise;
+    const camera = runtime.getState().settings.orbit;
+    assertFrameFits(engine.frames.at(-1), bounds);
+    assert.doesNotThrow(() => runtime.resize(288, 480));
+    assert.deepEqual([canvas.width, canvas.height], [512, 512]);
+    assert.equal(measureCalls[0].options.signal.aborted, false);
+    await assert.rejects(runtime.selectModel(model('other')), /still settling/);
+    const resized = engine.holdFence(); fitted.done.resolve(); await resized.entered.promise;
+    assert.deepEqual([canvas.width, canvas.height], [288, 480]);
+    assert.deepEqual(runtime.getState().settings.orbit, camera);
+    assert.equal(runtime.getState().busy, 'pose-frame');
+    resized.done.resolve(); const receipt = await framing;
+    const settled = runtime.getState();
+    assert.equal(settled.phase, 'ready'); assert.equal(settled.busy, null);
+    assert.equal(receipt.source.frameId, source.frame.frameId);
+    assert.deepEqual(receipt.source.viewport, source.viewport);
+    assert.equal(receipt.applied.frameId, source.frame.frameId + 2);
+    assert.equal(receipt.applied.frameId, settled.frame.frameId);
+    assert.equal(receipt.applied.viewRevision, settled.viewRevision);
+    assert.deepEqual(receipt.applied.viewport, { width: 288, height: 480 });
+    assert.deepEqual(receipt.applied.orbit, camera);
+    assert.deepEqual(settled.submittedView.controls.animation, receipt.source.animation);
+    assert.deepEqual(settled.poseFrame, receipt);
+    runtime.resize(512, 512); assert.deepEqual(runtime.getState().settings.orbit, camera);
+  });
+
+  for (const interruption of ['dispose', 'lost', 'foreign-scene']) {
+    test(`${interruption} during pose measurement prevents a late camera application`, async () => {
+      await runtime.selectModel(model());
+      const measuring = deferred(), release = deferred(), before = runtime.getState();
+      measureHook = async (prepared, animation) => { measuring.resolve(); await release.promise; return measuredPose(prepared.bounds, animation); };
+      const framing = runtime.frameCurrentPose();
+      const rejection = assert.rejects(framing);
+      await measuring.promise;
+      if (interruption === 'dispose') runtime.dispose();
+      else if (interruption === 'lost') engine.state = 'lost';
+      else engine.sceneIdentity = { ...engine.sceneIdentity, sceneGeneration: 99 };
+      release.resolve(); await rejection;
+      const after = runtime.getState();
+      assert.equal(after.phase, interruption === 'dispose' ? 'disposed' : 'error');
+      assert.deepEqual(after.settings.orbit, before.settings.orbit);
+      assert.equal(engine.frames.length, before.frame.frameId);
+      assert.equal(after.poseFrame, null); assert.equal(after.live, false); assert.equal(raf.size, 0);
+    });
+  }
+
+  test('a changed physical canvas makes pose measurement stale without applying a camera', async () => {
+    await runtime.selectModel(model());
+    const measuring = deferred(), release = deferred(), before = runtime.getState();
+    measureHook = async (prepared, animation) => { measuring.resolve(); await release.promise; return measuredPose(prepared.bounds, animation); };
+    const framing = runtime.frameCurrentPose();
+    const rejection = assert.rejects(framing, /submitted view changed/);
+    await measuring.promise; canvas.width = 480;
+    release.resolve(); await rejection;
+    assert.equal(runtime.getState().phase, 'ready');
+    assert.deepEqual(runtime.getState().settings.orbit, before.settings.orbit);
+    assert.equal(engine.frames.length, before.frame.frameId);
+  });
+
+  test('a failed final framing fence faults the applied view instead of claiming successful framing', async () => {
+    await runtime.selectModel(model());
+    const measuring = deferred(), release = deferred();
+    measureHook = async (prepared, animation) => { measuring.resolve(); await release.promise; return measuredPose(prepared.bounds, animation); };
+    const framing = runtime.frameCurrentPose();
+    const rejection = assert.rejects(framing, /framing fence failed/);
+    await measuring.promise;
+    const fence = engine.holdFence(); release.resolve(); await fence.entered.promise;
+    fence.done.reject(new Error('framing fence failed')); await rejection;
+    assert.equal(runtime.getState().phase, 'error'); assert.equal(runtime.getState().poseFrame, null);
+    assert.equal(runtime.getState().live, false); assert.equal(raf.size, 0);
   });
 
   test('temporal toggles reset history, advance view identity and match capture state without changing other controls', async () => {
@@ -773,6 +1052,61 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     assert.equal(state.progressive.countersPending, false);
     assert.equal(state.progressive.telemetry.sampleCounters.revision, state.progressive.telemetry.progress.revision);
     assert.equal(raf.size, 1); assert.equal(state.live, true);
+  });
+
+  test('progressive pose framing settles live counters before measuring and preserves submitted exposure', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive'); await runtime.setExposureEV(2.5);
+    runtime.setLive(true);
+    const live = engine.holdFence(); tick(1000); await live.entered.promise;
+    const before = runtime.getState(), count = engine.frames.length;
+    const bounds = { min: [-.5, 0, -.3], max: [.7, 1, .8] };
+    measureHook = async (_asset, animation) => measuredPose(bounds, animation);
+    const initial = engine.holdFence(), framing = runtime.frameCurrentPose();
+    assert.equal(measureCalls.length, 0); assert.equal(engine.frames.length, count);
+    assert.equal(engine.activeFences, 1); assert.equal(runtime.getState().progressive.countersPending, true);
+    live.done.resolve(); await initial.entered.promise;
+    assert.equal(engine.maximumActiveFences, 1); assert.equal(measureCalls.length, 0);
+    assert.equal(runtime.getState().progressive.countersPending, true, 'The framing fence is tracked after live counters settle');
+    const applied = engine.holdFence(); initial.done.resolve(); await applied.entered.promise;
+    assert.equal(measureCalls.length, 1); assert.equal(engine.frames.length, count + 1);
+    assert.equal(engine.frames.at(-1).options.exposureEV, 2.5);
+    assertFrameFits(engine.frames.at(-1), bounds);
+    assert.equal(runtime.getState().progressive.countersPending, true);
+    applied.done.resolve(); const receipt = await framing, after = runtime.getState();
+    assert.equal(engine.maximumActiveFences, 1); assert.equal(after.progressive.countersPending, false);
+    assert.equal(after.settings.exposureEV, 2.5); assert.equal(after.submittedView.exposureEV, 2.5);
+    assert.deepEqual(receipt.source.animation, before.frame.imported.animation);
+    assert.equal(receipt.applied.frameId, after.frame.frameId);
+    assert.equal(after.progressive.telemetry.sampleCounters.revision, after.progressive.telemetry.progress.revision);
+    assert.equal(after.live, true); assert.equal(after.phase, 'ready');
+  });
+
+  for (const cancellation of ['resize', 'model']) test(`progressive framing canceled by ${cancellation} while live counters settle preserves healthy ownership`, async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive'); runtime.setLive(true);
+    const live = engine.holdFence(); tick(1000); await live.entered.promise;
+    const before = runtime.getState(), count = engine.frames.length;
+    const framing = runtime.frameCurrentPose();
+    const rejected = assert.rejects(framing, error => error.name === 'AbortError');
+    let replacement;
+    if (cancellation === 'resize') runtime.resize(400, 300);
+    else replacement = runtime.selectModel(model('replacement'));
+    assert.equal(engine.frames.length, count); assert.equal(measureCalls.length, 0);
+    live.done.resolve(); await rejected; if (replacement) await replacement;
+    const after = runtime.getState();
+    assert.equal(after.phase, 'ready'); assert.equal(after.busy, null); assert.equal(after.error, null);
+    assert.equal(measureCalls.length, 0); assert.equal(after.poseFrame, null);
+    assert.equal(engine.maximumActiveFences, 1); assert.equal(after.progressive.countersPending, false);
+    if (cancellation === 'resize') {
+      assert.deepEqual(after.settings.orbit, before.settings.orbit);
+      assert.deepEqual(after.viewport, { width: 400, height: 300 });
+      assert.deepEqual(after.sceneCommit, before.sceneCommit);
+    } else {
+      assert.equal(after.modelId, 'replacement');
+      assert.equal(after.sceneCommit.sceneGeneration, engine.sceneIdentity.sceneGeneration);
+      assert.notEqual(after.sceneCommit.sceneGeneration, before.sceneCommit.sceneGeneration);
+    }
   });
 
   test('progressive live readback completion after disposal causes no late callback, submission or schedule', async () => {

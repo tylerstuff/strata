@@ -68,8 +68,15 @@ reported as supported by the runtime. A catalog clip count does not establish
 runtime support. Unsupported animation or materials, texture resizing and other
 importer diagnostics remain visible in Preview limits.
 Root motion is preserved. Reset fits the rest-pose
-bounds, and a traveling clip can leave that framing. Scripts can reframe by setting
-the orbit target and distance. In ordinary mode, available Idle, F_idle or idle01 clips play initially;
+bounds, and a traveling clip can leave that framing. **Frame current pose** fits the
+currently submitted pose once while keeping your viewing direction. It pauses
+advancement, waits for that frame's GPU work, measures the retained model on the
+CPU and fits the measured bounds to the current physical render size. Playback
+then resumes with its previous preference, without advancing by the time spent
+measuring. This action does not follow later animation: subsequent playback and
+resizing preserve the chosen camera. Reset restores rest-pose fitting.
+Scripts can also reframe by setting the orbit target and distance.
+In ordinary mode, available Idle, F_idle or idle01 clips play initially;
 otherwise the gallery starts paused in the rest pose.
 Catalog triangle counts describe stored source primitives; they are separate from
 the runtime's actual submitted triangle count. The catalog's source SHA-256 covers
@@ -218,6 +225,7 @@ if (clips.length === 0) throw new Error('The runtime exposes no playable clips.'
 await gallery.setAnimation({
   clipId: clips[0].id, timeSeconds: 0.5, loop: false, playing: false,
 });
+const framing = await gallery.frameCurrentPose();
 await gallery.setTextureCap(4096);
 const frozen = await gallery.captureState(4);
 // An external browser runner screenshots canvas#viewport, then verifies that
@@ -243,6 +251,28 @@ reset it. `getState().settings.exposureEV` and each capture's
 `state.submittedView.exposureEV` records the exact submitted value; keep it with the image when
 comparing captures. A changed exposure does not reset scene-linear GI or temporal
 AA history.
+
+`frameCurrentPose()` requires a ready, idle gallery. It measures index-referenced
+model geometry for the exact submitted clip/time/loop settings, including supported
+rigid and skinned motion. It checks model, scene, view and frame identity before
+applying one camera cut. Cancellation, stale input, an exceeded measurement budget
+or an impossible fit leaves the camera unchanged; a healthy view remains ready.
+Selecting another model or disposing the gallery cancels pending measurement.
+A responsive resize cancels measurement and applies the requested size without
+moving the camera during that handoff. A resize queued after the camera has been
+applied preserves that camera and settles before returning; the receipt records
+the final frame and dimensions. Other view changes reject while framing is busy.
+
+The returned receipt records the measured `source` identity, `measurement` bounds,
+work counts and timing, and the `applied` camera/frame identity.
+`source.requestedAnimation` preserves the submitted controls; `source.animation`
+records Core's resolved pose for that exact frame, including time zero for a
+zero-duration clip.
+`getState().poseFrame` retains the last successful receipt; its tags describe that
+operation, even after later animation advances. `measurement.cpuMs` is elapsed
+measurement time excluding deliberate task-yield waits; it is not a CPU profiler
+measurement. `elapsedMs` includes those waits. The action reuses loaded bytes
+and does not change lighting, materials or animation presets.
 
 The control surface also exposes `getCatalog`, `setScenePreset`, `setDebugView`,
 `setOrbit`, `resetCamera`, `renderFrames` and `dispose`. Orbit angles are radians.
@@ -270,7 +300,9 @@ GPU errors stop the session; reload to recreate its engine.
 ## Validation
 
 CPU catalog, timing and lifecycle checks use generated data and mocked engine
-operations; they do not establish rendering correctness. The separate
+operations; they do not establish rendering correctness. Current-pose framing
+has CPU bounds and lifecycle coverage; its actual browser behavior remains
+unverified. The separate
 `tests/browser/gallery-assertions.mjs` helper requires actual Strata WebGPU
 submissions, two generated lit models and a visibly moving animation. It checks
 model/lighting/clip pixel changes, Core-reported source and animation, fixed-size

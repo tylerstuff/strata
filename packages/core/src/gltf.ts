@@ -6,3 +6,5 @@ export type {
 } from './imported/imported-types.js';
 export { estimateImportedTextureAllocation } from './imported/imported-texture-plan.js';
 export type { ImportedTextureAllocationOptions, ImportedTextureAllocationRecord, ImportedTextureAllocationEstimate } from './imported/imported-texture-plan.js';
+export { measureImportedPoseBounds, importedPoseBoundsLimits } from './imported/imported-pose-bounds.js';
+export type { ImportedPoseBoundsOptions, ImportedPoseBoundsResult } from './imported/imported-pose-bounds.js';
