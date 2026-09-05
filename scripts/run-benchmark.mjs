@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 import { createBenchmarkServer } from './benchmark-server.mjs';
 import { validateBenchmarkReport } from './validate-benchmark.mjs';
+import { checkPower } from './benchmark-power.mjs';
 
 const exec = promisify(execFile);
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -159,21 +160,6 @@ async function powerSnapshot() {
     };
   }
   return snapshot;
-}
-
-function powerProfile(snapshot) {
-  return { source: snapshot.source, lowPowerMode: snapshot.lowPowerMode?.[snapshot.source] ?? null };
-}
-
-function checkPower(snapshot, expected, requireAcPerformance) {
-  const profile = powerProfile(snapshot);
-  if (requireAcPerformance && (profile.source !== 'AC Power' || profile.lowPowerMode !== 0)) {
-    throw new Error('This capture requires AC power with the active Low Power Mode profile off. The power probe did not confirm both conditions.');
-  }
-  if (expected && (profile.source !== expected.source || profile.lowPowerMode !== expected.lowPowerMode)) {
-    throw new Error('The active power source or Low Power Mode changed during this session. Repeat all comparison runs under a stable profile.');
-  }
-  return profile;
 }
 
 function isSoftwareAdapter(adapter) {

@@ -17,7 +17,7 @@
     "test:unit": "npm run build:wasm && vitest run",
     "test:rust": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked",
     "test:consumers": "node scripts/test-consumers.mjs",
-    "test:benchmark-server": "node --test scripts/benchmark-server.test.mjs scripts/validate-benchmark.test.mjs",
+    "test:benchmark-server": "node --test scripts/benchmark-server.test.mjs scripts/validate-benchmark.test.mjs scripts/benchmark-power.test.mjs",
     "benchmark": "node scripts/run-benchmark.mjs",
     "benchmark:serve": "node scripts/benchmark-server.mjs",
     "benchmark:smoke": "node scripts/run-benchmark.mjs --smoke",
