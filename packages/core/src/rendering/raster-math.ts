@@ -47,6 +47,8 @@ export function orthographicMatrix(extent: number, near: number, far: number): F
 }
 
 export interface CameraFrame {
+  readonly projectionScaleY?: number;
+  readonly orthographic?: boolean;
   readonly view: Float32Array<ArrayBuffer>;
   readonly viewProjection: Float32Array<ArrayBuffer>;
   readonly eye: Vec3;

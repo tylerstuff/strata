@@ -4,11 +4,13 @@ import { initializeCpuRuntime } from '../../packages/core/src/internal/cpu-runti
 import { GpuProfiler } from '../../packages/core/src/profiling/gpu-profiler.js';
 import { SceneRenderer } from '../../packages/core/src/rendering/scene-renderer.js';
 import { RasterRenderer } from '../../packages/core/src/rendering/raster-renderer.js';
+import { VirtualRenderer } from '../../packages/core/src/geometry/virtual-renderer.js';
 import type { RasterControls } from '../../packages/core/src/rendering/raster-types.js';
 
 vi.mock('../../packages/core/src/internal/cpu-runtime.js', () => ({ initializeCpuRuntime: vi.fn() }));
 vi.mock('../../packages/core/src/rendering/scene-renderer.js', () => ({ SceneRenderer: { create: vi.fn() } }));
 vi.mock('../../packages/core/src/rendering/raster-renderer.js', () => ({ RasterRenderer: { create: vi.fn() } }));
+vi.mock('../../packages/core/src/geometry/virtual-renderer.js', () => ({ VirtualRenderer: { create: vi.fn() } }));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -90,7 +92,7 @@ describe('bounded GPU timestamps', () => {
     ]);
     expect(profiler.pendingSamples).toBe(0);
     expect(profiler.droppedSamples).toBe(1);
-    expect(profiler.allocatedBufferBytes).toBe(256);
+    expect(profiler.allocatedBufferBytes).toBe(512);
     profiler.dispose();
   });
 
@@ -295,7 +297,7 @@ describe('engine telemetry and scene ownership', () => {
     expect(f.adapter.requestDevice).toHaveBeenCalledWith(expect.objectContaining({ requiredFeatures: ['timestamp-query'] }));
     expect(engine.info.profiling.reason).toBe('available');
     const frame = engine.render();
-    expect(frame.allocatedGpuBufferBytes).toBe(512);
+    expect(frame.allocatedGpuBufferBytes).toBe(1024);
     expect(engine.getTelemetry().pendingGpuSamples).toBe(1);
     expect(f.encoder.beginRenderPass).toHaveBeenCalledWith(expect.objectContaining({ timestampWrites: expect.any(Object) }));
     f.buffers[1]!.mapping.resolve();
@@ -552,5 +554,83 @@ describe('engine telemetry and scene ownership', () => {
     expect(value.encode.mock.calls[0]![5]).toEqual({ temporal: false, debugView: 'normal', cameraCut: true });
     engine.render({ temporal: false, debugView: 'normal' });
     expect(value.encode.mock.calls[1]![5]).toEqual({ temporal: false, debugView: 'normal' });
+  });
+
+  it('submits virtual feedback after the GPU commands and labels delayed geometry counts', async () => {
+    const value = { ...scene(), passNames: vi.fn(() => ['selection', 'shadow', 'raster', 'temporal', 'presentation'] as const),
+      submitted: vi.fn(), cancelFrame: vi.fn(), flushFeedback: vi.fn(async () => undefined), geometryTelemetry: { sourceFrameId: 0, residentPages: 2 } };
+    vi.mocked(VirtualRenderer.create).mockResolvedValue(value as unknown as VirtualRenderer);
+    const engine = await ready(true);
+    await engine.setScene({ renderer: 'virtual', manifestUrl: '/terrain/manifest.json' });
+    const result = engine.render();
+    expect(value.submitted).toHaveBeenCalledWith(1);
+    expect(value.submitted.mock.invocationCallOrder[0]!).toBeGreaterThan(f.device.queue.submit.mock.invocationCallOrder[0]!);
+    expect(result.triangleCountSourceFrameId).toBe(0);
+    expect(result.geometry).toEqual(value.geometryTelemetry);
+    expect(engine.getTelemetry().pendingGpuSamples).toBe(5);
+    f.buffers[1]!.mapping.resolve();
+    await engine.flushGpuTimings();
+    expect(value.flushFeedback).toHaveBeenCalledOnce();
+    expect(engine.drainGpuTimings()).toHaveLength(5);
+    f.device.queue.submit.mockImplementationOnce(() => { throw new Error('Submission failed'); });
+    expect(() => engine.render()).toThrow();
+    expect(value.cancelFrame).toHaveBeenCalledOnce();
+    engine.render();
+    expect(value.encode.mock.calls.at(-1)![5]).toMatchObject({ cameraCut: true });
+  });
+
+  it('aborts superseded virtual downloads without replacing the currently usable scene', async () => {
+    const original = scene();
+    vi.mocked(SceneRenderer.create).mockResolvedValue(original as unknown as SceneRenderer);
+    let signal: AbortSignal | undefined;
+    vi.mocked(VirtualRenderer.create).mockImplementation((_device, _format, options) => new Promise((_resolve, reject) => {
+      signal = options.signal;
+      signal!.addEventListener('abort', () => reject(new Error('Download aborted')), { once: true });
+    }));
+    const engine = await ready();
+    await engine.setScene({});
+    const pending = engine.setScene({ renderer: 'virtual', manifestUrl: '/terrain/manifest.json' });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'SCENE_LOAD_SUPERSEDED' });
+    await microtasks();
+    engine.render();
+    expect(original.encode).toHaveBeenCalledOnce();
+    await engine.setScene(null);
+    await rejected;
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it('cancels pending virtual creation on disposal and disposes a late successful result', async () => {
+    const late = { ...scene(), submitted: vi.fn(), cancelFrame: vi.fn(), geometryTelemetry: { sourceFrameId: null } };
+    const waiting = deferred<VirtualRenderer>();
+    let signal: AbortSignal | undefined;
+    vi.mocked(VirtualRenderer.create).mockImplementation((_device, _format, options) => { signal = options.signal; return waiting.promise; });
+    const engine = await ready();
+    const pending = engine.setScene({ renderer: 'virtual', manifestUrl: '/terrain/manifest.json' });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'ENGINE_DISPOSED' });
+    await microtasks();
+    engine.dispose();
+    expect(signal?.aborted).toBe(true);
+    waiting.resolve(late as unknown as VirtualRenderer);
+    await rejected;
+    expect(late.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('honors user cancellation during virtual creation and detaches it after success', async () => {
+    const engine = await ready();
+    const controller = new AbortController();
+    vi.mocked(VirtualRenderer.create).mockImplementation((_device, _format, options) => new Promise((_resolve, reject) => {
+      options.signal!.addEventListener('abort', () => reject(new Error('Aborted')), { once: true });
+    }));
+    const pending = engine.setScene({ renderer: 'virtual', manifestUrl: '/terrain/manifest.json', signal: controller.signal });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'SCENE_LOAD_ABORTED' });
+    await microtasks(); controller.abort(); await rejected;
+    const successful = new AbortController();
+    let internalSignal: AbortSignal | undefined;
+    const value = { ...scene(), geometryTelemetry: { sourceFrameId: null } };
+    vi.mocked(VirtualRenderer.create).mockImplementation(async (_device, _format, options) => { internalSignal = options.signal; return value as unknown as VirtualRenderer; });
+    await engine.setScene({ renderer: 'virtual', manifestUrl: '/terrain/manifest.json', signal: successful.signal });
+    successful.abort();
+    expect(internalSignal?.aborted).toBe(false);
+    expect(value.dispose).not.toHaveBeenCalled();
   });
 });

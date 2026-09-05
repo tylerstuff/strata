@@ -1,3 +1,5 @@
+import type { GeometryMode, GeometryTelemetry, RasterControls } from '@strata-engine/core';
+
 export interface Distribution {
   count: number;
   min: number | null;
@@ -37,6 +39,8 @@ export interface FrameSample {
   drawCalls: number;
   dispatchCalls: number;
   triangles: number;
+  triangleCountSourceFrameId?: number | null;
+  geometry?: GeometryTelemetry;
   uploadBytes: number;
   allocatedGpuBufferBytes: number;
   allocatedGpuTextureBytes: number;
@@ -66,9 +70,15 @@ export interface BenchmarkOptions {
   durationSeconds: number;
   seed: number;
   instanceCount: number;
-  renderer: 'diffuse' | 'raster';
+  renderer: 'diffuse' | 'raster' | 'virtual';
   temporal: boolean;
-  debugView: 'final' | 'direct' | 'shadow' | 'depth' | 'normal' | 'motion' | 'material';
+  debugView: NonNullable<RasterControls['debugView']>;
+  manifestUrl?: string;
+  geometryMode: GeometryMode;
+  poolBytes: number;
+  pixelError: number;
+  pageLoadDelayMs: number;
+  cameraMode: 'tour' | 'coverage';
   mode: 'performance' | 'sustained' | 'smoke';
   metadata: Record<string, unknown>;
 }
@@ -84,6 +94,12 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     renderer: input.renderer ?? 'diffuse',
     temporal: input.temporal ?? true,
     debugView: input.debugView ?? 'final',
+    ...(input.manifestUrl === undefined ? {} : { manifestUrl: input.manifestUrl }),
+    geometryMode: input.geometryMode ?? 'streamed',
+    poolBytes: input.poolBytes ?? 8 * 1024 * 1024,
+    pixelError: input.pixelError ?? 2,
+    pageLoadDelayMs: input.pageLoadDelayMs ?? 0,
+    cameraMode: input.cameraMode ?? 'tour',
     mode: input.mode ?? 'performance',
     metadata: input.metadata ?? {},
   };
@@ -99,10 +115,20 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     throw new RangeError('Use a uint32 seed and 1–16384 instances.');
   }
   if (!['performance', 'sustained', 'smoke'].includes(result.mode)) throw new RangeError('Unknown benchmark mode.');
-  if (!['diffuse', 'raster'].includes(result.renderer) || typeof result.temporal !== 'boolean'
-    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'].includes(result.debugView)) {
+  if (!['diffuse', 'raster', 'virtual'].includes(result.renderer) || typeof result.temporal !== 'boolean'
+    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage'].includes(result.debugView)) {
     throw new RangeError('Unknown renderer, temporal setting, or debug view.');
   }
   if (result.renderer === 'diffuse' && result.debugView !== 'final') throw new RangeError('Debug views require the raster renderer.');
+  if (result.renderer === 'virtual') {
+    if (!result.manifestUrl || typeof result.manifestUrl !== 'string') throw new RangeError('Virtual geometry requires manifestUrl.');
+    if (!['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(result.geometryMode)
+      || !['tour', 'coverage'].includes(result.cameraMode)) throw new RangeError('Unknown geometry mode or camera.');
+    if (!Number.isSafeInteger(result.poolBytes) || result.poolBytes < 65536
+      || !Number.isFinite(result.pixelError) || result.pixelError <= 0 || result.pixelError > 1000
+      || !Number.isFinite(result.pageLoadDelayMs) || result.pageLoadDelayMs < 0 || result.pageLoadDelayMs > 60000) {
+      throw new RangeError('Use a positive geometry pool/error and a bounded page delay.');
+    }
+  }
   return result;
 }

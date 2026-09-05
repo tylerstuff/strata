@@ -34,7 +34,11 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
     const coldStart = performance.now();
     engine = await createEngine({ canvas, profiling: true, powerPreference: 'high-performance' });
     const initializedAt = performance.now();
-    await engine.setScene({ seed: options.seed, instanceCount: options.instanceCount, renderer: options.renderer });
+    await engine.setScene(options.renderer === 'virtual' ? {
+      renderer: 'virtual', manifestUrl: options.manifestUrl!, geometryMode: options.geometryMode,
+      poolBytes: options.poolBytes, pixelError: options.pixelError,
+      pageLoadDelayMs: options.pageLoadDelayMs, cameraMode: options.cameraMode,
+    } : { seed: options.seed, instanceCount: options.instanceCount, renderer: options.renderer });
     const compiledAt = performance.now();
     if (engine.info.adapter.isFallbackAdapter && options.mode !== 'smoke') {
       throw new Error('A software/fallback adapter is only valid for smoke tests, not performance reports.');
@@ -107,6 +111,8 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
               drawCalls: metrics.drawCalls,
               dispatchCalls: metrics.dispatchCalls,
               triangles: metrics.triangles,
+              ...(metrics.triangleCountSourceFrameId === undefined ? {} : { triangleCountSourceFrameId: metrics.triangleCountSourceFrameId }),
+              ...(metrics.geometry === undefined ? {} : { geometry: metrics.geometry }),
               uploadBytes: metrics.uploadBytes,
               allocatedGpuBufferBytes: metrics.allocatedGpuBufferBytes,
               allocatedGpuTextureBytes: metrics.allocatedGpuTextureBytes,
@@ -135,13 +141,27 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
     const finalTelemetry = engine.getTelemetry();
     const summary = summarizeFrames(frames);
     const entries = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
+    const virtual = options.renderer === 'virtual';
+    const geometry = finalTelemetry.geometry;
     const result = {
       schemaVersion: 1,
       startedAt,
       completedAt: new Date().toISOString(),
       mode: options.mode,
-      workload: { id: options.renderer === 'diffuse' ? 'procedural-boxes-v1' : 'procedural-pbr-boxes-v1', seed: options.seed, instanceCount: options.instanceCount, cameraPath: 'orbit-20s-v1', renderPath: options.renderer === 'diffuse' ? 'diffuse-raster-v1' : 'pbr-shadow-temporal-v1', renderer: options.renderer, temporal: options.renderer === 'raster' && options.temporal, debugView: options.debugView, externalAssetsUsed: false },
-      quality: options.renderer === 'raster' ? { shadowMapSize: 2048, shadowKernel: '3x3-comparison', materialFixture: 'checker-metal-rough-v1', exposure: 1, temporalFilter: 'depth-qualified-bilinear-clamped-v1', temporalHistoryWeight: 0.9, jitterSequenceLength: 8 } : { shading: 'diffuse-directional' },
+      workload: {
+        id: virtual ? 'cooked-analytic-terrain-v1' : options.renderer === 'diffuse' ? 'procedural-boxes-v1' : 'procedural-pbr-boxes-v1',
+        seed: virtual ? geometry?.sourceSeed : options.seed, instanceCount: virtual ? 0 : options.instanceCount,
+        cameraPath: virtual ? geometry?.cameraPath : 'orbit-20s-v1',
+        renderPath: virtual ? 'virtual-pbr-shadow-temporal-v1' : options.renderer === 'diffuse' ? 'diffuse-raster-v1' : 'pbr-shadow-temporal-v1',
+        renderer: options.renderer, temporal: options.renderer !== 'diffuse' && options.temporal, debugView: options.debugView,
+        externalAssetsUsed: virtual, ...(virtual ? { geometryMode: options.geometryMode, sourceTriangleCount: geometry?.sourceTriangleCount, uniqueCompiledBytes: geometry?.uniqueCompiledBytes } : {}),
+      },
+      quality: options.renderer !== 'diffuse' ? {
+        shadowMapSize: 2048, shadowKernel: '3x3-comparison', materialFixture: virtual ? 'terrain-checker-v1' : 'checker-metal-rough-v1', exposure: 1,
+        temporalFilter: 'depth-qualified-bilinear-clamped-v1', temporalHistoryWeight: 0.9, jitterSequenceLength: 8,
+        ...(virtual ? { geometryMode: options.geometryMode, poolBytes: options.poolBytes, pixelError: options.pixelError, pageLoadDelayMs: options.pageLoadDelayMs,
+          shadowGeometry: 'selected-visible-lod-and-offscreen-roots', manifestUrl: options.manifestUrl } : {}),
+      } : { shading: 'diffuse-directional' },
       resolution: { width: options.width, height: options.height, devicePixelRatio, cssWidth: canvas.clientWidth, cssHeight: canvas.clientHeight, screenWidth: screen.width, screenHeight: screen.height },
       capture: { warmupSeconds: options.warmupSeconds, requestedDurationSeconds: options.durationSeconds, actualDurationMs: captureEnd - captureStart, frameCount: frames.length, visibilityChanges },
       browser: { userAgent: navigator.userAgent, hardwareConcurrency: navigator.hardwareConcurrency, crossOriginIsolated, secureContext: isSecureContext },
@@ -149,7 +169,12 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       capabilities: { adapterFeatures: engine.info.adapterFeatures, adapterLimits: engine.info.adapterLimits, deviceLimits: engine.info.deviceLimits },
       profiling: { ...engine.info.profiling, capturedGpuSamples: summary.gpuPassMs.count, timedFrameCount: summary.gpuPassMs.count, capturedPassSampleCount: [...capturedTimings.values()].reduce((sum, values) => sum + values.length, 0), droppedGpuSamples: finalTelemetry.droppedGpuSamples - measuredStartTelemetry.droppedGpuSamples, pendingGpuSamples: finalTelemetry.pendingGpuSamples },
       coldStart: { initializeMs: initializedAt - coldStart, sceneSetupMs: compiledAt - initializedAt, uploadBytes: initialTelemetry.totalUploadBytes },
-      assetTraffic: { externalAssetsUsed: false, steadyUploadBytes: finalTelemetry.totalUploadBytes - measuredStartTelemetry.totalUploadBytes, documentResourceTransferBytes: entries.reduce((sum, entry) => sum + entry.transferSize, 0), documentResourceDecodedBytes: entries.reduce((sum, entry) => sum + entry.decodedBodySize, 0), note: 'Document resource totals include engine/app loading, exclude worker-internal fetch timing, and may contain cache/cross-origin zero values. They are not model-streaming traffic.' },
+      assetTraffic: {
+        externalAssetsUsed: virtual, steadyUploadBytes: finalTelemetry.totalUploadBytes - measuredStartTelemetry.totalUploadBytes,
+        documentResourceTransferBytes: entries.reduce((sum, entry) => sum + entry.transferSize, 0), documentResourceDecodedBytes: entries.reduce((sum, entry) => sum + entry.decodedBodySize, 0),
+        ...(virtual ? { geometryAtCaptureStart: measuredStartTelemetry.geometry, geometryAtCaptureEnd: geometry } : {}),
+        note: 'Document resource totals can omit worker/cache traffic. Geometry counters separately record completed page bytes and uploads; final counters may include requests completing during the bounded post-capture GPU readback flush.',
+      },
       allocations: { ...finalTelemetry, note: 'Explicit app-owned GPU buffers/textures and WASM linear memory. Excludes swapchain, driver allocation, browser memory, and JavaScript heap.' },
       summary,
       gpuPasses: Object.fromEntries([...capturedTimings].map(([name, values]) => [name, { ...distribution(values), sampleCount: values.length, totalMs: values.reduce((sum, value) => sum + value, 0) }])),
@@ -157,8 +182,9 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       limitations: [
         'RAF intervals measure browser callback cadence, not scan-out or uncapped GPU throughput.',
         'GPU pass timestamps exclude presentation and may be quantized by the browser.',
-        'This small procedural scene establishes a rendering baseline; it does not validate the final 60 FPS graphics goal.',
-        'No Sketchfab models are loaded, copied, or uploaded by this procedural run.',
+        virtual ? 'This static analytic terrain tests geometry streaming; it does not validate arbitrary meshes or the integrated graphics target.' : 'This small procedural scene establishes a rendering baseline; it does not validate the final 60 FPS graphics goal.',
+        'No Sketchfab models are loaded, copied, or uploaded by this run.',
+        ...(virtual ? ['Triangle and GPU selection counters describe their explicit sourceFrameId, which can lag the submitted frame. Missing counters stay labelled null.'] : []),
       ],
       frames,
     };
@@ -201,7 +227,9 @@ startButton.addEventListener('click', () => {
   const renderer = document.querySelector<HTMLSelectElement>('#renderer')!.value as BenchmarkOptions['renderer'];
   const debugView = document.querySelector<HTMLSelectElement>('#debug')!.value as BenchmarkOptions['debugView'];
   const temporal = document.querySelector<HTMLInputElement>('#temporal')!.checked;
-  void run({ width: width!, height: height!, renderer, debugView, temporal }).catch(error => { status.textContent = String(error); });
+  const manifestUrl = document.querySelector<HTMLInputElement>('#manifest')!.value;
+  const geometryMode = document.querySelector<HTMLSelectElement>('#geometry-mode')!.value as BenchmarkOptions['geometryMode'];
+  void run({ width: width!, height: height!, renderer, debugView, temporal, manifestUrl, geometryMode }).catch(error => { status.textContent = String(error); });
 });
 downloadButton.addEventListener('click', () => {
   const url = URL.createObjectURL(new Blob([JSON.stringify(lastResult, null, 2)], { type: 'application/json' }));

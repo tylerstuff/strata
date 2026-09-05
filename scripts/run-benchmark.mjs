@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { mkdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import { arch, cpus, homedir, platform, release, totalmem } from 'node:os';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,13 +14,13 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 function parseArguments(args) {
   const options = { smoke: false, sustained: false, output: resolve(homedir(), 'Downloads/Strata-Benchmark-Results') };
-  const numeric = new Set(['duration', 'warmup', 'seed', 'instance-count']);
+  const numeric = new Set(['duration', 'warmup', 'seed', 'instance-count', 'pool-mib', 'pixel-error', 'page-delay-ms']);
   for (let index = 0; index < args.length; index++) {
     const name = args[index];
     if (name === '--smoke') options.smoke = true;
     else if (name === '--sustained') options.sustained = true;
     else if (name === '--help') options.help = true;
-    else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view'].includes(name)) {
+    else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view', '--manifest', '--geometry-mode', '--camera'].includes(name)) {
       const value = args[++index];
       if (!value || value.startsWith('--')) throw new Error(`Missing value for ${name}.`);
       options[name.slice(2)] = numeric.has(name.slice(2)) ? Number(value) : value;
@@ -32,10 +33,20 @@ function parseArguments(args) {
   options.renderer ??= 'diffuse';
   options.temporal ??= 'on';
   options['debug-view'] ??= 'final';
-  if (!['diffuse', 'raster'].includes(options.renderer) || !['on', 'off'].includes(options.temporal)
-    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'].includes(options['debug-view'])) {
-    throw new Error('Use --renderer diffuse|raster, --temporal on|off and a supported --debug-view.');
+  options['geometry-mode'] ??= 'streamed';
+  options['pool-mib'] ??= 8;
+  options['pixel-error'] ??= 2;
+  options['page-delay-ms'] ??= 0;
+  options.camera ??= 'tour';
+  if (!['diffuse', 'raster', 'virtual'].includes(options.renderer) || !['on', 'off'].includes(options.temporal)
+    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage'].includes(options['debug-view'])) {
+    throw new Error('Use --renderer diffuse|raster|virtual, --temporal on|off and a supported --debug-view.');
   }
+  if (!['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(options['geometry-mode']) || !['tour', 'coverage'].includes(options.camera)) throw new Error('Unknown geometry mode or camera.');
+  if (!Number.isFinite(options['pool-mib']) || options['pool-mib'] < 0.0625 || !Number.isSafeInteger(options['pool-mib'] * 1024 ** 2)
+    || !Number.isFinite(options['pixel-error']) || options['pixel-error'] <= 0 || options['pixel-error'] > 1000
+    || !Number.isFinite(options['page-delay-ms']) || options['page-delay-ms'] < 0 || options['page-delay-ms'] > 60000) throw new Error('Invalid geometry pool, error or page delay.');
+  if (options.renderer === 'virtual' && (!options.manifest || !process.env.STRATA_BENCHMARK_ASSET_DIR)) throw new Error('Virtual benchmarks require --manifest relative/path/manifest.json and STRATA_BENCHMARK_ASSET_DIR pointing to the external cooked asset root.');
   for (const name of ['duration', 'warmup', 'seed', 'instance-count']) {
     const value = options[name];
     if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error(`--${name} must be a nonnegative finite number.`);
@@ -199,7 +210,8 @@ async function captureEvidence(page, path) {
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
-    console.log('Usage: npm run benchmark -- [--smoke | --sustained] [--duration seconds] [--warmup seconds] [--seed integer] [--instance-count integer] [--output external-directory] [--device-label label] [--renderer diffuse|raster] [--temporal on|off] [--debug-view final|direct|shadow|depth|normal|motion|material]');
+    console.log('Usage: npm run benchmark -- [--smoke | --sustained] [--duration seconds] [--warmup seconds] [--seed integer] [--instance-count integer] [--output external-directory] [--device-label label] [--renderer diffuse|raster|virtual] [--temporal on|off] [--debug-view view]');
+    console.log('Virtual terrain: STRATA_BENCHMARK_ASSET_DIR=/external/cooked/root plus --manifest relative/manifest.json [--geometry-mode streamed|resident-lod|resident-full|mesh-lod] [--pool-mib 8] [--pixel-error 2] [--page-delay-ms 0] [--camera tour|coverage].');
     console.log('Default: headed Chrome, 720p + 1080p, 30s warmup and 60s capture per resolution. Sustained: 1080p, 30s warmup + 180s capture. Smoke timings are never performance evidence.');
     return;
   }
@@ -209,6 +221,14 @@ async function main() {
   await stat(resolve(repository, 'packages/core/dist/index.js')).catch(() => { throw new Error('Run npm run build first.'); });
   await stat(resolve(repository, 'benchmarks/browser/app.js')).catch(() => { throw new Error('Run npm run build first to compile the benchmark application.'); });
   const directory = await outputDirectory(options.output);
+  let geometryAsset;
+  if (options.renderer === 'virtual') {
+    const root = await realpath(resolve(process.env.STRATA_BENCHMARK_ASSET_DIR));
+    const manifest = await realpath(resolve(root, options.manifest));
+    if (!within(root, manifest) || isAbsolute(options.manifest)) throw new Error('--manifest must identify a file inside the external asset root.');
+    const bytes = await readFile(manifest);
+    geometryAsset = { manifestSha256: createHash('sha256').update(bytes).digest('hex'), source: JSON.parse(bytes).source };
+  }
   const host = await hostMetadata();
   const [commit, gitChanges] = await Promise.all([
     command('git', ['rev-parse', 'HEAD']), command('git', ['status', '--porcelain']),
@@ -253,7 +273,7 @@ async function main() {
       await page.bringToFront();
       if (await page.evaluate(() => document.visibilityState !== 'visible')) throw new Error('Benchmark tab must be visible.');
       const powerAtStart = await powerSnapshot();
-      const metadata = { host, source, browser: report.browser, powerAtStart, deviceLabel: options['device-label'] ?? null };
+      const metadata = { host, source, browser: report.browser, powerAtStart, deviceLabel: options['device-label'] ?? null, ...(geometryAsset ? { geometryAsset } : {}) };
       const samples = [{ phase: 'before', ...powerAtStart }];
       let sampling = null;
       const start = Date.now();
@@ -268,6 +288,11 @@ async function main() {
           width, height, warmupSeconds: options.warmup, durationSeconds: options.duration,
           seed: options.seed, mode, metadata, renderer: options.renderer, temporal: options.temporal === 'on', debugView: options['debug-view'],
           ...(options['instance-count'] === undefined ? {} : { instanceCount: options['instance-count'] }),
+          ...(options.renderer === 'virtual' ? {
+            manifestUrl: `/external-assets/${options.manifest.split('/').map(encodeURIComponent).join('/')}`,
+            geometryMode: options['geometry-mode'], poolBytes: options['pool-mib'] * 1024 ** 2,
+            pixelError: options['pixel-error'], pageLoadDelayMs: options['page-delay-ms'], cameraMode: options.camera,
+          } : {}),
         });
       } finally {
         clearInterval(interval);
@@ -285,7 +310,8 @@ async function main() {
       report.runs.push(result);
       if (errors.length) throw new Error(`Browser errors during capture: ${errors.join('; ')}`);
       if (!captureValidation.passed) throw new Error(`The ${width}x${height} procedural scene capture is blank or lacks visible geometry; the failed image and measurements were retained locally.`);
-      if (!result.frames?.length || !result.frames.every((frame) => frame.drawCalls > 0 && frame.triangles > 0)) throw new Error('The procedural scene did not record rendered triangles and draw calls for every measured frame.');
+      if (!result.frames?.length || !result.frames.every((frame) => frame.drawCalls > 0
+        && (frame.triangles > 0 || (options.renderer === 'virtual' && frame.triangleCountSourceFrameId === null)))) throw new Error('The scene did not record geometry submissions or explicitly unavailable GPU counters.');
       validateBenchmarkReport(report);
       await save();
       console.log(`${width}x${height}: completed; ${samples.length} power/thermal observations and a deterministic capture recorded.`);

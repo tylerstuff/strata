@@ -1,6 +1,7 @@
 import { createReadStream } from 'node:fs';
-import { realpath, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -28,8 +29,32 @@ async function containedFile(directory, path) {
   return info.isFile() ? { path: canonical, size: info.size } : null;
 }
 
+async function proceduralFixture(root, canonicalRepository) {
+  const directory = await realpath(resolve(root));
+  const temporary = await realpath(tmpdir());
+  if (directory === temporary || !isWithin(temporary, directory) || isWithin(canonicalRepository, directory)) {
+    throw new Error('Procedural fixtures must use a dedicated temporary directory outside the repository.');
+  }
+  const file = await containedFile(directory, 'manifest.json');
+  if (!file || file.size > 2 * 1024 * 1024) throw new Error('A small procedural geometry manifest is required.');
+  const manifest = JSON.parse(await readFile(file.path, 'utf8'));
+  if (manifest.format !== 'strata-geometry' || manifest.version !== 1 || manifest.pageBytes !== 65536
+      || manifest.source?.kind !== 'analytic-heightfield-v1' || !Array.isArray(manifest.pages)
+      || manifest.pages.length < 1 || manifest.pages.length > 256) {
+    throw new Error('Only small generated analytic heightfield fixtures may use the procedural route.');
+  }
+  const paths = new Set(['manifest.json']);
+  for (const [id, page] of manifest.pages.entries()) {
+    if (page.id !== id || page.url !== `pages/${String(id).padStart(6, '0')}.bin` || page.byteLength !== 65536) {
+      throw new Error('Procedural fixture pages must use canonical bounded geometry page paths.');
+    }
+    paths.add(page.url);
+  }
+  return [directory, paths];
+}
+
 /** Read-only localhost server. External collections are never copied or exposed to CI. */
-export async function createBenchmarkServer({ port = 0, assetRoot = process.env.STRATA_BENCHMARK_ASSET_DIR } = {}) {
+export async function createBenchmarkServer({ port = 0, assetRoot = process.env.STRATA_BENCHMARK_ASSET_DIR, proceduralRoot } = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Port must be an integer from 0 to 65535.');
   const canonicalRepository = await realpath(repository);
   let canonicalAssets = null;
@@ -56,6 +81,12 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
     if (!isWithin(canonicalRepository, entry[1])) throw new Error('The benchmark browser and runtime directories must remain inside the repository.');
   }
   if (canonicalAssets) roots.push(['/external-assets/', canonicalAssets]);
+  // This separate route is only for fresh, tiny cooker fixtures in the OS temp
+  // directory. It never weakens the external collection's CI prohibition.
+  if (proceduralRoot) {
+    const [directory, paths] = await proceduralFixture(proceduralRoot, canonicalRepository);
+    roots.push(['/procedural-assets/', directory, paths]);
+  }
   let catalogAvailable = false;
   if (canonicalAssets) {
     try { catalogAvailable = Boolean(await containedFile(canonicalAssets, 'catalog.json')); }
@@ -79,7 +110,9 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
       }
       const root = roots.find(([prefix]) => path.startsWith(prefix));
       if (!root) return fail(404);
-      const file = await containedFile(root[1], path.slice(root[0].length));
+      const relativePath = path.slice(root[0].length);
+      if (root[2] && !root[2].has(relativePath)) return fail(404);
+      const file = await containedFile(root[1], relativePath);
       if (!file) return fail(404);
       response.writeHead(200, { ...headers, 'Content-Type': mimeTypes[extname(file.path)] ?? 'application/octet-stream', 'Content-Length': file.size });
       if (request.method === 'HEAD') return response.end();

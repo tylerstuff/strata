@@ -99,3 +99,28 @@ test('keeps complete named pass timings distinct from the number of timed frames
   run.profiling.capturedPassSampleCount = 2;
   assert.throws(() => validateBenchmarkReport(report), /pass sample count is inconsistent/);
 });
+
+test('validates delayed geometry feedback independently from current frame submissions', () => {
+  const report = fixture();
+  const run = report.runs[0];
+  Object.assign(run.workload, { renderer: 'virtual', geometryMode: 'streamed', instanceCount: 0,
+    externalAssetsUsed: true, sourceTriangleCount: 32768, uniqueCompiledBytes: 1048576 });
+  run.assetTraffic.externalAssetsUsed = true;
+  run.quality = { poolBytes: 524288 };
+  run.allocations.geometry = { pendingFeedbackFrames: 0 };
+  const geometry = { sourceFrameId: null, coverageMissingTiles: 0, overflowCount: 0,
+    poolBytes: 524288, capacityPages: 8, residentPages: 2, rootPages: 2, pageBytes: 65536 };
+  Object.assign(run.frames[0], { triangles: 0, triangleCountSourceFrameId: null, geometry: { ...geometry } });
+  Object.assign(run.frames[1], { triangleCountSourceFrameId: 2, geometry: { ...geometry, sourceFrameId: 2 } });
+  assert.equal(validateBenchmarkReport(report), report);
+  run.frames[1].geometry.sourceFrameId = 4;
+  run.frames[1].triangleCountSourceFrameId = 4;
+  assert.throws(() => validateBenchmarkReport(report), /future frame/);
+  run.frames[1].geometry.sourceFrameId = 2;
+  run.frames[1].triangleCountSourceFrameId = 2;
+  run.frames[1].geometry.residentPages = 9;
+  assert.throws(() => validateBenchmarkReport(report), /residency bounds/);
+  run.frames[1].geometry.residentPages = 2;
+  run.frames[1].geometry.coverageMissingTiles = 1;
+  assert.throws(() => validateBenchmarkReport(report), /incomplete geometry coverage/);
+});

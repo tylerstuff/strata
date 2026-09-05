@@ -1,11 +1,11 @@
 /** Raster foundation controls; the temporal path defaults to enabled. */
 export interface RasterControls {
   temporal?: boolean;
-  debugView?: 'final' | 'direct' | 'shadow' | 'depth' | 'normal' | 'motion' | 'material';
+  debugView?: 'final' | 'direct' | 'shadow' | 'depth' | 'normal' | 'motion' | 'material' | 'clusters' | 'lod' | 'residency' | 'coverage';
   cameraCut?: boolean;
 }
 
-export type RasterPassName = 'shadow' | 'raster' | 'temporal' | 'presentation';
+export type RasterPassName = 'selection' | 'shadow' | 'raster' | 'temporal' | 'presentation';
 export type RasterTimestamps = Partial<Record<RasterPassName, GPURenderPassTimestampWrites>>;
 
 /**

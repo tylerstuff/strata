@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/runtime"]
+members = ["crates/runtime", "crates/geometry-cooker"]
 resolver = "3"
 
 [profile.release]

@@ -83,6 +83,42 @@ test('invalid listening ports fail before opening a server', async () => {
   for (const port of [-1, 65536, 1.5, NaN]) await assert.rejects(createBenchmarkServer({ port, assetRoot: '' }), /Port/);
 });
 
+test('CI procedural route serves only bounded generated fixture paths with symlink containment', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'strata-geometry-fixture-'));
+  const root = join(directory, 'cooked');
+  await mkdir(join(root, 'pages'), { recursive: true });
+  const manifest = { format: 'strata-geometry', version: 1, pageBytes: 65536,
+    source: { kind: 'analytic-heightfield-v1' },
+    pages: [0, 1].map(id => ({ id, url: `pages/${String(id).padStart(6, '0')}.bin`, byteLength: 65536 })) };
+  await writeFile(join(root, 'manifest.json'), JSON.stringify(manifest));
+  await writeFile(join(root, 'pages/000000.bin'), new Uint8Array(65536));
+  await writeFile(join(root, 'private.txt'), 'must not be served');
+  await writeFile(join(directory, 'outside.bin'), new Uint8Array(65536));
+  await symlink(join(directory, 'outside.bin'), join(root, 'pages/000001.bin'));
+  const oldCi = process.env.CI;
+  let server;
+  try {
+    process.env.CI = 'true';
+    server = await createBenchmarkServer({ assetRoot: '', proceduralRoot: root });
+    assert.deepEqual(await (await fetch(`${server.url}/procedural-assets/manifest.json`)).json(), manifest);
+    assert.equal((await fetch(`${server.url}/procedural-assets/pages/000000.bin`)).status, 200);
+    for (const path of ['private.txt', 'pages/000001.bin', 'pages/000002.bin', '%2e%2e%2foutside.bin']) {
+      assert.equal((await fetch(`${server.url}/procedural-assets/${path}`)).status, 404, path);
+    }
+    await assert.rejects(createBenchmarkServer({ assetRoot: root, proceduralRoot: root }), /local only/);
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', proceduralRoot: tmpdir() }), /dedicated temporary/);
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', proceduralRoot: repository }), /dedicated temporary/);
+    await writeFile(join(root, 'manifest.json'), JSON.stringify({ ...manifest, source: { kind: 'external-model' } }));
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', proceduralRoot: root }), /Only small generated/);
+    await writeFile(join(root, 'manifest.json'), JSON.stringify({ ...manifest, pages: [{ id: 0, url: '../outside.bin', byteLength: 65536 }] }));
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', proceduralRoot: root }), /canonical bounded/);
+  } finally {
+    await server?.close();
+    if (oldCi === undefined) delete process.env.CI; else process.env.CI = oldCi;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('automation refuses CI and explicit software GPU performance runs before browser startup', () => {
   const runner = fileURLToPath(new URL('./run-benchmark.mjs', import.meta.url));
   for (const [environment, message] of [

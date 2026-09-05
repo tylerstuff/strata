@@ -49,7 +49,15 @@ export function validateBenchmarkReport(report) {
     ensure(run.mode === report.mode, `${prefix} mode differs from the session`);
     ensure((run.resolution.width === 1280 && run.resolution.height === 720)
       || (run.resolution.width === 1920 && run.resolution.height === 1080), `${prefix} has a mismatched resolution pair`);
-    ensure(run.workload.seed <= 0xffff_ffff && run.workload.instanceCount >= 1 && run.workload.instanceCount <= 16_384, `${prefix} has an invalid procedural workload`);
+    const virtual = run.workload.renderer === 'virtual';
+    ensure(run.workload.seed <= 0xffff_ffff && (virtual ? run.workload.instanceCount === 0
+      : run.workload.instanceCount >= 1 && run.workload.instanceCount <= 16_384), `${prefix} has an invalid procedural workload`);
+    if (virtual) {
+      ensure(['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(run.workload.geometryMode), `${prefix} has an unknown geometry mode`);
+      ensure(run.workload.externalAssetsUsed === true && run.assetTraffic.externalAssetsUsed === true, `${prefix} must identify cooked asset traffic`);
+      ensure(run.workload.sourceTriangleCount > 0 && run.workload.uniqueCompiledBytes > 0, `${prefix} is missing unique geometry quantities`);
+      ensure(run.allocations.geometry?.pendingFeedbackFrames === 0, `${prefix} has undrained geometry feedback`);
+    }
     ensure(capture.warmupSeconds <= 600 && capture.requestedDurationSeconds > 0 && capture.requestedDurationSeconds <= 1800, `${prefix} has an invalid capture duration`);
     ensure(frames.length > 0 && capture.frameCount === frames.length, `${prefix} frame count differs from its capture`);
     ensure(!capture.visibilityChanges.some(change => change.state !== 'visible'), `${prefix} was hidden during measurement`);
@@ -71,14 +79,26 @@ export function validateBenchmarkReport(report) {
     for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
       const frame = frames[frameIndex];
       ensure(frame.frameIntervalMs > 0, `${prefix} contains an empty frame interval`);
-      ensure(frame.drawCalls > 0 && frame.triangles > 0, `${prefix} contains a frame without procedural geometry`);
+      ensure(frame.drawCalls > 0 && (frame.triangles > 0 || (virtual && frame.triangleCountSourceFrameId === null)), `${prefix} contains a frame without procedural geometry`);
+      if (virtual) {
+        const geometry = frame.geometry;
+        ensure(geometry && frame.triangleCountSourceFrameId === geometry.sourceFrameId, `${prefix} geometry counters lack a matching source frame`);
+        ensure(geometry.sourceFrameId === null || (Number.isInteger(geometry.sourceFrameId) && geometry.sourceFrameId >= 0 && geometry.sourceFrameId <= frame.frameId), `${prefix} geometry counters claim a future frame`);
+        ensure(geometry.coverageMissingTiles === 0 && geometry.overflowCount === 0, `${prefix} records incomplete geometry coverage or overflow`);
+        ensure(geometry.residentPages >= geometry.rootPages && geometry.residentPages <= geometry.capacityPages
+          && geometry.capacityPages * geometry.pageBytes === geometry.poolBytes, `${prefix} violates geometry page residency bounds`);
+        if (run.workload.geometryMode === 'streamed') ensure(geometry.poolBytes <= run.quality.poolBytes, `${prefix} exceeds its configured geometry pool`);
+      }
       if (frame.gpuPasses !== undefined) {
         const entries = Object.entries(frame.gpuPasses);
         if (frame.gpuMs === null) ensure(entries.length === 0, `${prefix} has named timings for an untimed frame`);
         else {
           ensure(entries.length > 0, `${prefix} has no named timings for a timed frame`);
           close(frame.gpuMs, entries.reduce((sum, [, value]) => sum + value, 0), `${prefix} frame pass sum`);
-          const expected = run.workload.renderer === 'raster' ? ['shadow', 'raster', 'presentation', ...(run.workload.temporal ? ['temporal'] : [])] : ['procedural'];
+          const expected = run.workload.renderer === 'raster' || virtual ? [
+            ...(virtual && run.workload.geometryMode !== 'mesh-lod' ? ['selection'] : []),
+            'shadow', 'raster', 'presentation', ...(run.workload.temporal ? ['temporal'] : []),
+          ] : ['procedural'];
           ensure(entries.length === expected.length && expected.every(name => Object.hasOwn(frame.gpuPasses, name)), `${prefix} contains incomplete frame pass timings`);
         }
         for (const [name, value] of entries) {
