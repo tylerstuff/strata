@@ -57,8 +57,19 @@ fn completeLod(lod: u32) -> bool {
     }
   }
   var selected = 0xffffffffu;
-  for (var level = desired; level < count; level++) {
-    if (completeLod(firstLod + level)) { selected = level; break; }
+  if (completeLod(firstLod + desired)) { selected = desired; }
+  // A missing coarser target need not discard finer geometry already resident.
+  // Prefer the closest finer level to bound extra detail; offscreen policy and
+  // the full-resident reference retain their existing selection semantics.
+  if (selected == 0xffffffffu && visible && selectionFrame.settings.y == 0u) {
+    for (var level = i32(desired) - 1; level >= 0; level--) {
+      if (completeLod(firstLod + u32(level))) { selected = u32(level); break; }
+    }
+  }
+  if (selected == 0xffffffffu) {
+    for (var level = desired + 1u; level < count; level++) {
+      if (completeLod(firstLod + level)) { selected = level; break; }
+    }
   }
   let base = tile * 8u;
   let previous = selections[base + 1u];
@@ -70,7 +81,7 @@ fn completeLod(lod: u32) -> bool {
   if (selected == 0xffffffffu) { atomicAdd(&arguments[10], 1u); return; }
   let selectedError = bitcast<f32>(metadata[metadata[5] + (firstLod + selected) * 8u + 4u]);
   selections[base + 4u] = bitcast<u32>(selectedError * selectionFrame.parameters.x / depth);
-  if (visible && selected != desired) { atomicAdd(&arguments[11], 1u); }
+  if (visible && selected > desired) { atomicAdd(&arguments[11], 1u); }
 }
 
 var<workgroup> mainBase: u32;
@@ -157,7 +168,7 @@ fn clusterColor(id: u32) -> vec3f {
   let debug = u32(frame.parameters.z + 0.5);
   output.debugColor = clusterColor(vertex.cluster);
   if (debug == 2u) { output.debugColor = clusterColor(selected * 7u); }
-  if (debug == 3u) { output.debugColor = select(vec3f(0.95, 0.35, 0.05), vec3f(0.1, 0.85, 0.3), selected == desired); }
+  if (debug == 3u) { output.debugColor = select(vec3f(0.95, 0.35, 0.05), vec3f(0.1, 0.85, 0.3), selected <= desired); }
   if (debug == 4u) { output.debugColor = vec3f(1.0); }
   return output;
 }

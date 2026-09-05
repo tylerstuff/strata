@@ -28,6 +28,8 @@ try {
   report.fixture = { source: manifest.source, pages: manifest.pages.length, rootPages: roots.size, poolBytes };
   const shadowValidation = await build({ absWorkingDir: repository, entryPoints: ['tests/browser/geometry-shadow-validation.ts'],
     bundle: true, format: 'esm', platform: 'browser', target: 'es2022', write: false });
+  const fallbackValidation = await build({ absWorkingDir: repository, entryPoints: ['tests/browser/geometry-fallback-validation.ts'],
+    bundle: true, format: 'esm', platform: 'browser', target: 'es2022', write: false });
   server = await createBenchmarkServer({ assetRoot: '', proceduralRoot: fixture });
   const args = ['--enable-unsafe-webgpu'];
   if (process.env.STRATA_TEST_SOFTWARE_GPU === '1') {
@@ -38,6 +40,7 @@ try {
   browser = await chromium.launch({ channel: process.env.STRATA_TEST_BROWSER_CHANNEL ?? 'chromium', headless: process.env.STRATA_TEST_HEADED !== '1', args });
   const page = await browser.newPage({ viewport: { width: 1000, height: 800 }, deviceScaleFactor: 1 });
   await page.route(`${server.url}/geometry-shadow-validation.js`, route => route.fulfill({ contentType: 'text/javascript', body: shadowValidation.outputFiles[0].text }));
+  await page.route(`${server.url}/geometry-fallback-validation.js`, route => route.fulfill({ contentType: 'text/javascript', body: fallbackValidation.outputFiles[0].text }));
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
@@ -208,6 +211,10 @@ try {
   const { images, ...shadowMetrics } = shadowResult;
   report.results.residentFullShadowReference = { ...shadowMetrics, images: Object.keys(images).map(name => `shadow-${name}.png`) };
   for (const [name, dataUrl] of Object.entries(images)) await writeFile(join(directory, `shadow-${name}.png`), Buffer.from(dataUrl.split(',')[1], 'base64'));
+  const fallbackResult = await page.evaluate(async () => (await import('/geometry-fallback-validation.js')).validateGeometryResidentFallback('/procedural-assets/manifest.json'));
+  const { images: fallbackImages, ...fallbackMetrics } = fallbackResult;
+  report.results.residentFinerFallback = { ...fallbackMetrics, images: Object.keys(fallbackImages).map(name => `fallback-${name}.png`) };
+  for (const [name, dataUrl] of Object.entries(fallbackImages)) await writeFile(join(directory, `fallback-${name}.png`), Buffer.from(dataUrl.split(',')[1], 'base64'));
   assert.deepEqual(errors, []);
   console.log(`Geometry shaders, complete coverage, streaming, resident modes, source labels, resize, temporal toggles and disposal passed. Local evidence: ${directory}`);
 } catch (error) {
