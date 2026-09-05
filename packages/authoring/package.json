@@ -1,0 +1,28 @@
+{
+  "name": "@strata-engine/authoring",
+  "version": "0.0.0",
+  "description": "Optional Strata scene documents, typed edits, and noninteractive authoring CLI.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "sideEffects": false,
+  "engines": { "node": ">=22.13.0" },
+  "files": ["dist", "README.md"],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./package.json": "./package.json"
+  },
+  "bin": { "strata-scene": "./dist/bin.js" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": { "ajv": "8.20.0" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tylerstuff/strata.git",
+    "directory": "packages/authoring"
+  }
+}
