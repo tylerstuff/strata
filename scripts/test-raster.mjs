@@ -7,6 +7,7 @@ import { chromium } from 'playwright';
 import { createBenchmarkServer } from './benchmark-server.mjs';
 
 await build({ entryPoints: ['tests/browser/temporal-validation.ts'], outfile: 'benchmarks/browser/temporal-validation.js', bundle: true, format: 'esm', platform: 'browser', target: 'es2022' });
+await build({ entryPoints: ['tests/browser/temporal-detail-validation.ts'], outfile: 'benchmarks/browser/temporal-detail-validation.js', bundle: true, format: 'esm', platform: 'browser', target: 'es2022' });
 const directory = resolve(homedir(), 'Downloads/Strata-Benchmark-Results', `${new Date().toISOString().replaceAll(':', '-')}-raster-validation`);
 await mkdir(directory, { recursive: true });
 const args = ['--enable-unsafe-webgpu'];
@@ -27,6 +28,7 @@ try {
   await page.goto(server.url);
   await page.waitForFunction(() => globalThis.strataBenchmark?.ready);
   report.results.temporalShader = await page.evaluate(async () => (await import('/benchmarks/browser/temporal-validation.js')).validateTemporalShader());
+  report.results.temporalDetail = await page.evaluate(async () => (await import('/benchmarks/browser/temporal-detail-validation.js')).validateTemporalDetail());
   console.log('GPU shaders: GGX normalization, signed motion, valid history, depth-edge filtering, disocclusion, bounds, clamp and reset passed.');
   const images = {};
   for (const temporal of [false, true]) {

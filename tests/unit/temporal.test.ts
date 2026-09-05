@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { TemporalResolve } from '../../packages/core/src/rendering/temporal-resolve.js';
-import { acceptsTemporalHistory, blendDepthQualifiedHistory } from '../../packages/core/src/rendering/temporal-reprojection.js';
+import { acceptsTemporalHistory, blendDepthQualifiedHistory, reconstructTemporalHistory } from '../../packages/core/src/rendering/temporal-reprojection.js';
 import type { TemporalInputs } from '../../packages/core/src/rendering/raster-types.js';
 
 describe('temporal motion and disocclusion contract', () => {
@@ -64,6 +64,66 @@ describe('depth-qualified history filtering', () => {
     expect(blendDepthQualifiedHistory([
       [1, 0, 0, 10], [1, 0, 0, 10], [0, 100, 0, 20], [0, 100, 0, 20],
     ], [0.2, 0.25], 10)).toEqual([1, 0, 0]);
+  });
+});
+
+describe('sharper history reconstruction with positive depth support', () => {
+  type Tap = readonly [number, number, number, number];
+  const footprint = (color: (x: number, y: number) => readonly [number, number, number], depth = 10): Tap[] =>
+    Array.from({ length: 16 }, (_, index) => [...color(index % 4 - 1, Math.floor(index / 4) - 1), depth] as const);
+
+  it('reconstructs constant and quadratic fields at subpixel positions without bilinear smoothing', () => {
+    const constant = footprint(() => [2, 4, 8]);
+    const polynomial = (x: number, y: number): readonly [number, number, number] =>
+      [20 + x * x + 2 * x * y + 3 * y * y, 4 + 2 * x - y, 5 + x * y];
+    for (const fraction of [[0, 0], [0.25, 0.375], [0.75, 0.99], [1, 1]] as const) {
+      const uniform = reconstructTemporalHistory(constant, fraction, 10)!;
+      expect(uniform.filter).toBe('catmull-rom');
+      uniform.color.forEach((value, channel) => expect(value).toBeCloseTo([2, 4, 8][channel]!, 12));
+      expect(uniform.historyWeight).toBeCloseTo(0.9, 12);
+      const curved = reconstructTemporalHistory(footprint(polynomial), fraction, 10)!;
+      const expected = polynomial(fraction[0], fraction[1]);
+      curved.color.forEach((value, channel) => expect(value).toBeCloseTo(expected[channel]!, 12));
+    }
+    const taps = footprint(polynomial);
+    expect(blendDepthQualifiedHistory([taps[5]!, taps[6]!, taps[9]!, taps[10]!], [0.25, 0.375], 10)![0])
+      .not.toBeCloseTo(polynomial(0.25, 0.375)[0], 3);
+  });
+
+  it('falls back to the central positive kernel when an outer cubic tap belongs to another depth', () => {
+    const taps = footprint((x, y) => [x * x + y * y, x + 2, y + 2]);
+    taps[0] = [10_000, 20_000, 30_000, 5];
+    const result = reconstructTemporalHistory(taps, [0.25, 0.75], 10)!;
+    expect(result.filter).toBe('bilinear');
+    expect(result.color).toEqual([1, 2.25, 2.75]);
+    expect(result.acceptedBilinearWeight).toBe(1);
+    expect(result.historyWeight).toBe(0.9);
+  });
+
+  it('weights feedback by the original accepted footprint instead of amplifying a tiny surviving tap', () => {
+    const taps = footprint(() => [100, 200, 300], 5);
+    taps[5] = [1, 2, 3, 10];
+    for (const fraction of [[0.25, 0.25], [0.99, 0.99]] as const) {
+      const result = reconstructTemporalHistory(taps, fraction, 10)!;
+      const expectedSupport = (1 - fraction[0]) * (1 - fraction[1]);
+      expect(result.filter).toBe('bilinear');
+      result.color.forEach((value, channel) => expect(value).toBeCloseTo(channel + 1, 12));
+      expect(result.acceptedBilinearWeight).toBeCloseTo(expectedSupport, 14);
+      expect(result.historyWeight).toBeCloseTo(0.9 * expectedSupport, 14);
+    }
+    expect(reconstructTemporalHistory(taps, [0.99, 0.99], 10)!.historyWeight).toBeLessThan(0.0001);
+  });
+
+  it('ignores zero-weight foreign taps at exact pixel centers and rejects absent support', () => {
+    const taps = footprint(() => [100, 200, 300], 5);
+    taps[5] = [1, 2, 3, 10];
+    expect(reconstructTemporalHistory(taps, [0, 0], 10)).toEqual({
+      color: [1, 2, 3], filter: 'catmull-rom', acceptedBilinearWeight: 1, historyWeight: 0.9,
+    });
+    expect(reconstructTemporalHistory(taps, [1, 1], 10)).toBeNull();
+    expect(reconstructTemporalHistory(taps, [NaN, 0], 10)).toBeNull();
+    expect(reconstructTemporalHistory(taps.slice(1), [0.25, 0.75], 10)).toBeNull();
+    expect(reconstructTemporalHistory(taps, [0, 0], Infinity)).toBeNull();
   });
 });
 
