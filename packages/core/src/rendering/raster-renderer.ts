@@ -1,4 +1,5 @@
 import { StrataError } from '../errors.js';
+import { normalizeExposureEV } from './exposure.js';
 import { buildProceduralScene, instanceStride, vertexStride } from './scene-data.js';
 import type { ProceduralSceneOptions } from './scene-data.js';
 import type { SceneFrameStats } from './scene-renderer.js';
@@ -25,7 +26,8 @@ export function normalizeRasterControls(controls: RasterControls = {}): Required
     || (controls.debugView !== undefined && !debugViews.includes(controls.debugView))) {
     throw new StrataError('INVALID_OPTIONS', 'Invalid raster controls.');
   }
-  return { temporal: controls.temporal ?? true, debugView: controls.debugView ?? 'final', cameraCut: controls.cameraCut ?? false };
+  return { temporal: controls.temporal ?? true, debugView: controls.debugView ?? 'final', cameraCut: controls.cameraCut ?? false,
+    exposureEV: normalizeExposureEV(controls.exposureEV) };
 }
 
 export interface RasterFrameState {
@@ -287,7 +289,7 @@ export class RasterRenderer {
     this.device.queue.writeBuffer(this.resources.frameUniform, 0, frameData);
     const presentationData = new ArrayBuffer(presentationUniformBytes);
     new Uint32Array(presentationData).set([debugIndex, this.gi?.active ? 1 : 0]);
-    new Float32Array(presentationData).set([camera.far, 1], 2);
+    new Float32Array(presentationData).set([camera.far, 2 ** settings.exposureEV], 2);
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
     const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow'): void => {
       for (const pair of this.resources.geometryPipelines) {

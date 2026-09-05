@@ -118,6 +118,28 @@ describe('engine lifecycle', () => {
     expect(() => engine.resize(10, 10)).toThrowError(expect.objectContaining({ code: 'ENGINE_DISPOSED' }));
   });
 
+  it('rejects invalid exposure before frame preparation and keeps the committed scene usable', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const value = { gpuBufferBytes: 0, gpuTextureBytes: 0, initialUploadBytes: 0,
+      passNames: vi.fn(() => ['raster']), encode: vi.fn(() => ({ drawCalls: 1, dispatchCalls: 0, triangles: 1, uploadBytes: 0 })),
+      submitted: vi.fn(), cancelFrame: vi.fn(), dispose: vi.fn() };
+    vi.spyOn(ImportedRenderer, 'create').mockResolvedValue(value as unknown as ImportedRendererType);
+    const engine = await ready(); await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset });
+    const before = engine.getTelemetry();
+    for (const exposureEV of [NaN, Infinity, -Infinity, -16.01, 16.01, null, '4', true]) {
+      expect(() => engine.render({ exposureEV: exposureEV as number })).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+    }
+    expect(value.passNames).not.toHaveBeenCalled(); expect(value.encode).not.toHaveBeenCalled();
+    expect(value.cancelFrame).not.toHaveBeenCalled(); expect(fixture.device.createCommandEncoder).not.toHaveBeenCalled();
+    expect(fixture.device.queue.submit).not.toHaveBeenCalled(); expect(engine.getTelemetry()).toEqual(before);
+    for (const exposureEV of [-16, 0, 16]) {
+      engine.render({ exposureEV });
+      expect(value.encode).toHaveBeenLastCalledWith(fixture.encoder, fixture.view, 640, 360, 0,
+        expect.objectContaining({ exposureEV }), undefined);
+    }
+    expect(engine.state).toBe('ready'); expect(engine.getTelemetry().submittedFrames).toBe(3);
+  });
+
   it('fences submitted GPU work without profiling and does not submit extra frames', async () => {
     const engine = await ready(); const completion = deferred<void>();
     fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(completion.promise);

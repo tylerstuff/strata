@@ -5,6 +5,7 @@ import { validateAuthoredBoxScene, validateAuthoredFrameCamera } from './renderi
 import type { AuthoredBoxRenderer } from './rendering/authored-box-renderer.js';
 import type { AuthoredFrameMetadata, BoxSceneDescriptor } from './rendering/authored-box-types.js';
 import type { RasterControls } from './rendering/raster-types.js';
+import { normalizeExposureEV } from './rendering/exposure.js';
 import type { SceneRenderer } from './rendering/scene-renderer.js';
 import type { RasterRenderer } from './rendering/raster-renderer.js';
 import type { VirtualRenderer } from './geometry/virtual-renderer.js';
@@ -29,6 +30,7 @@ function validateRenderOptions(options: RenderOptions): void {
     || (options.debugView !== undefined && !debugViews.includes(options.debugView))) {
     throw new StrataError('INVALID_OPTIONS', 'Use boolean temporal/cameraCut controls and a supported debugView.');
   }
+  normalizeExposureEV(options.exposureEV);
 }
 
 function snapshotLimits(limits: GPUSupportedLimits): Readonly<Record<string, number>> {
@@ -491,6 +493,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         assertReady();
         const requestedControls = renderOptions ?? defaultRenderOptions;
         validateRenderOptions(requestedControls);
+        if ((requestedControls.exposureEV ?? 0) !== 0 && (!scene || scene.kind === 'diffuse' || scene.kind === 'authored-boxes')) {
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Nonzero exposureEV requires a raster-based renderer; clear, diffuse and authored-boxes have no tone-mapped presentation.');
+        }
         if (requestedControls.imported !== undefined && scene?.kind !== 'imported') {
           throw new StrataError('UNSUPPORTED_FEATURE', 'Imported controls require an imported scene.');
         }
