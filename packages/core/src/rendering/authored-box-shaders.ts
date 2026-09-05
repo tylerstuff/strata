@@ -15,13 +15,14 @@ export function authoredClearColor(
   return { r: present(background[0]), g: present(background[1]), b: present(background[2]), a: 1 };
 }
 
-/** Optional authored root-box path: no implicit scene, ambient term or history. */
+/** Authored root-box color and submitted-view motion; no temporal accumulation. */
 export function authoredBoxShader(targetIsSrgb: boolean): string {
   return /* wgsl */ `
 ${ggxDistributionShader}
 const attachmentIsSrgb = ${targetIsSrgb};
 struct Frame {
   viewProjection: mat4x4f,
+  previousViewProjection: mat4x4f,
   directionToLight: vec4f,
   radiance: vec4f,
   settings: vec4u,
@@ -39,6 +40,10 @@ struct VertexInput {
   @location(8) normal2: vec3f,
   @location(9) material: vec4f,
   @location(10) roughness: f32,
+  @location(11) previousModel0: vec4f,
+  @location(12) previousModel1: vec4f,
+  @location(13) previousModel2: vec4f,
+  @location(14) previousModel3: vec4f,
 };
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -46,6 +51,8 @@ struct VertexOutput {
   @location(1) normal: vec3f,
   @location(2) @interpolate(flat) material: vec4f,
   @location(3) @interpolate(flat) roughness: f32,
+  @location(4) previousClip: vec4f,
+  @location(5) viewDepth: f32,
 };
 @vertex fn vertexMain(input: VertexInput) -> VertexOutput {
   let model = mat4x4f(input.model0, input.model1, input.model2, input.model3);
@@ -53,6 +60,9 @@ struct VertexOutput {
   let relative = model * vec4f(input.position, 1.0);
   var output: VertexOutput;
   output.position = frame.viewProjection * relative;
+  let previousModel = mat4x4f(input.previousModel0, input.previousModel1, input.previousModel2, input.previousModel3);
+  output.previousClip = frame.previousViewProjection * (previousModel * vec4f(input.position, 1.0));
+  output.viewDepth = output.position.w;
   output.relativePosition = relative.xyz;
   output.normal = normalMatrix * input.normal;
   output.material = input.material;
@@ -99,11 +109,31 @@ fn authoredDirect(base: vec3f, authoredRoughness: f32, metallic: f32, n: vec3f, 
   let diffuse = (1.0 - fresnel) * (1.0 - metallic) * base / 3.14159265;
   return (diffuse + distribution * visibility * fresnel) * nl * frame.radiance.xyz;
 }
-@fragment fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+fn color(input: VertexOutput) -> vec4f {
   if (frame.settings.x == 1u) { return vec4f(present(input.material.rgb), 1.0); }
   let direct = authoredDirect(input.material.rgb, input.roughness, input.material.a,
     normalize(input.normal), input.relativePosition);
   return vec4f(present(toneMap(direct)), 1.0);
+}
+struct FragmentOutput {
+  @location(0) color: vec4f,
+  @location(1) motion: vec4f,
+};
+@fragment fn fragmentMain(input: VertexOutput) -> FragmentOutput {
+  var output: FragmentOutput;
+  output.color = color(input);
+  output.motion = vec4f(0.0, 0.0, input.viewDepth, 0.0);
+  // Interpolate homogeneous previous clips with the CURRENT perspective, then
+  // divide here. W=0 explicitly rejects missing/out-of-frustum prior data; it
+  // does not claim the point was visible in the prior depth buffer.
+  let previous = input.previousClip;
+  if (frame.settings.y != 0u && previous.w > 0.0
+    && all(abs(previous.xy) <= vec2f(previous.w)) && previous.z >= 0.0 && previous.z <= previous.w) {
+    let currentUv = input.position.xy / vec2f(frame.settings.zw);
+    let previousUv = previous.xy / previous.w * vec2f(0.5, -0.5) + vec2f(0.5);
+    output.motion = vec4f(previousUv - currentUv, input.viewDepth, previous.w);
+  }
+  return output;
 }
 `;
 }

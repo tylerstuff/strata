@@ -29,20 +29,31 @@ function descriptor(sceneId = 'scene-a', sourceRevision: string | null = 'revisi
 }
 
 function sceneMock(scene: BoxSceneDescriptor, allocation = 128) {
+  let staged: AuthoredFrameMetadata | undefined;
+  let previous: { frameId: number; width: number; height: number } | undefined;
   return {
     gpuBufferBytes: allocation, gpuTextureBytes: 64, initialUploadBytes: 32,
     passNames: vi.fn(() => ['raster']), dispose: vi.fn<() => void>(),
+    submitted: vi.fn((frameId: number) => {
+      if (staged) previous = { frameId, width: staged.width, height: staged.height };
+      staged = undefined;
+    }),
+    cancelFrame: vi.fn(() => { staged = undefined; }),
     encode: vi.fn((_encoder: GPUCommandEncoder, _view: GPUTextureView, width: number, height: number,
       timeSeconds: number, controls: RenderOptions = {}) => {
       // This only models the renderer's metadata boundary; packing/render math is
       // covered separately. Real validation preserves the per-frame camera copy.
       const camera = validateAuthoredFrameCamera(scene, controls.camera ?? scene.camera, width, height);
       const length = Math.hypot(...camera.rotation);
+      const resetReason = !previous ? 'first-frame' : controls.cameraCut ? 'camera-cut'
+        : previous.width !== width || previous.height !== height ? 'viewport-change' : null;
       const authored: AuthoredFrameMetadata = Object.freeze({
         camera: Object.freeze({ ...camera, rotation: Object.freeze(camera.rotation.map(value => value / length)) as BoxCamera['rotation'] }),
         origin: Object.freeze([...camera.position]) as BoxCamera['position'], aspect: width / height,
         width, height, timeSeconds, debugView: controls.debugView === 'base-color' ? 'base-color' : 'final',
+        motion: Object.freeze({ previousSubmittedFrameId: previous?.frameId ?? null, valid: resetReason === null, resetReason }),
       });
+      staged = authored;
       return { authored, drawCalls: 1, dispatchCalls: 0, triangles: 12, uploadBytes: 16, gpuBufferBytes: allocation, gpuTextureBytes: 64 };
     }),
   };
@@ -165,10 +176,13 @@ describe('authored engine commitment and frame lifecycle', () => {
 
   it('preserves the committed scene when asynchronous creation rejects', async () => {
     const engine = await ready(); const first = await engine.setScene({ renderer: 'authored-boxes', scene: descriptor() });
+    const before = engine.render();
     const failure = new Error('pipeline failed'); factories.authored.mockRejectedValueOnce(failure);
     await expect(engine.setScene({ renderer: 'authored-boxes', scene: descriptor('failed') })).rejects.toMatchObject({ code: 'SCENE_LOAD_FAILED', cause: failure });
     expect(engine.getTelemetry().scene.identity).toEqual(first); expect(created[0]!.dispose).not.toHaveBeenCalled();
-    expect(engine.render().scene).toEqual(first);
+    const after = engine.render();
+    expect(after.scene).toEqual(first);
+    expect(after.authored!.motion).toEqual({ previousSubmittedFrameId: before.frameId, valid: true, resetReason: null });
   });
 
   it('assigns distinct generations to identical source revisions and keeps historical receipts immutable', async () => {
@@ -181,6 +195,8 @@ describe('authored engine commitment and frame lifecycle', () => {
     expect(firstFrame.scene).toEqual(first);
     expect(engine.getTelemetry().scene).toEqual({ identity: second, firstSubmittedFrameId: null, lastSubmittedFrameId: null });
     expect(engine.render()).toMatchObject({ frameId: 2, scene: second });
+    expect(created[1]!.encode.mock.results[0]!.value.authored.motion)
+      .toEqual({ previousSubmittedFrameId: null, valid: false, resetReason: 'first-frame' });
     expect(firstFrame.scene.sceneGeneration).toBe(first.sceneGeneration);
   });
 
@@ -228,6 +244,143 @@ describe('authored engine commitment and frame lifecycle', () => {
     expect(() => engine.render()).toThrow();
     expect(engine.getTelemetry()).toMatchObject({ submittedFrames: 1, scene: { identity: committed, firstSubmittedFrameId: 1, lastSubmittedFrameId: 1 } });
     expect(engine.render()).toMatchObject({ frameId: 2, scene: committed });
+    expect(created[0]!.submitted.mock.calls).toEqual([[1], [2]]);
+    expect(created[0]!.cancelFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it('acknowledges authored state only after queue submission succeeds', async () => {
+    const engine = await ready(); await engine.setScene({ renderer: 'authored-boxes', scene: descriptor() });
+    const renderer = created[0]!;
+    gpu.device.queue.submit.mockImplementation(() => {
+      expect(renderer.submitted).not.toHaveBeenCalled();
+      expect(engine.getTelemetry().submittedFrames).toBe(0);
+    });
+    const first = engine.render();
+    expect(first.authored!.motion).toEqual({ previousSubmittedFrameId: null, valid: false, resetReason: 'first-frame' });
+    expect(renderer.submitted).toHaveBeenCalledExactlyOnceWith(first.frameId);
+    expect(renderer.submitted.mock.invocationCallOrder[0]).toBeGreaterThan(gpu.device.queue.submit.mock.invocationCallOrder[0]!);
+    expect(renderer.cancelFrame).not.toHaveBeenCalled();
+  });
+
+  it('retains a real submission when later telemetry throws and cancellation runs after commitment', async () => {
+    const engine = await ready(); const committed = await engine.setScene({ renderer: 'authored-boxes', scene: descriptor() });
+    const renderer = created[0]!; expect(engine.render().frameId).toBe(1);
+    const failure = new Error('post-submit telemetry failed'); let failOnce = true;
+    Object.defineProperty(renderer, 'gpuBufferBytes', { configurable: true, get() {
+      if (failOnce) {
+        failOnce = false;
+        expect(gpu.device.queue.submit).toHaveBeenCalledTimes(2);
+        expect(renderer.submitted.mock.calls).toEqual([[1], [2]]);
+        throw failure;
+      }
+      return 128;
+    } });
+    const camera: BoxCamera = { ...descriptor().camera, position: [.25, .5, 4] };
+    expect(() => engine.render({ camera })).toThrowError(expect.objectContaining({ code: 'RENDER_FAILED', cause: failure }));
+    expect(renderer.cancelFrame).toHaveBeenCalledOnce();
+    expect(renderer.submitted.mock.invocationCallOrder[1]).toBeLessThan(renderer.cancelFrame.mock.invocationCallOrder[0]!);
+    expect(engine.getTelemetry()).toMatchObject({ submittedFrames: 2,
+      scene: { identity: committed, firstSubmittedFrameId: 1, lastSubmittedFrameId: 2 } });
+    expect(renderer.encode.mock.results[1]!.value.authored.camera.position).toEqual(camera.position);
+    const next = engine.render();
+    expect(next.frameId).toBe(3);
+    expect(next.authored!.motion).toEqual({ previousSubmittedFrameId: 2, valid: true, resetReason: null });
+    expect(renderer.encode.mock.lastCall![5]?.cameraCut).toBe(false);
+    expect(renderer.submitted.mock.calls).toEqual([[1], [2], [3]]);
+  });
+
+  it('keeps interleaved engines independent and preserves a good predecessor through invalid camera validation', async () => {
+    const firstEngine = await ready(); const firstScene = descriptor('first-view');
+    firstScene.boxes[0]!.transform.position = [1_000_000, 0, 0]; firstScene.camera.position = [1_000_000, 0, 4];
+    await firstEngine.setScene({ renderer: 'authored-boxes', scene: firstScene });
+    const firstRenderer = created[0]!;
+    const otherGpu = gpuFixture(); vi.stubGlobal('navigator', { gpu: otherGpu.gpu });
+    const otherEngine = await createEngine({ canvas: otherGpu.canvas }); engines.push(otherEngine);
+    const otherScene = descriptor('other-view');
+    otherScene.boxes[0]!.transform.position = [-1_000_000, 0, 0]; otherScene.camera.position = [-1_000_000, 0, 4];
+    await otherEngine.setScene({ renderer: 'authored-boxes', scene: otherScene });
+    const otherRenderer = created[1]!;
+    const firstCamera: BoxCamera = { ...firstScene.camera, position: [1_000_000.25, 0, 4] };
+    const otherCamera: BoxCamera = { ...otherScene.camera, position: [-1_000_000.5, 0, 4] };
+    const a1 = firstEngine.render({ camera: firstCamera });
+    const a2 = firstEngine.render();
+    const b1 = otherEngine.render({ camera: otherCamera });
+    expect([a1.frameId, a2.frameId, b1.frameId]).toEqual([1, 2, 1]);
+    expect(a1.authored!.origin).toEqual(firstCamera.position); expect(b1.authored!.origin).toEqual(otherCamera.position);
+    expect(b1.authored!.motion).toEqual({ previousSubmittedFrameId: null, valid: false, resetReason: 'first-frame' });
+    const a3 = firstEngine.render({ camera: firstCamera, cameraCut: true });
+    const b2 = otherEngine.render();
+    expect(a3.authored!.motion).toEqual({ previousSubmittedFrameId: 2, valid: false, resetReason: 'camera-cut' });
+    expect(b2.authored!.motion).toEqual({ previousSubmittedFrameId: 1, valid: true, resetReason: null });
+    const invalid: BoxCamera = { ...firstCamera, position: [1_005_000, 0, 4] };
+    expect(() => firstEngine.render({ camera: invalid, cameraCut: true }))
+      .toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_LIMIT' }));
+    expect(firstRenderer.encode).toHaveBeenCalledTimes(3);
+    expect(firstRenderer.cancelFrame).not.toHaveBeenCalled();
+    expect(firstRenderer.submitted.mock.calls).toEqual([[1], [2], [3]]);
+    expect(gpu.device.queue.submit).toHaveBeenCalledTimes(3);
+    expect(firstEngine.getTelemetry().submittedFrames).toBe(3);
+    const b3 = otherEngine.render({ camera: otherCamera, cameraCut: true });
+    const a4 = firstEngine.render(); const b4 = otherEngine.render();
+    expect(b3.authored!.motion).toEqual({ previousSubmittedFrameId: 2, valid: false, resetReason: 'camera-cut' });
+    expect(a4.authored!.motion).toEqual({ previousSubmittedFrameId: 3, valid: true, resetReason: null });
+    expect(b4.authored!.motion).toEqual({ previousSubmittedFrameId: 3, valid: true, resetReason: null });
+    expect(a4.authored!.camera).toEqual(firstScene.camera); expect(b4.authored!.camera).toEqual(otherScene.camera);
+    expect(firstRenderer.submitted.mock.calls).toEqual([[1], [2], [3], [4]]);
+    expect(otherRenderer.submitted.mock.calls).toEqual([[1], [2], [3], [4]]);
+    expect(otherRenderer.cancelFrame).not.toHaveBeenCalled();
+    expect(otherGpu.device.queue.submit).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(['encode', 'finish', 'submit'] as const)('discards repeated %s failures without forcing an authored camera cut', async stage => {
+    const engine = await ready(); const committed = await engine.setScene({ renderer: 'authored-boxes', scene: descriptor() });
+    const renderer = created[0]!; let lastSuccessful = engine.render().frameId;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const fail = () => { throw new Error(`${stage} refused`); };
+      if (stage === 'encode') renderer.encode.mockImplementationOnce(fail);
+      if (stage === 'finish') gpu.encoder.finish.mockImplementationOnce(fail);
+      if (stage === 'submit') gpu.device.queue.submit.mockImplementationOnce(fail);
+      expect(() => engine.render({ cameraCut: true })).toThrowError(expect.objectContaining({ code: 'RENDER_FAILED' }));
+      expect(renderer.submitted).toHaveBeenCalledTimes(attempt + 1);
+      expect(renderer.cancelFrame).toHaveBeenCalledTimes(attempt + 1);
+      expect(engine.getTelemetry()).toMatchObject({ submittedFrames: lastSuccessful,
+        scene: { identity: committed, firstSubmittedFrameId: 1, lastSubmittedFrameId: lastSuccessful } });
+      const recovered = engine.render();
+      expect(renderer.encode.mock.lastCall![5]?.cameraCut).not.toBe(true);
+      expect(recovered.authored!.motion).toEqual({ previousSubmittedFrameId: lastSuccessful, valid: true, resetReason: null });
+      expect(recovered.frameId).toBe(lastSuccessful + 1);
+      lastSuccessful = recovered.frameId;
+    }
+  });
+
+  it('keeps a failed resize/cut out of the baseline and forwards a later explicit successful cut', async () => {
+    const engine = await ready(); await engine.setScene({ renderer: 'authored-boxes', scene: descriptor() });
+    const first = engine.render();
+    engine.resize(1280, 720);
+    gpu.encoder.finish.mockImplementationOnce(() => { throw new Error('resized encoder failed'); });
+    expect(() => engine.render({ cameraCut: true })).toThrowError(expect.objectContaining({ code: 'RENDER_FAILED' }));
+    engine.resize(640, 360);
+    const recovered = engine.render();
+    expect(recovered.authored!.motion).toEqual({ previousSubmittedFrameId: first.frameId, valid: true, resetReason: null });
+    const cut = engine.render({ cameraCut: true });
+    expect(created[0]!.encode.mock.lastCall![5]).toMatchObject({ cameraCut: true });
+    expect(cut.authored!.motion).toEqual({ previousSubmittedFrameId: recovered.frameId, valid: false, resetReason: 'camera-cut' });
+    expect(engine.render().authored!.motion).toEqual({ previousSubmittedFrameId: cut.frameId, valid: true, resetReason: null });
+  });
+
+  it('continues submitted motion while a replacement is pending and resets only when it commits', async () => {
+    const engine = await ready(); await engine.setScene({ renderer: 'authored-boxes', scene: descriptor('old') });
+    const first = engine.render(); const pending = deferred<MockScene>(); factories.authored.mockReturnValueOnce(pending.promise);
+    const loading = engine.setScene({ renderer: 'authored-boxes', scene: descriptor('new') });
+    await vi.waitFor(() => expect(factories.authored).toHaveBeenCalledTimes(2));
+    const duringLoad = engine.render();
+    expect(duringLoad.authored!.motion).toEqual({ previousSubmittedFrameId: first.frameId, valid: true, resetReason: null });
+    const replacement = sceneMock(descriptor('new')); pending.resolve(replacement); const receipt = await loading;
+    const after = engine.render();
+    expect(after.scene).toEqual(receipt);
+    expect(after.authored!.motion).toEqual({ previousSubmittedFrameId: null, valid: false, resetReason: 'first-frame' });
+    expect(replacement.submitted).toHaveBeenCalledExactlyOnceWith(after.frameId);
+    expect(created[0]!.submitted.mock.calls).toEqual([[first.frameId], [duringLoad.frameId]]);
   });
 
   it('forwards a one-frame camera override and reports effective view metadata without replacing the scene', async () => {
@@ -236,9 +389,10 @@ describe('authored engine commitment and frame lifecycle', () => {
     engine.resize(768, 512);
     const frame = engine.render({ camera, timeSeconds: 4.5, debugView: 'base-color', temporal: false, cameraCut: true });
     expect(frame.scene).toEqual(committed);
-    expect(frame.authored).toEqual({ camera, origin: [.25, .5, 5], aspect: 1.5, width: 768, height: 512, timeSeconds: 4.5, debugView: 'base-color' });
+    expect(frame.authored).toEqual({ camera, origin: [.25, .5, 5], aspect: 1.5, width: 768, height: 512, timeSeconds: 4.5, debugView: 'base-color',
+      motion: { previousSubmittedFrameId: null, valid: false, resetReason: 'first-frame' } });
     expect(created[0]!.encode).toHaveBeenLastCalledWith(gpu.encoder, gpu.view, 768, 512, 4.5,
-      expect.objectContaining({ camera, debugView: 'base-color', temporal: false }), undefined);
+      expect.objectContaining({ camera, debugView: 'base-color', temporal: false, cameraCut: true }), undefined);
     camera.position[0] = 2;
     expect(frame.authored!.camera.position[0]).toBe(.25);
     expect(engine.render().authored).toMatchObject({ camera: input.camera, debugView: 'final', timeSeconds: 0 });
