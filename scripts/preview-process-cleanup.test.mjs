@@ -587,3 +587,117 @@ test('native diagnostic resource zero and settled false remain explicit', () => 
   assert.equal(parsed.counts.nativeErrors, 0);
   assert.equal(parsed.omitted.labelChanges, 0);
 });
+
+function acquisitionDiagnosticFixture() {
+  const input = diagnosticFixture(), ownership = input.process.ownership;
+  const identity = { pid: 102, ppid: 101, pgid: 102, command: 'node', state: 'S', start: 'observed birth',
+    startTicks: '18446744073709550000', argv: 'PRIVATE_ACQUISITION_ARGV' };
+  const parent = { ...identity, pid: 101, ppid: 1 };
+  const namespace = { checkerPid: 99, nstgid: 99, valueCount: 1, byteCount: 2048, rawStatus: 'PRIVATE_RAW_STATUS' };
+  const error = { code: 'ENOENT', message: 'Initial process stat open returned ENOENT', status: 'PRIVATE_ERROR_STATUS' };
+  ownership.identityProvider = 'linux-proc-stat-fd';
+  ownership.nativeAcquisitionCount = 1; ownership.nativeAcquisitionLimitReached = false;
+  ownership.nativeErrors = [{ operation: 'open', pid: 102, ...error }]; ownership.nativeErrorCount = 1;
+  ownership.nativeResources = { opened: 3, closed: 3, held: 0, pendingOpens: 0, pendingReads: 0, pendingCloses: 0,
+    heldIdentities: 0, heldNamespaces: 0, pendingConfirmations: 0, pendingCensuses: 0, unsettled: false,
+    rawStatus: 'PRIVATE_RESOURCE_STATUS' };
+  ownership.nativeAcquisitions = [{ sequence: 1, pid: 102, role: 'descendant',
+    discovery: { sampleId: 7, row: identity, fullCensus: 'PRIVATE_FULL_CENSUS' }, parentBefore: parent,
+    scheduledAt: 0, startedAt: 1, settledAt: 2,
+    providerOutcome: { status: 'rejected', error, stdout: 'PRIVATE_PROVIDER_STDOUT' },
+    observationOutcome: { status: 'received', error: null, expiresAt: 1000, stderr: 'PRIVATE_OBSERVATION_STDERR' },
+    resolution: 'absent-before-admission', confirmation: { startedAt: 2, settledAt: 5, failedGate: null,
+      namespaceBefore: namespace, namespaceAfter: { ...namespace },
+      census: { sampleId: 8, rowCount: 10, candidate: null, dependents: { count: 0, rows: [] }, rows: 'PRIVATE_CENSUS_ROWS' },
+      discoveryDependents: { count: 0, rows: [] }, existence: { code: 'ESRCH', absent: true, argv: 'PRIVATE_EXISTENCE_ARGV', error: { code: 'ESRCH', message: 'No current PID', status: 'PRIVATE_STATUS' } },
+      parentAfter: parent, error: null, rawStatus: 'PRIVATE_CONFIRMATION_STATUS' },
+    laterContradiction: null, scene: 'PRIVATE_ACQUISITION_SCENE' }];
+  return input;
+}
+
+test('acquisition diagnostic retains confirmation gates and raw ENOENT without changing cleanup outcome', () => {
+  const input = acquisitionDiagnosticFixture(), ownership = input.process.ownership;
+  input.process.cleanupUnknown = false; ownership.cleanupUnknown = false;
+  const before = structuredClone(input), { parsed, text } = parsedDiagnostic(input);
+  assert.deepEqual(input, before);
+  assert.equal(parsed.process.cleanupUnknown, false); assert.equal(parsed.ownership.cleanupUnknown, false);
+  assert.equal(parsed.ownership.nativeAcquisitionCount, 1);
+  assert.equal(parsed.ownership.nativeAcquisitionLimitReached, false);
+  assert.equal(parsed.counts.nativeAcquisitions, 1); assert.equal(parsed.omitted.nativeAcquisitions, 0);
+  const acquisition = parsed.ownership.nativeAcquisitions[0];
+  assert.equal(acquisition.scheduledAt, 0); assert.equal(acquisition.startedAt, 1); assert.equal(acquisition.settledAt, 2);
+  assert.equal(acquisition.discovery.sampleId, 7); assert.equal(acquisition.discovery.row.pid, 102);
+  assert.equal(acquisition.parentBefore.startTicks, '18446744073709550000');
+  assert.deepEqual(acquisition.providerOutcome, { status: 'rejected', error: { code: 'ENOENT', message: ownership.nativeErrors[0].message } });
+  assert.deepEqual(acquisition.observationOutcome, { status: 'received', error: null, expiresAt: 1000 });
+  assert.equal(acquisition.resolution, 'absent-before-admission');
+  assert.deepEqual(acquisition.confirmation.namespaceBefore, { checkerPid: 99, nstgid: 99, valueCount: 1, byteCount: 2048 });
+  assert.deepEqual(acquisition.confirmation.namespaceAfter, acquisition.confirmation.namespaceBefore);
+  assert.equal(acquisition.confirmation.census.sampleId, 8); assert.equal(acquisition.confirmation.census.rowCount, 10);
+  assert.equal(acquisition.confirmation.census.candidate, null);
+  assert.deepEqual(acquisition.confirmation.existence, { code: 'ESRCH', absent: true, error: { code: 'ESRCH', message: 'No current PID' } });
+  assert.equal(acquisition.confirmation.parentAfter.pid, 101); assert.equal(acquisition.confirmation.failedGate, null);
+  assert.equal(acquisition.laterContradiction, null);
+  assert.equal(parsed.ownership.nativeErrors[0].code, 'ENOENT'); assert.equal(parsed.counts.nativeErrors, 1);
+  for (const key of ['heldIdentities', 'heldNamespaces', 'pendingConfirmations', 'pendingCensuses']) assert.equal(parsed.ownership.nativeResources[key], 0);
+  assert.equal(parsed.truncated, false); assert.ok(!text.includes('PRIVATE_'));
+});
+
+test('acquisition diagnostic keeps late provider error separate from timed-out observation and pending stages', () => {
+  const input = acquisitionDiagnosticFixture(), acquisition = input.process.ownership.nativeAcquisitions[0];
+  acquisition.observationOutcome = { status: 'timed-out', error: { code: 'IDENTITY_TIMEOUT', message: 'Original lease expired' }, expiresAt: 5 };
+  acquisition.resolution = 'unresolved'; acquisition.confirmation = null;
+  const pending = { ...acquisition, sequence: 2, pid: 103, startedAt: null, settledAt: null,
+    providerOutcome: { status: 'not-started', error: null }, observationOutcome: { status: 'pending', error: null, expiresAt: 5 }, resolution: 'pending' };
+  input.process.ownership.nativeAcquisitions.push(pending); input.process.ownership.nativeAcquisitionCount = 2;
+  const { parsed } = parsedDiagnostic(input), [late, scheduled] = parsed.ownership.nativeAcquisitions;
+  assert.equal(late.providerOutcome.status, 'rejected'); assert.equal(late.providerOutcome.error.code, 'ENOENT');
+  assert.equal(late.observationOutcome.status, 'timed-out'); assert.equal(late.observationOutcome.error.code, 'IDENTITY_TIMEOUT');
+  assert.equal(late.resolution, 'unresolved'); assert.equal(late.confirmation, null);
+  assert.equal(scheduled.startedAt, null); assert.equal(scheduled.settledAt, null);
+  assert.deepEqual(scheduled.providerOutcome, { status: 'not-started', error: null });
+  assert.equal(scheduled.resolution, 'pending'); assert.equal(parsed.ownership.cleanupUnknown, true);
+});
+
+test('acquisition diagnostic bounds nested dependents with exact omissions and retains later contradictions', () => {
+  const input = acquisitionDiagnosticFixture(), acquisition = input.process.ownership.nativeAcquisitions[0];
+  const dependents = { count: 80, rows: Array.from({ length: 7 }, (_, index) => ({ ...acquisition.discovery.row, pid: 200 + index,
+    rawStatus: 'PRIVATE_DEPENDENT_STATUS' })), fullCensus: 'PRIVATE_DEPENDENT_CENSUS' };
+  acquisition.confirmation.discoveryDependents = dependents;
+  acquisition.confirmation.census.dependents = dependents;
+  acquisition.confirmation.failedGate = 'discovery-dependents';
+  acquisition.laterContradiction = { sampleId: 9, count: 5, row: { ...acquisition.discovery.row, state: 'Z' }, dependents,
+    environment: 'PRIVATE_LATER_ENV' };
+  const { parsed, text } = parsedDiagnostic(input), row = parsed.ownership.nativeAcquisitions[0];
+  for (const value of [row.confirmation.discoveryDependents, row.confirmation.census.dependents, row.laterContradiction.dependents]) {
+    assert.equal(value.count, 80); assert.equal(value.rows.length, 4); assert.equal(value.omitted, 76);
+  }
+  assert.equal(row.confirmation.failedGate, 'discovery-dependents');
+  assert.equal(row.laterContradiction.sampleId, 9); assert.equal(row.laterContradiction.count, 5); assert.equal(row.laterContradiction.row.state, 'Z');
+  assert.equal(parsed.truncated, true); assert.ok(!text.includes('PRIVATE_'));
+});
+
+for (const maxBytes of [1024, 2048, 32768]) {
+  test(`acquisition diagnostic preserves totals, limits and pending work within ${maxBytes} UTF-8 bytes`, () => {
+    const input = acquisitionDiagnosticFixture(), ownership = input.process.ownership;
+    const entry = ownership.nativeAcquisitions[0], long = '🙂漢字"\\\n'.repeat(1000);
+    ownership.nativeAcquisitions = Array.from({ length: 512 }, (_, index) => ({ ...entry, sequence: index + 1,
+      providerOutcome: { status: 'rejected', error: { code: 'ENOENT', message: long } } }));
+    ownership.nativeAcquisitionCount = 512; ownership.nativeAcquisitionLimitReached = true;
+    ownership.nativeErrorCount = 512;
+    Object.assign(ownership.nativeResources, { held: 2, heldIdentities: 1, heldNamespaces: 1,
+      pendingConfirmations: 2, pendingCensuses: 3, unsettled: true });
+    const { parsed, text } = parsedDiagnostic(input, maxBytes);
+    assert.equal(parsed.process.cleanupUnknown, true); assert.equal(parsed.process.exitCode, 0);
+    assert.equal(parsed.ownership.cleanupUnknown, true); assert.equal(parsed.ownership.nativeResources.unsettled, true);
+    assert.equal(parsed.ownership.nativeResources.pendingConfirmations, 2);
+    assert.equal(parsed.ownership.nativeResources.pendingCensuses, 3);
+    assert.equal(parsed.ownership.nativeAcquisitionCount, 512); assert.equal(parsed.ownership.nativeAcquisitionLimitReached, true);
+    assert.equal(parsed.counts.nativeAcquisitions, 512);
+    assert.ok(parsed.ownership.nativeAcquisitions.length <= 32);
+    assert.equal(parsed.omitted.nativeAcquisitions, 512 - parsed.ownership.nativeAcquisitions.length);
+    assert.equal(parsed.counts.nativeErrors, 512);
+    assert.equal(parsed.omitted.nativeErrors, 512 - parsed.ownership.nativeErrors.length);
+    assert.equal(parsed.truncated, true); assertWellFormedStrings(parsed); assert.ok(!text.includes('PRIVATE_'));
+  });
+}

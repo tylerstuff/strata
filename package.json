@@ -51,7 +51,7 @@
     "test:preview:consumer": "node scripts/test-preview-consumer.mjs",
     "test:preview:connection:consumer": "node scripts/test-preview-connection-consumer.mjs",
     "check:preview": "npm run build:authoring && npm run typecheck --workspace @strata-engine/preview && npm run test:preview && npm run build --workspace @strata-engine/preview && npm run test:preview:consumer && npm run test:preview:connection:consumer",
-    "test:preview:processes": "node --test scripts/preview-process-cleanup.test.mjs scripts/preview-process-native.test.mjs",
+    "test:preview:processes": "node --test scripts/preview-process-cleanup.test.mjs scripts/preview-process-native.test.mjs scripts/preview-process-namespace.test.mjs scripts/preview-process-absence.test.mjs",
     "test:preview:browser": "node scripts/test-preview-browser.mjs",
     "test:preview:connection:browser": "node scripts/test-preview-connection-browser.mjs"
   },

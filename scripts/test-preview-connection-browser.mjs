@@ -16,6 +16,7 @@ const runner = 'scripts/test-preview-connection-browser.mjs';
 const workflow = 'tests/consumers/preview-connection/browser-workflow.mjs';
 const cleanupHelper = 'scripts/preview-process-cleanup.mjs';
 const nativeCleanupHelper = 'scripts/preview-process-identity-linux.mjs';
+const namespaceCleanupHelper = 'scripts/preview-process-namespace-linux.mjs';
 const execute = promisify(execFile);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
@@ -171,6 +172,8 @@ async function prepare() {
   await copyFile(join(root, cleanupHelper), join(frozen.consumerDirectory, 'preview-process-cleanup.mjs'));
   await copyFile(join(root, nativeCleanupHelper), join(output, 'preview-process-identity-linux.mjs'));
   await copyFile(join(root, nativeCleanupHelper), join(frozen.consumerDirectory, 'preview-process-identity-linux.mjs'));
+  await copyFile(join(root, namespaceCleanupHelper), join(output, 'preview-process-namespace-linux.mjs'));
+  await copyFile(join(root, namespaceCleanupHelper), join(frozen.consumerDirectory, 'preview-process-namespace-linux.mjs'));
   await writeFile(join(frozen.consumerDirectory, 'package.json'), json({ name: 'strata-preview-connection-browser-consumer', private: true, type: 'module',
     dependencies: Object.fromEntries(Object.entries(frozen.archives).map(([name, archive]) => [`@strata-engine/${name}`, `file:${join(output, archive.path)}`])) }));
   await loggedCommand('install', 'npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], frozen.consumerDirectory, env);
@@ -197,7 +200,8 @@ async function prepare() {
   frozen.inputManifest = await evidenceFile(join(output, 'input-sha256.json'));
   frozen.harness = { workflow: await evidenceFile(join(output, 'browser-workflow.mjs')), runner: await evidenceFile(join(output, 'runner.mjs')),
     cleanupHelper: await evidenceFile(join(output, 'preview-process-cleanup.mjs')),
-    nativeCleanupHelper: await evidenceFile(join(output, 'preview-process-identity-linux.mjs')) };
+    nativeCleanupHelper: await evidenceFile(join(output, 'preview-process-identity-linux.mjs')),
+    namespaceCleanupHelper: await evidenceFile(join(output, 'preview-process-namespace-linux.mjs')) };
   frozen.installation = await tree(frozen.consumerDirectory, '', true);
   frozen.guards = { rust: await tree(join(temporaryDirectory, 'rust-guards')), preparation: await tree(join(temporaryDirectory, 'prepare-guards')) };
   assert.deepEqual(await sourceIdentity(), frozen.source, 'Source changed during preparation');
@@ -240,6 +244,7 @@ async function verifyFrozen() {
   assert.deepEqual(await evidenceFile(join(output, 'runner.mjs')), frozen.harness.runner);
   assert.deepEqual(await evidenceFile(join(output, 'preview-process-cleanup.mjs')), frozen.harness.cleanupHelper);
   assert.deepEqual(await evidenceFile(join(output, 'preview-process-identity-linux.mjs')), frozen.harness.nativeCleanupHelper);
+  assert.deepEqual(await evidenceFile(join(output, 'preview-process-namespace-linux.mjs')), frozen.harness.namespaceCleanupHelper);
   for (const [name, value] of [['source', frozen.source], ['build', frozen.builds], ['installation', frozen.installation]]) {
     assert.equal(await readFile(join(output, `${name}-sha256.json`), 'utf8'), json(value), `External ${name} manifest changed`);
   }

@@ -182,13 +182,45 @@ reads, and unresolved opens, reads or closes keep cleanup uncertain. Retired
 identities cannot be admitted again. Cleanup stops new admission; deadlines do
 not cancel native I/O, and late handles close without regaining authority.
 
+A narrow Linux check handles a never-admitted descendant whose first native open
+actually rejects with `ENOENT` within its original admission deadline. The PID is
+quarantined permanently. One follow-up can record `absent-before-admission` only
+when both the discovery and fresh full census have no observed dependent chain,
+the fresh census has no candidate row, a separate positive-PID signal-zero check
+returns `ESRCH`, and the parent's retained identity remains live and authoritative.
+Before and after that check, the checking Node process reads `/proc/self/status`
+to actual EOF and requires exactly one canonical `NStgid` value equal to its own
+PID. All checks and owned file cleanup must settle within the original deadline;
+there is no retry or extension. This assumes a cooperating Linux host with genuine,
+fixed procfs at `/proc`; it does not authenticate a hostile filesystem.
+
+Root failures, retained-handle errors, other initial errors, observation timeouts,
+namespace mismatches and shutdown interruptions remain unresolved. A later row or
+dependent chain through a quarantined PID latches uncertainty without admitting
+or signaling it. Confirmed absence never clears an earlier uncertainty and does
+not prove the candidate's earlier lifetime or cleanup of an unseen subtree.
+
 This remains a polling launcher, with a final identity-check-to-numeric-signal
 race and a blind spot for children that fork and reparent between samples.
 Abnormal shutdown always reports that uncertainty. Initial process labels are
 still required; the controlled Node 24 fixture's known label does not relax
-production admission. Failure diagnostics include bounded native errors, label
-changes and unsettled-resource counts. None of this changes the runtime package
-or establishes browser, GPU or performance acceptance.
+production admission.
+
+The full cleanup report retains up to 512 native acquisition entries, reserving
+each entry before provider invocation. Provider outcomes remain separate from
+observation timeouts, confirmation gates and later contradictions. Raw native
+errors, including an `ENOENT` followed by confirmed absence, remain recorded.
+Diagnostics distinguish held process-identity and namespace descriptors and
+include pending confirmation/census work alongside open/read/close counts.
+The single-line formatter stays within its 1–32 KiB UTF-8 budget, whitelists only
+identity metadata, and reports omitted acquisition/dependent rows with their
+counts. It never includes raw status files, argv, environment or scene payloads.
+Returned cleanup receipts do not change when late I/O eventually settles.
+
+This candidate-confirmation and diagnostic work is a CPU-only checkpoint; new
+Linux and browser acceptance remain pending. It does not explain or reclassify
+the earlier failed CI result. None of this changes the runtime package or
+establishes browser, GPU or performance acceptance.
 
 ## Validation boundary
 

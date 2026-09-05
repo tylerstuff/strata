@@ -314,15 +314,18 @@ export function superviseChildProcess(child, { rootCommand, timeoutMs = 240_000,
 export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = {}) {
   assert.ok(Number.isInteger(maxBytes) && maxBytes >= 1024 && maxBytes <= 32 * 1024, 'Diagnostic byte budget must be 1024..32768');
   const processInfo = outcome?.process ?? {}, ownership = processInfo.ownership ?? {};
-  const hasNative = ownership.identityProvider !== undefined || ownership.nativeResources !== undefined;
+  const hasAcquisitions = ownership.nativeAcquisitions !== undefined || ownership.nativeAcquisitionCount !== undefined
+    || ownership.nativeAcquisitionLimitReached !== undefined;
+  const hasNative = hasAcquisitions || ownership.identityProvider !== undefined || ownership.nativeResources !== undefined;
   const names = ['limitations', 'observed', 'remaining', 'identityMismatches', 'censusErrors', 'signals',
-    ...(hasNative ? ['labelChanges', 'nativeErrors'] : [])];
+    ...(hasNative ? ['labelChanges', 'nativeErrors'] : []), ...(hasAcquisitions ? ['nativeAcquisitions'] : [])];
   const arrays = Object.fromEntries(names.map(name => [name, Array.isArray(ownership[name]) ? ownership[name] : []]));
   const counts = Object.fromEntries(names.map(name => [name, arrays[name].length]));
   if (hasNative) {
     counts.labelChanges = Math.max(counts.labelChanges, diagnosticNumber(ownership.labelChangeCount) ?? 0);
     counts.nativeErrors = Math.max(counts.nativeErrors, diagnosticNumber(ownership.nativeErrorCount) ?? 0);
   }
+  if (hasAcquisitions) counts.nativeAcquisitions = Math.max(counts.nativeAcquisitions, diagnosticNumber(ownership.nativeAcquisitionCount) ?? 0);
   const caps = Object.fromEntries(names.map(name => [name, Math.min(32, arrays[name].length)]));
   let stringBytes = 512, includeInitialRoot = true, includeNativeDetails = true, compactEnvelope = false;
   const boolean = value => typeof value === 'boolean' ? value : null;
@@ -343,6 +346,34 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
       kind: text(value.kind, Math.min(64, stringBytes)), rowIndex: diagnosticNumber(value.rowIndex), rowBytes: diagnosticNumber(value.rowBytes),
       rowPrefix: text(value.rowPrefix), identity: identity(value.identity),
     } : null;
+    const error = value => value && typeof value === 'object' ? {
+      code: text(value.code, Math.min(64, stringBytes)), message: text(value.message),
+    } : null;
+    const namespace = value => value && typeof value === 'object' ? Object.fromEntries(
+      ['checkerPid', 'nstgid', 'valueCount', 'byteCount'].map(key => [key, diagnosticNumber(value[key])]),
+    ) : null;
+    const dependents = value => {
+      if (!value || typeof value !== 'object') return null;
+      const rows = Array.isArray(value.rows) ? value.rows : [];
+      const count = Math.max(rows.length, diagnosticNumber(value.count) ?? 0);
+      const retained = rows.slice(0, 4).map(identity), omitted = count - retained.length;
+      if (omitted > 0) truncated = true;
+      return { count, rows: retained, omitted };
+    };
+    const confirmation = value => value && typeof value === 'object' ? {
+      startedAt: diagnosticNumber(value.startedAt), settledAt: diagnosticNumber(value.settledAt),
+      failedGate: text(value.failedGate, Math.min(64, stringBytes)), namespaceBefore: namespace(value.namespaceBefore), namespaceAfter: namespace(value.namespaceAfter),
+      census: value.census && typeof value.census === 'object' ? {
+        sampleId: diagnosticNumber(value.census.sampleId), rowCount: diagnosticNumber(value.census.rowCount),
+        candidate: identity(value.census.candidate), dependents: dependents(value.census.dependents),
+      } : null,
+      discoveryDependents: dependents(value.discoveryDependents),
+      existence: value.existence && typeof value.existence === 'object' ? {
+        code: text(value.existence.code, Math.min(64, stringBytes)), absent: boolean(value.existence.absent),
+        ...(value.existence.error ? { error: error(value.existence.error) } : {}),
+      } : null,
+      parentAfter: identity(value.parentAfter), error: error(value.error),
+    } : null;
     const maps = {
       limitations: value => text(value), observed: identity, remaining: identity,
       identityMismatches: value => ({ expected: identity(value?.expected), current: identity(value?.current) }),
@@ -353,6 +384,26 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
         previousCommand: text(value?.previousCommand), currentCommand: text(value?.currentCommand) }),
       nativeErrors: value => ({ operation: text(value?.operation, Math.min(64, stringBytes)), pid: diagnosticNumber(value?.pid),
         code: text(value?.code, Math.min(64, stringBytes)), message: text(value?.message) }),
+      nativeAcquisitions: value => ({ sequence: diagnosticNumber(value?.sequence), pid: diagnosticNumber(value?.pid),
+        role: text(value?.role, Math.min(64, stringBytes)),
+        discovery: value?.discovery && typeof value.discovery === 'object' ? {
+          sampleId: diagnosticNumber(value.discovery.sampleId), row: identity(value.discovery.row),
+        } : null,
+        parentBefore: identity(value?.parentBefore), scheduledAt: diagnosticNumber(value?.scheduledAt),
+        startedAt: diagnosticNumber(value?.startedAt), settledAt: diagnosticNumber(value?.settledAt),
+        providerOutcome: value?.providerOutcome && typeof value.providerOutcome === 'object' ? {
+          status: text(value.providerOutcome.status, Math.min(64, stringBytes)), error: error(value.providerOutcome.error),
+        } : null,
+        observationOutcome: value?.observationOutcome && typeof value.observationOutcome === 'object' ? {
+          status: text(value.observationOutcome.status, Math.min(64, stringBytes)), error: error(value.observationOutcome.error),
+          expiresAt: diagnosticNumber(value.observationOutcome.expiresAt),
+        } : null,
+        resolution: text(value?.resolution, Math.min(64, stringBytes)), confirmation: confirmation(value?.confirmation),
+        laterContradiction: value?.laterContradiction && typeof value.laterContradiction === 'object' ? {
+          sampleId: diagnosticNumber(value.laterContradiction.sampleId), count: diagnosticNumber(value.laterContradiction.count),
+          row: identity(value.laterContradiction.row), dependents: dependents(value.laterContradiction.dependents),
+        } : null,
+      }),
     };
     const filtered = Object.fromEntries(names.map(name => [name, arrays[name].slice(0, caps[name]).map(maps[name])]));
     const omitted = Object.fromEntries(names.map(name => [name, counts[name] - filtered[name].length]));
@@ -364,9 +415,14 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
     const resources = ownership.nativeResources;
     const nativeFields = hasNative ? {
       identityProvider: text(ownership.identityProvider, Math.min(64, stringBytes)),
+      ...(hasAcquisitions ? { nativeAcquisitionCount: diagnosticNumber(ownership.nativeAcquisitionCount),
+        nativeAcquisitionLimitReached: boolean(ownership.nativeAcquisitionLimitReached) } : {}),
       nativeResources: resources && typeof resources === 'object' ? {
         unsettled: boolean(resources.unsettled),
-        ...(includeNativeDetails ? Object.fromEntries(['opened', 'closed', 'held', 'pendingOpens', 'pendingReads', 'pendingCloses']
+        ...Object.fromEntries(['pendingConfirmations', 'pendingCensuses'].filter(key => resources[key] !== undefined)
+          .map(key => [key, diagnosticNumber(resources[key])])),
+        ...(includeNativeDetails ? Object.fromEntries(['opened', 'closed', 'held', 'pendingOpens', 'pendingReads', 'pendingCloses',
+          ...['heldIdentities', 'heldNamespaces', 'openedIdentities', 'closedIdentities', 'openedNamespaces', 'closedNamespaces'].filter(key => resources[key] !== undefined)]
           .map(key => [key, diagnosticNumber(resources[key])])) : {}),
       } : null,
     } : {};
@@ -392,7 +448,7 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
   while (Buffer.byteLength(result) > maxBytes) {
     // Preserve one short reason/error ahead of bulky process rows. Exact totals
     // remain visible even when all rows from a category must be omitted.
-    const drop = ['observed', 'signals', 'identityMismatches', 'labelChanges', 'remaining', 'limitations', 'censusErrors', 'nativeErrors']
+    const drop = ['observed', 'signals', 'identityMismatches', 'labelChanges', 'remaining', 'nativeAcquisitions', 'limitations', 'censusErrors', 'nativeErrors']
       .find(name => caps[name] > (name === 'limitations' || name === 'censusErrors' || name === 'nativeErrors' ? 1 : 0));
     if (drop) caps[drop]--;
     else if (stringBytes > 16) stringBytes = Math.max(16, Math.floor(stringBytes / 2));
