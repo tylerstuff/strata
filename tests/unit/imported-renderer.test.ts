@@ -24,7 +24,7 @@ function gpu() {
     createShaderModule: vi.fn(() => ({})), createRenderPipelineAsync: vi.fn(async (descriptor: GPURenderPipelineDescriptor) => ({ label: descriptor.label, getBindGroupLayout: vi.fn((group: number) => ({ group })) })),
     createBuffer: vi.fn((d: GPUBufferDescriptor) => { const b = { label: d.label ?? '', size: d.size, destroy: vi.fn() }; buffers.push(b); return b; }),
     createTexture: vi.fn((d: GPUTextureDescriptor) => { const t = { descriptor: d, destroy: vi.fn(), createView: vi.fn(() => ({})) }; textures.push(t); return t; }),
-    createSampler: vi.fn(() => ({})), createBindGroup: vi.fn(() => ({})), createCommandEncoder: vi.fn(() => encoder),
+    createSampler: vi.fn((_descriptor?: GPUSamplerDescriptor) => ({})), createBindGroup: vi.fn(() => ({})), createCommandEncoder: vi.fn(() => encoder),
     queue: { writeBuffer: vi.fn((buffer: { label: string }, _offset: number, data: ArrayBuffer | ArrayBufferView<ArrayBuffer>) => { const view = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength); writes.push({ label: buffer.label, data: new Float32Array(view.slice().buffer) }); }),
       writeTexture: vi.fn(), copyExternalImageToTexture: vi.fn(), submit: vi.fn() },
   };
@@ -55,6 +55,33 @@ describe('imported scene resource and temporal contracts', () => {
     for (const r of [...g.buffers, ...g.textures]) expect(r.destroy).toHaveBeenCalledOnce();
     expect(geometry.gpuBufferBytes).toBe(0); expect(geometry.gpuTextureBytes).toBe(0);
   });
+  const minificationModes = [
+    [9728, 'nearest', 'nearest', 0], // NEAREST, no mipmaps
+    [9729, 'linear', 'nearest', 0], // LINEAR, no mipmaps
+    [9984, 'nearest', 'nearest', 32], // NEAREST_MIPMAP_NEAREST
+    [9985, 'linear', 'nearest', 32], // LINEAR_MIPMAP_NEAREST
+    [9986, 'nearest', 'linear', 32], // NEAREST_MIPMAP_LINEAR
+    [9987, 'linear', 'linear', 32], // LINEAR_MIPMAP_LINEAR
+  ] as const;
+  it.each(([9728, 9729] as const).flatMap(mag => minificationModes.map(mode => [mag, ...mode] as const)))(
+    'preserves glTF mag %i/min %i filters and enables only compatible anisotropy', async (mag, min, expectedMin, expectedMip, expectedLod) => {
+      const g = gpu(), a = textured(8);
+      vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ width: 8, height: 4, close: vi.fn() })));
+      const ref: ImportedTexture = { image: 0, sampler: { magFilter: mag, minFilter: min, wrapS: 33071, wrapT: 33648 } };
+      const geometry = await ImportedGeometry.create(g.device, { ...a, materials: [{ ...material, baseColorTexture: ref, metallicRoughnessTexture: ref, emissiveTexture: ref }] });
+      // Distinct wrapping identifies the authored sampler among mip-generation/fallback samplers.
+      const matches = g.raw.createSampler.mock.calls.map(([descriptor]) => descriptor).filter(d => d?.addressModeU === 'clamp-to-edge' && d.addressModeV === 'mirror-repeat');
+      expect(matches).toHaveLength(1); // Color/data roles share the sampler, not the texture.
+      const descriptor = matches[0]!;
+      expect(descriptor).toEqual({ addressModeU: 'clamp-to-edge', addressModeV: 'mirror-repeat', magFilter: mag === 9728 ? 'nearest' : 'linear',
+        minFilter: expectedMin, mipmapFilter: expectedMip, lodMaxClamp: expectedLod, maxAnisotropy: mag === 9729 && min === 9987 ? 8 : 1 });
+      // Validate every sampler sent to WebGPU, including shared fallback samplers.
+      for (const [d] of g.raw.createSampler.mock.calls) if ((d?.maxAnisotropy ?? 1) > 1) {
+        expect([d!.magFilter, d!.minFilter, d!.mipmapFilter]).toEqual(['linear', 'linear', 'linear']);
+      }
+      expect(geometry.gpuTextureBytes).toBe(352); // Two unchanged 8x4 complete mip chains plus white fallbacks.
+      geometry.dispose();
+    });
   it('preflights aggregate color-role texture memory before decoding or allocating', async () => {
     const g = gpu(), a = textured(8192); const decode = vi.fn(); vi.stubGlobal('createImageBitmap', decode);
     await expect(ImportedGeometry.create(g.device, { ...a, images: [{ ...a.images[0]!, width: 8192, height: 8192 }] })).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
