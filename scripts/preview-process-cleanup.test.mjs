@@ -106,7 +106,8 @@ function ownedSignalsOnly(result, allowed, controlPid) {
 }
 
 async function trackerFor(context, fixture, options = {}) {
-  const tracker = createProcessTracker({ rootPid: fixture.pid, rootCommand: fixture.rootCommand, pollIntervalMs: 10, ...options });
+  const tracker = createProcessTracker({ rootPid: fixture.pid, rootCommand: fixture.rootCommand, pollIntervalMs: 10,
+    rootIsRunning: () => fixture.child.exitCode === null && fixture.child.signalCode === null, ...options });
   context.after(async () => { await tracker.cleanup({ reason: 'failure', termGraceMs: 30, killGraceMs: 100 }); });
   await tracker.start();
   await tracker.sample();
@@ -529,4 +530,60 @@ test('cleanup diagnostic rejects unsupported byte budgets', () => {
   for (const maxBytes of [0, 1023, 32769, 2048.5, NaN, Infinity]) {
     assert.throws(() => formatProcessCleanupSummary(diagnosticFixture(), { maxBytes }));
   }
+});
+
+test('native cleanup diagnostics retain exact birth strings and unsettled descriptor evidence', () => {
+  const input = diagnosticFixture(), ownership = input.process.ownership;
+  ownership.identityProvider = 'linux-proc-stat-fd';
+  ownership.observed[0].startTicks = '18446744073709550000';
+  ownership.labelChanges = [{ pid: 101, startTicks: '18446744073709550000', previousCommand: 'node', currentCommand: 'renamed' }];
+  ownership.labelChangeCount = 1;
+  ownership.nativeErrors = [{ operation: 'read', pid: 101, code: 'ETIMEDOUT', message: 'Held process read did not settle', private: 'PRIVATE_NATIVE' }];
+  ownership.nativeErrorCount = 1;
+  ownership.nativeResources = { opened: 2, closed: 1, held: 1, pendingOpens: 0, pendingReads: 1, pendingCloses: 1,
+    unsettled: true, environment: 'PRIVATE_NATIVE' };
+  const { parsed, text } = parsedDiagnostic(input);
+  assert.equal(parsed.ownership.identityProvider, 'linux-proc-stat-fd');
+  assert.equal(parsed.ownership.observed[0].startTicks, '18446744073709550000');
+  assert.equal(parsed.ownership.labelChanges[0].startTicks, '18446744073709550000');
+  assert.equal(parsed.ownership.nativeErrors[0].code, 'ETIMEDOUT');
+  assert.equal(parsed.ownership.nativeResources.unsettled, true);
+  assert.equal(parsed.ownership.nativeResources.pendingReads, 1);
+  assert.equal(parsed.ownership.nativeResources.pendingCloses, 1);
+  assert.equal(parsed.truncated, false);
+  assert.ok(!text.includes('PRIVATE_'));
+});
+
+test('native diagnostics preserve total counters and uncertainty at the minimum byte budget', () => {
+  const input = diagnosticFixture(), ownership = input.process.ownership;
+  const long = '🙂漢字"\\\n'.repeat(1000);
+  ownership.identityProvider = 'linux-proc-stat-fd';
+  ownership.labelChanges = Array.from({ length: 32 }, () => ({ pid: 101, startTicks: '9007199254740993', previousCommand: long, currentCommand: long }));
+  ownership.labelChangeCount = 79;
+  ownership.nativeErrors = Array.from({ length: 32 }, () => ({ operation: 'read', pid: 101, code: 'ETIMEDOUT', message: long }));
+  ownership.nativeErrorCount = 200;
+  ownership.nativeResources = { opened: 512, closed: 0, held: 512, pendingOpens: 0, pendingReads: 512, pendingCloses: 512, unsettled: true };
+  const { parsed } = parsedDiagnostic(input, 1024);
+  assert.equal(parsed.process.cleanupUnknown, true);
+  assert.equal(parsed.ownership.cleanupUnknown, true);
+  assert.equal(parsed.ownership.nativeResources.unsettled, true);
+  assert.equal(parsed.counts.labelChanges, 79);
+  assert.equal(parsed.counts.nativeErrors, 200);
+  assert.equal(parsed.omitted.labelChanges, 79 - parsed.ownership.labelChanges.length);
+  assert.equal(parsed.omitted.nativeErrors, 200 - parsed.ownership.nativeErrors.length);
+  assert.equal(parsed.truncated, true);
+  assertWellFormedStrings(parsed);
+});
+
+test('native diagnostic resource zero and settled false remain explicit', () => {
+  const input = diagnosticFixture(), ownership = input.process.ownership;
+  ownership.identityProvider = 'linux-proc-stat-fd';
+  ownership.labelChanges = []; ownership.labelChangeCount = 0;
+  ownership.nativeErrors = []; ownership.nativeErrorCount = 0;
+  ownership.nativeResources = { opened: 0, closed: 0, held: 0, pendingOpens: 0, pendingReads: 0, pendingCloses: 0, unsettled: false };
+  const { parsed } = parsedDiagnostic(input);
+  assert.equal(parsed.ownership.nativeResources.unsettled, false);
+  assert.equal(parsed.ownership.nativeResources.pendingReads, 0);
+  assert.equal(parsed.counts.nativeErrors, 0);
+  assert.equal(parsed.omitted.labelChanges, 0);
 });

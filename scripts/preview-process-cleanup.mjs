@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { basename } from 'node:path';
 import { promisify } from 'node:util';
+import { createLinuxProcessProvider, createNativeProcessTracker } from './preview-process-identity-linux.mjs';
 
 const execute = promisify(execFile);
 const MAX_PROCESSES = 512;
@@ -21,7 +22,8 @@ function diagnosticIdentity(value, stringBytes = 512) {
   if (!value || typeof value !== 'object') return null;
   return { pid: diagnosticNumber(value.pid), ppid: diagnosticNumber(value.ppid), pgid: diagnosticNumber(value.pgid),
     start: diagnosticText(value.start, Math.min(64, stringBytes)), state: diagnosticText(value.state, Math.min(32, stringBytes)),
-    command: diagnosticText(value.command, stringBytes) };
+    command: diagnosticText(value.command, stringBytes),
+    ...(typeof value.startTicks === 'string' ? { startTicks: diagnosticText(value.startTicks, Math.min(64, stringBytes)) } : {}) };
 }
 function diagnosticDetail(value, stringBytes = 512) {
   if (!value || typeof value !== 'object') return null;
@@ -31,7 +33,8 @@ function diagnosticDetail(value, stringBytes = 512) {
 }
 
 async function census() {
-  // comm records the executable, never argv or the process environment.
+  // Select the process label, not argv or environment columns. The label can
+  // change during a process lifetime and is not executable identity.
   const { stdout } = await execute('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,lstart=,stat=,comm='], {
     env: { ...process.env, LC_ALL: 'C', LANG: 'C' }, encoding: 'utf8', timeout: CENSUS_MS,
     maxBuffer: 4 * 1024 * 1024,
@@ -69,7 +72,16 @@ const live = value => value !== undefined && !value.state?.startsWith('Z');
  * parent, so abnormal shutdown always retains that uncertainty.
  */
 export function createProcessTracker({ rootPid, rootCommand, pollIntervalMs = 25,
-  readProcesses = census, signalProcess = (pid, signal) => process.kill(pid, signal) }) {
+  readProcesses = census, signalProcess = (pid, signal) => process.kill(pid, signal), rootIsRunning,
+  // A custom census uses the legacy identity seam unless its test also supplies
+  // a native provider. The real Linux census always uses retained descriptors.
+  nativeProvider = process.platform === 'linux' && readProcesses === census ? createLinuxProcessProvider() : null }) {
+  if (nativeProvider) return createNativeProcessTracker({ rootPid, rootCommand, pollIntervalMs,
+    readProcesses, signalProcess, nativeProvider, rootIsRunning, censusMs: CENSUS_MS, maxProcesses: MAX_PROCESSES });
+  return createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, readProcesses, signalProcess });
+}
+
+function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, readProcesses, signalProcess }) {
   assert.ok(Number.isSafeInteger(rootPid) && rootPid > 0 && typeof rootCommand === 'string' && rootCommand.length > 0);
   assert.ok(Number.isInteger(pollIntervalMs) && pollIntervalMs >= 1 && pollIntervalMs <= 1000);
   const owned = new Map(), retired = new Set(), mismatched = new Set();
@@ -213,7 +225,7 @@ export function createProcessTracker({ rootPid, rootCommand, pollIntervalMs = 25
  * chooses reporting and exit status. The caller must not add a second kill path.
  */
 export function superviseChildProcess(child, { rootCommand, timeoutMs = 240_000, termGraceMs = 5000, killGraceMs = 1000,
-  exitGraceMs = 1000, maxOutputBytes = 8 * 1024 * 1024, pollIntervalMs = 25, readProcesses, signalProcess }) {
+  exitGraceMs = 1000, maxOutputBytes = 8 * 1024 * 1024, pollIntervalMs = 25, readProcesses, signalProcess, nativeProvider }) {
   assert.ok(typeof rootCommand === 'string' && rootCommand.length > 0 && child?.stdout && child?.stderr);
   assert.ok(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 300_000);
   assert.ok(Number.isInteger(maxOutputBytes) && maxOutputBytes > 0 && maxOutputBytes <= 32 * 1024 * 1024);
@@ -289,7 +301,9 @@ export function superviseChildProcess(child, { rootCommand, timeoutMs = 240_000,
     if (child.pid) {
       try {
         tracker = createProcessTracker({ rootPid: child.pid, rootCommand, pollIntervalMs,
-          ...(readProcesses ? { readProcesses } : {}), ...(signalProcess ? { signalProcess } : {}) });
+          rootIsRunning: () => !exit && child.exitCode === null && child.signalCode === null,
+          ...(readProcesses ? { readProcesses } : {}), ...(signalProcess ? { signalProcess } : {}),
+          ...(nativeProvider === undefined ? {} : { nativeProvider }) });
         void tracker.start().catch(error => cleanup('failure', error));
       } catch (error) { cleanup('failure', error); }
     }
@@ -300,14 +314,21 @@ export function superviseChildProcess(child, { rootCommand, timeoutMs = 240_000,
 export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = {}) {
   assert.ok(Number.isInteger(maxBytes) && maxBytes >= 1024 && maxBytes <= 32 * 1024, 'Diagnostic byte budget must be 1024..32768');
   const processInfo = outcome?.process ?? {}, ownership = processInfo.ownership ?? {};
-  const names = ['limitations', 'observed', 'remaining', 'identityMismatches', 'censusErrors', 'signals'];
+  const hasNative = ownership.identityProvider !== undefined || ownership.nativeResources !== undefined;
+  const names = ['limitations', 'observed', 'remaining', 'identityMismatches', 'censusErrors', 'signals',
+    ...(hasNative ? ['labelChanges', 'nativeErrors'] : [])];
   const arrays = Object.fromEntries(names.map(name => [name, Array.isArray(ownership[name]) ? ownership[name] : []]));
   const counts = Object.fromEntries(names.map(name => [name, arrays[name].length]));
-  const caps = Object.fromEntries(names.map(name => [name, Math.min(32, counts[name])]));
-  let stringBytes = 512, includeInitialRoot = true;
+  if (hasNative) {
+    counts.labelChanges = Math.max(counts.labelChanges, diagnosticNumber(ownership.labelChangeCount) ?? 0);
+    counts.nativeErrors = Math.max(counts.nativeErrors, diagnosticNumber(ownership.nativeErrorCount) ?? 0);
+  }
+  const caps = Object.fromEntries(names.map(name => [name, Math.min(32, arrays[name].length)]));
+  let stringBytes = 512, includeInitialRoot = true, includeNativeDetails = true, compactEnvelope = false;
   const boolean = value => typeof value === 'boolean' ? value : null;
   function render() {
-    let truncated = !includeInitialRoot && ownership.initialRootObservation !== undefined;
+    let truncated = (!includeInitialRoot && ownership.initialRootObservation !== undefined)
+      || (hasNative && (!includeNativeDetails || compactEnvelope));
     const text = (value, limit = stringBytes) => {
       const clipped = diagnosticText(value, limit);
       if (typeof value === 'string' && clipped !== value) truncated = true;
@@ -316,6 +337,7 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
     const identity = value => value && typeof value === 'object' ? {
       pid: diagnosticNumber(value.pid), ppid: diagnosticNumber(value.ppid), pgid: diagnosticNumber(value.pgid),
       start: text(value.start, Math.min(64, stringBytes)), command: text(value.command), state: text(value.state, Math.min(32, stringBytes)),
+      ...(typeof value.startTicks === 'string' ? { startTicks: text(value.startTicks, Math.min(64, stringBytes)) } : {}),
     } : null;
     const detail = value => value && typeof value === 'object' ? {
       kind: text(value.kind, Math.min(64, stringBytes)), rowIndex: diagnosticNumber(value.rowIndex), rowBytes: diagnosticNumber(value.rowBytes),
@@ -327,6 +349,10 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
       censusErrors: value => ({ message: text(value?.message), code: typeof value?.code === 'number' ? diagnosticNumber(value.code) : text(value?.code, Math.min(64, stringBytes)),
         signal: text(value?.signal, Math.min(32, stringBytes)), killed: boolean(value?.killed), diagnostic: detail(value?.diagnostic) }),
       signals: value => ({ ...identity(value), signal: text(value?.signal, Math.min(32, stringBytes)) }),
+      labelChanges: value => ({ pid: diagnosticNumber(value?.pid), startTicks: text(value?.startTicks, Math.min(64, stringBytes)),
+        previousCommand: text(value?.previousCommand), currentCommand: text(value?.currentCommand) }),
+      nativeErrors: value => ({ operation: text(value?.operation, Math.min(64, stringBytes)), pid: diagnosticNumber(value?.pid),
+        code: text(value?.code, Math.min(64, stringBytes)), message: text(value?.message) }),
     };
     const filtered = Object.fromEntries(names.map(name => [name, arrays[name].slice(0, caps[name]).map(maps[name])]));
     const omitted = Object.fromEntries(names.map(name => [name, counts[name] - filtered[name].length]));
@@ -335,6 +361,15 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
     const initialRootObservation = includeInitialRoot && initial && typeof initial === 'object' ? {
       expected: identity(initial.expected), observed: identity(initial.observed), reason: text(initial.reason, Math.min(64, stringBytes)),
     } : null;
+    const resources = ownership.nativeResources;
+    const nativeFields = hasNative ? {
+      identityProvider: text(ownership.identityProvider, Math.min(64, stringBytes)),
+      nativeResources: resources && typeof resources === 'object' ? {
+        unsettled: boolean(resources.unsettled),
+        ...(includeNativeDetails ? Object.fromEntries(['opened', 'closed', 'held', 'pendingOpens', 'pendingReads', 'pendingCloses']
+          .map(key => [key, diagnosticNumber(resources[key])])) : {}),
+      } : null,
+    } : {};
     const summary = {
       format: 'strata.preview.process-cleanup-diagnostic', version: 1,
       error: outcome?.error ? { name: text(outcome.error.name, Math.min(64, stringBytes)), message: text(outcome.error.message) } : null,
@@ -344,9 +379,11 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
         timeoutMs: diagnosticNumber(processInfo.timeoutMs), termGraceMs: diagnosticNumber(processInfo.termGraceMs),
         killGraceMs: diagnosticNumber(processInfo.killGraceMs), exitGraceMs: diagnosticNumber(processInfo.exitGraceMs) },
       ownership: { rootPid: diagnosticNumber(ownership.rootPid), cleanupUnknown: boolean(ownership.cleanupUnknown),
-        ...(initialRootObservation ? { initialRootObservation } : {}), ...filtered },
+        ...(initialRootObservation ? { initialRootObservation } : {}), ...nativeFields, ...filtered },
       counts, omitted, truncated,
     };
+    if (compactEnvelope) summary.process = { pid: summary.process.pid, exitCode: summary.process.exitCode,
+      cleanupUnknown: summary.process.cleanupUnknown, timedOut: summary.process.timedOut };
     // text() may have set the flag while constructing the last fields.
     summary.truncated = truncated;
     return `${JSON.stringify(summary)}\n`;
@@ -355,13 +392,15 @@ export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = 
   while (Buffer.byteLength(result) > maxBytes) {
     // Preserve one short reason/error ahead of bulky process rows. Exact totals
     // remain visible even when all rows from a category must be omitted.
-    const drop = ['observed', 'signals', 'identityMismatches', 'remaining', 'limitations', 'censusErrors']
-      .find(name => caps[name] > (name === 'limitations' || name === 'censusErrors' ? 1 : 0));
+    const drop = ['observed', 'signals', 'identityMismatches', 'labelChanges', 'remaining', 'limitations', 'censusErrors', 'nativeErrors']
+      .find(name => caps[name] > (name === 'limitations' || name === 'censusErrors' || name === 'nativeErrors' ? 1 : 0));
     if (drop) caps[drop]--;
     else if (stringBytes > 16) stringBytes = Math.max(16, Math.floor(stringBytes / 2));
     else if (includeInitialRoot && ownership.initialRootObservation !== undefined) includeInitialRoot = false;
+    else if (hasNative && includeNativeDetails) includeNativeDetails = false;
+    else if (hasNative && !compactEnvelope) compactEnvelope = true;
     else {
-      const last = ['limitations', 'censusErrors'].find(name => caps[name] > 0);
+      const last = ['limitations', 'censusErrors', 'nativeErrors'].find(name => caps[name] > 0);
       if (last) caps[last]--;
       else throw new Error('Diagnostic envelope cannot fit its minimum byte budget');
     }

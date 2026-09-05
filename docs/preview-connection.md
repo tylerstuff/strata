@@ -166,6 +166,30 @@ publication. Roots must not be renamed or replaced during use. This process is a
 cooperating local-project tool, not an OS sandbox against hostile concurrent
 filesystem changes by another process.
 
+## Contributor launcher cleanup
+
+The connection browser test launcher tracks its spawned workflow and observed
+descendants. On Linux, it opens and retains `/proc/<pid>/stat` descriptors after
+the initial expected-label check and a live `ChildProcess` observation. Current
+parent checks bracket descendant admission. Later label, parent or process-group
+changes do not replace the retained identity; raw start ticks stay decimal strings
+in diagnostics. Darwin continues using the existing `ps` identity checks.
+
+The process census discovers candidates. A missing or dead census row for an
+owned process requires confirmation through its retained descriptor or the
+spawned root's exit state. Conflicting live evidence, inaccessible or malformed
+reads, and unresolved opens, reads or closes keep cleanup uncertain. Retired
+identities cannot be admitted again. Cleanup stops new admission; deadlines do
+not cancel native I/O, and late handles close without regaining authority.
+
+This remains a polling launcher, with a final identity-check-to-numeric-signal
+race and a blind spot for children that fork and reparent between samples.
+Abnormal shutdown always reports that uncertainty. Initial process labels are
+still required; the controlled Node 24 fixture's known label does not relax
+production admission. Failure diagnostics include bounded native errors, label
+changes and unsettled-resource counts. None of this changes the runtime package
+or establishes browser, GPU or performance acceptance.
+
 ## Validation boundary
 
 `npm run check:preview` passed for this implementation checkpoint: 325 CPU tests,
