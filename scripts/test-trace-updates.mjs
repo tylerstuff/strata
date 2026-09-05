@@ -11,7 +11,7 @@ import { createBenchmarkServer } from './benchmark-server.mjs';
 
 const command = promisify(execFile);
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const usage = 'Use --prepare-only --asset-root PATH --rays PATH --output NEW_EXTERNAL_DIR [--allow-dirty-draft], or --run --manifest PATH --manifest-sha256 SHA --output NEW_EXTERNAL_DIR --adapter hardware|software.';
+const usage = 'Use --prepare-only --asset-root PATH --rays PATH --output NEW_EXTERNAL_DIR [--allow-dirty-draft] [--full-control full-correctness-only|full-performance] [--renderer-churn run|skip-unchanged-candidate-only], or --run --manifest PATH --manifest-sha256 SHA --output NEW_EXTERNAL_DIR --adapter hardware|software.';
 export const traceProofInputs = Object.freeze({
   'manifest.json': '818d7d020a608d59e83b334b1737ac655de545986e5a8a7494d76910a09c86ca',
   'trace-proxy.json': 'e5341ca032a49c21591f3a47029c301ad0325e6abdde3bb1542f2e6e5cbee47c',
@@ -19,6 +19,18 @@ export const traceProofInputs = Object.freeze({
   'rays.bin': '95540b1eaeb1468a89c622cab00f87e07d544c2bf55d4f432e076a24f26e06d7',
 });
 export const proofHash = bytes => createHash('sha256').update(bytes).digest('hex');
+export function traceProofControlSpec(id = 'full-correctness-only') {
+  assert(['full-correctness-only', 'full-performance'].includes(id), 'Unknown frozen full-control identity.');
+  return { id, path: id === 'full-performance' ? 'tests/helpers/full-trace-performance-updater.ts' : 'tests/helpers/full-trace-updater.ts',
+    timingEligibility: id === 'full-performance' ? 'requires-matching-passed-direct-and-renderer-gates' : 'correctness-only' };
+}
+/** Candidate code is never substituted. Direct proofs retain their independent oracle. */
+export function traceProofBundleReplacements(id, role) {
+  const control = traceProofControlSpec(id);
+  assert(['direct', 'candidate', 'full'].includes(role), 'Unknown proof bundle role.');
+  if (role === 'candidate' || role === 'direct' && id === 'full-correctness-only') return [];
+  return [{ requested: role === 'full' ? 'packages/core/src/gi/trace-updates.ts' : 'tests/helpers/full-trace-updater.ts', actual: control.path }];
+}
 async function bounded(operation, label, milliseconds = 10000) {
   let timer;
   try { return await Promise.race([operation, new Promise((_, reject) => { timer = setTimeout(() => reject(Error(`${label} deadline exceeded.`)), milliseconds); })]); }
@@ -31,7 +43,7 @@ export const parseProofInputJson = text => JSON.parse(text, (_key, item) => item
 const within = (root, path) => { const p = relative(root, path); return p === '' || (!isAbsolute(p) && p !== '..' && !p.startsWith(`..${sep}`)); };
 export function parseProofArguments(args) {
   const flags = new Set(['--prepare-only', '--run', '--allow-dirty-draft']);
-  const values = new Set(['--asset-root', '--rays', '--output', '--manifest', '--manifest-sha256', '--adapter']);
+  const values = new Set(['--asset-root', '--rays', '--output', '--manifest', '--manifest-sha256', '--adapter', '--full-control', '--renderer-churn']);
   const result = {};
   for (let i = 0; i < args.length; i++) {
     const key = args[i];
@@ -45,9 +57,14 @@ export function parseProofArguments(args) {
   const prepare = result['--prepare-only'] === true;
   assert(prepare !== (result['--run'] === true), usage);
   const required = prepare ? ['--asset-root', '--rays', '--output'] : ['--manifest', '--manifest-sha256', '--output', '--adapter'];
-  const allowed = new Set([...required, prepare ? '--prepare-only' : '--run', ...(prepare ? ['--allow-dirty-draft'] : [])]);
+  const allowed = new Set([...required, prepare ? '--prepare-only' : '--run', ...(prepare ? ['--allow-dirty-draft', '--full-control', '--renderer-churn'] : [])]);
   assert(required.every(key => typeof result[key] === 'string') && Object.keys(result).every(key => allowed.has(key)), usage);
-  if (!prepare) {
+  if (prepare) {
+    result['--full-control'] ??= 'full-correctness-only';
+    result['--renderer-churn'] ??= 'run';
+    traceProofControlSpec(result['--full-control']);
+    assert(['run', 'skip-unchanged-candidate-only'].includes(result['--renderer-churn']), 'Unknown frozen renderer churn mode.');
+  } else {
     assert(/^[a-f0-9]{64}$/.test(result['--manifest-sha256']), 'The independently reviewed manifest SHA-256 is required.');
     assert(['hardware', 'software'].includes(result['--adapter']), usage);
   }
@@ -135,16 +152,15 @@ async function externalAssets(assetRoot) {
   return { root, files };
 }
 
-async function bundle(entry, output, name, substituteFull = false) {
+export async function bundleTraceProof(entry, output, name, replacements = []) {
   const modules = {}, substitutions = [];
-  const production = resolve(repository, 'packages/core/src/gi/trace-updates.ts');
-  const helper = resolve(repository, 'tests/helpers/full-trace-updater.ts');
   const result = await build({ absWorkingDir: repository, ...(typeof entry === 'string' ? { entryPoints: [entry] } : { stdin: entry }),
     outfile: resolve(output, name), bundle: true, write: false, format: 'esm', platform: 'browser', target: 'es2022',
     sourcemap: 'external', sourcesContent: true, metafile: true,
     plugins: [{ name: 'frozen-explicit-diagnostic-control', setup(builder) {
       builder.onLoad({ filter: /\.ts$/ }, async ({ path }) => {
-        const actual = substituteFull && path === production ? helper : path;
+        const replacement = replacements.find(item => path === resolve(repository, item.requested));
+        const actual = replacement ? resolve(repository, replacement.actual) : path;
         const contents = await readFile(actual, 'utf8');
         modules[relative(repository, actual)] = proofHash(contents);
         if (actual !== path) substitutions.push({ requested: relative(repository, path), actual: relative(repository, actual), sha256: proofHash(contents) });
@@ -152,7 +168,8 @@ async function bundle(entry, output, name, substituteFull = false) {
       });
     } }],
   });
-  assert.equal(substitutions.length, substituteFull ? 1 : 0, 'Only the explicit full renderer bundle may replace the updater.');
+  assert.deepEqual(substitutions.map(({ requested, actual }) => ({ requested, actual })), replacements,
+    'Only the explicitly selected full-control module may be substituted.');
   const files = [];
   for (const file of result.outputFiles) {
     await writeFile(file.path, file.contents, { flag: 'wx' });
@@ -161,6 +178,7 @@ async function bundle(entry, output, name, substituteFull = false) {
   return { entry: typeof entry === 'string' ? entry : entry.sourcefile, modules, substitutions, files,
     performanceEligible: false };
 }
+const bundle = bundleTraceProof;
 
 /** CPU descriptor collection only: no browser, native adapter or GPU resource. */
 async function collectShaderSources(api, stageA, stageB) {
@@ -194,6 +212,11 @@ async function collectShaderSources(api, stageA, stageB) {
 export async function prepareProof(args) {
   const before = await sourceState();
   assert(!before.status || args['--allow-dirty-draft'], 'Freeze a clean harness commit, or explicitly create a non-runnable dirty draft.');
+  const control = traceProofControlSpec(args['--full-control']);
+  const fullControl = { id: control.id, helper: { path: control.path, sha256: proofHash(await readFile(resolve(repository, control.path))) },
+    timingEligibility: control.timingEligibility };
+  const rendererChurn = args['--renderer-churn'] ?? 'run';
+  assert(['run', 'skip-unchanged-candidate-only'].includes(rendererChurn), 'Unknown frozen renderer churn mode.');
   const output = await newExternalDirectory(args['--output']);
   const assets = await externalAssets(args['--asset-root']);
   const rayPath = await realpath(resolve(args['--rays']));
@@ -202,9 +225,9 @@ export async function prepareProof(args) {
   const direct = await bundle({ contents: `
     export * from './tests/browser/trace-update-write-validation.ts';
     export { assertCompletedProofStage, finishProofDevice } from './tests/browser/trace-update-proof-gpu.ts';
-  `, resolveDir: repository, sourcefile: 'direct-proof-entry.ts', loader: 'ts' }, output, 'direct.mjs');
+  `, resolveDir: repository, sourcefile: 'direct-proof-entry.ts', loader: 'ts' }, output, 'direct.mjs', traceProofBundleReplacements(control.id, 'direct'));
   const candidate = await bundle('tests/browser/trace-update-renderer-validation.ts', output, 'candidate.mjs');
-  const full = await bundle('tests/browser/trace-update-renderer-validation.ts', output, 'full-correctness-only.mjs', true);
+  const full = await bundle('tests/browser/trace-update-renderer-validation.ts', output, `${control.id}.mjs`, traceProofBundleReplacements(control.id, 'full'));
   for (const [path, sha] of Object.entries(candidate.modules)) {
     if (path !== 'packages/core/src/gi/trace-updates.ts') assert.equal(full.modules[path], sha, `Renderer arm module changed: ${path}`);
   }
@@ -249,12 +272,13 @@ export async function prepareProof(args) {
   });
   const inputs = { staticTriangles: proxy.triangles, rays };
   assert.deepEqual(parseProofInputJson(proofInputJson(inputs)), inputs, 'Frozen input transport must preserve signed zero.');
-  const plan = { correctnessOnly: true, performanceEligible: false, totalDeadlineMs: 600000, readbackDeadlineMs: 10000,
+  const renderer = stageB.validateRendererProofPlan(JSON.parse(json(stageB.createRendererProofPlan(rendererChurn))));
+  const plan = { correctnessOnly: true, performanceEligible: false, fullControl, rendererChurn, totalDeadlineMs: 600000, readbackDeadlineMs: 10000,
     traceStrides: api.giTraceStrides, directReadbackLayouts: stageA.traceWriteReadbackLayouts,
     reportedSourceInterval: stageA.traceWriteReportedSourceInterval,
     sourceGates: api.updateOracleGates, rayLabels: labels,
     states: stageA.traceWriteStates, queryStates: stageA.traceWriteQueryStates, canonicalWrites: stageA.traceWriteCanonicalWrites,
-    failurePlan: stageA.traceWriteFailurePlan(proxy.triangles), renderer: stageB.rendererProofPlan,
+    failurePlan: stageA.traceWriteFailurePlan(proxy.triangles, control.id), renderer,
     shaderSha256: Object.fromEntries(Object.entries(shaders).map(([name, source]) => [name, proofHash(source)])) };
   const artifacts = [];
   for (const [name, contents] of [['inputs.json', proofInputJson(inputs)], ['steps.json', json(plan)], ['shaders.json', json(shaders)], ['rays.bin', rayBytes]]) {
@@ -264,9 +288,12 @@ export async function prepareProof(args) {
   const after = await sourceState(); assert.deepEqual(after, before, 'Source changed during preparation.');
   // Also guard untracked draft sources, which are not represented by git diff.
   const modules = Object.assign({}, direct.modules, candidate.modules, full.modules, cpu.modules);
+  assert.equal(direct.modules[control.path], fullControl.helper.sha256);
+  assert.equal(full.modules[control.path], fullControl.helper.sha256);
   for (const [path, sha] of Object.entries(modules)) assert.equal(proofHash(await readFile(resolve(repository, path))), sha, `Source changed: ${path}`);
   const manifest = { schemaVersion: 1, kind: 'strata-issue20-frozen-correctness-proof', createdAt: new Date().toISOString(),
     correctnessOnly: true, performanceEligible: false, runnable: !before.status && !args['--allow-dirty-draft'],
+    fullControl, rendererChurn,
     source: before, runnerSha256: proofHash(await readFile(fileURLToPath(import.meta.url))), assets,
     raySource: { path: rayPath, sha256: proofHash(rayBytes), bytes: rayBytes.byteLength },
     bundles: { direct, candidate, full, cpu }, artifacts };
@@ -280,6 +307,9 @@ export async function verifyProof(path, sha256) {
   assert.equal(manifest.schemaVersion, 1); assert.equal(manifest.kind, 'strata-issue20-frozen-correctness-proof');
   assert.equal(manifest.runnable, true, 'Draft manifests cannot request a GPU.');
   assert.equal(manifest.performanceEligible, false);
+  const control = traceProofControlSpec(manifest.fullControl?.id);
+  assert.deepEqual(manifest.fullControl, { id: control.id,
+    helper: { path: control.path, sha256: proofHash(await readFile(resolve(repository, control.path))) }, timingEligibility: control.timingEligibility });
   assert.deepEqual(await sourceState(), manifest.source, 'Run from the exact clean reviewed source.');
   assert.equal(proofHash(await readFile(fileURLToPath(import.meta.url))), manifest.runnerSha256);
   for (const artifact of [...manifest.artifacts, ...Object.values(manifest.bundles).flatMap(b => b.files)]) {
@@ -289,6 +319,17 @@ export async function verifyProof(path, sha256) {
   for (const b of Object.values(manifest.bundles)) for (const [module, sha] of Object.entries(b.modules)) {
     assert.equal(proofHash(await readFile(resolve(repository, module))), sha, `Reviewed module changed: ${module}`);
   }
+  for (const role of ['direct', 'candidate', 'full']) {
+    const bundle = manifest.bundles[role];
+    assert.deepEqual(bundle.substitutions.map(({ requested, actual }) => ({ requested, actual })), traceProofBundleReplacements(control.id, role));
+    if (role !== 'candidate') assert.equal(bundle.modules[control.path], manifest.fullControl.helper.sha256);
+  }
+  const steps = JSON.parse(await readFile(resolve(directory, 'steps.json'), 'utf8'));
+  assert.deepEqual(steps.fullControl, manifest.fullControl);
+  assert.equal(steps.rendererChurn, manifest.rendererChurn);
+  assert.equal(steps.renderer.streamedChurn, manifest.rendererChurn);
+  const rendererApi = await import(pathToFileURL(resolve(directory, 'candidate.mjs')).href);
+  rendererApi.validateRendererProofPlan(steps.renderer); // Reject numerical/shape changes before browser launch.
   assert.deepEqual(await externalAssets(manifest.assets.root), manifest.assets);
   await frozenFile(manifest.raySource.path, traceProofInputs['rays.bin']);
   return { manifest, directory };
@@ -298,6 +339,7 @@ export async function runProof(args) {
   const frozen = await verifyProof(args['--manifest'], args['--manifest-sha256']);
   const output = await newExternalDirectory(args['--output']);
   const report = { kind: 'strata-issue20-gpu-correctness', correctnessOnly: true, performanceEligible: false,
+    fullControl: frozen.manifest.fullControl, rendererChurn: frozen.manifest.rendererChurn,
     manifest: { path: resolve(args['--manifest']), sha256: args['--manifest-sha256'] }, requestedAdapter: args['--adapter'],
     startedAt: new Date().toISOString(), browserErrors: [], events: 0, cleanup: {} };
   let browser, server, timer, detachBrowserListeners, stopped = false, pendingEvents = Promise.resolve();
@@ -326,12 +368,13 @@ export async function runProof(args) {
     detachBrowserListeners = () => { page.off('pageerror', pageError); page.off('console', consoleError); };
     await page.exposeFunction('recordTraceProofEvent', event);
     await page.route(`${server.url}/proof.html`, route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Strata issue20 correctness proof</title>' }));
-    for (const name of ['direct.mjs', 'candidate.mjs', 'full-correctness-only.mjs', 'inputs.json', 'steps.json', 'shaders.json']) {
+    const fullBundleName = `${frozen.manifest.fullControl.id}.mjs`;
+    for (const name of ['direct.mjs', 'candidate.mjs', fullBundleName, 'inputs.json', 'steps.json', 'shaders.json']) {
       const body = await readFile(resolve(frozen.directory, name));
       await page.route(`${server.url}/proof/${name}`, route => route.fulfill({ contentType: name.endsWith('.json') ? 'application/json' : 'text/javascript', body }));
     }
     await page.goto(`${server.url}/proof.html`);
-    const result = await page.evaluate(async requestedAdapter => {
+    const result = await page.evaluate(async ({ requestedAdapter, fullBundleName, fullControl, rendererChurn }) => {
       let device, proofApi; let expectedDestroy = false, openScopes = 0;
       const errors = [], result = { stages: {}, shaders: [], cleanup: { deviceDestroyed: false } };
       const emit = async value => {
@@ -339,10 +382,14 @@ export async function runProof(args) {
         if (errors.length) throw Error(errors.join('\n'));
       };
       try {
-        const [direct, candidate, full, inputs] = await Promise.all([import('/proof/direct.mjs'), import('/proof/candidate.mjs'), import('/proof/full-correctness-only.mjs'),
+        const [direct, candidate, full, inputs, steps] = await Promise.all([import('/proof/direct.mjs'), import('/proof/candidate.mjs'), import(`/proof/${fullBundleName}`),
           fetch('/proof/inputs.json').then(r => r.text()).then(text => JSON.parse(text, (_key, item) => item && typeof item === 'object'
-            && Object.keys(item).length === 1 && item.$strataF32 === '-0' ? -0 : item))]);
+            && Object.keys(item).length === 1 && item.$strataF32 === '-0' ? -0 : item)), fetch('/proof/steps.json').then(r => r.json())]);
         proofApi = direct;
+        const frozenRenderer = candidate.validateRendererProofPlan(steps.renderer);
+        full.validateRendererProofPlan(steps.renderer);
+        if (JSON.stringify(steps.fullControl) !== JSON.stringify(fullControl) || steps.rendererChurn !== rendererChurn
+          || frozenRenderer.streamedChurn !== rendererChurn) throw Error('Frozen control or renderer scope differs.');
         if (!navigator.gpu) throw Error('WebGPU unavailable.');
         const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance', forceFallbackAdapter: requestedAdapter === 'software' });
         if (!adapter) throw Error(`No ${requestedAdapter} adapter available; no fallback substitution allowed.`);
@@ -372,12 +419,12 @@ export async function runProof(args) {
           return functions.get(key);
         } });
         await emit({ stage: 'A', status: 'start', adapter: result.adapter, device: result.device });
-        result.stages.A = await direct.runTraceWriteValidation(recorded, inputs, emit);
+        result.stages.A = await direct.runTraceWriteValidation(recorded, inputs, emit, fullControl.id);
         await emit({ stage: 'A', status: 'complete', evidence: result.stages.A });
         direct.assertCompletedProofStage(result.stages.A, 'Stage A');
         await emit({ stage: 'B/C', status: 'start' });
         result.stages.BC = await candidate.runRendererPairValidation(recorded, candidate.createRendererProofArm, full.createRendererProofArm,
-          { manifestUrl: new URL('/external-assets/manifest.json', location.href).href, traceProxyUrl: new URL('/external-assets/trace-proxy.json', location.href).href }, emit);
+          { manifestUrl: new URL('/external-assets/manifest.json', location.href).href, traceProxyUrl: new URL('/external-assets/trace-proxy.json', location.href).href }, frozenRenderer, emit);
         await emit({ stage: 'B/C', status: 'complete', evidence: result.stages.BC });
         direct.assertCompletedProofStage(result.stages.BC, 'Renderer stages');
         await device.queue.onSubmittedWorkDone();
@@ -395,7 +442,7 @@ export async function runProof(args) {
         if (errors.length) { result.status = 'fail'; result.failure ??= { message: errors.join('\n') }; }
       }
       return result;
-    }, args['--adapter']);
+    }, { requestedAdapter: args['--adapter'], fullBundleName, fullControl: frozen.manifest.fullControl, rendererChurn: frozen.manifest.rendererChurn });
     active();
     report.result = result;
     assert.equal(report.result.status, 'pass', report.result.failure?.message ?? 'GPU correctness proof failed.');

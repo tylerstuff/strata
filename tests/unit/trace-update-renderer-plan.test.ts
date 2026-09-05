@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { advanceRendererProofModes, assertDisabledRendererCaches, assertProbeResetLifecycle, assertRendererProofModes,
-  assertRendererSharpSample, rendererProofPlan, rendererSharpRay } from '../browser/trace-update-renderer-validation.js';
+  assertRendererSharpSample, createRendererProofPlan, rendererProofPlan, rendererSharpRay,
+  runRendererPairValidation, validateRendererProofPlan } from '../browser/trace-update-renderer-validation.js';
 import type { RendererProofKind } from '../browser/trace-update-renderer-validation.js';
 import { GiTraceUpdater } from '../../packages/core/src/gi/trace-updates.js';
 import { buildGiTraceData, traceGiBvh } from '../../packages/core/src/gi/trace-data.js';
@@ -11,6 +13,77 @@ import { createReflectionScene } from '../../packages/core/src/reflections/refle
 import { createIntegratedScene } from '../../packages/core/src/integrated/integrated-scene.js';
 
 describe('frozen renderer-pair proof schedule', () => {
+  it('retains the complete reviewed serialized schedule and exact f64 motion bits without transcendental regeneration', () => {
+    // Archived ed83499 steps.json renderer.steps; independent fixed digest, no external files needed in CI.
+    expect(createHash('sha256').update(JSON.stringify(rendererProofPlan.steps)).digest('hex'))
+      .toBe('58df81195fd1462697e73d0af006870321d8d892eaf22e4ad08d8b9d5027045f');
+    const value = rendererProofPlan.steps.reflections.find(step => step.id === 'soft-motion-8')!.controls.reflections!.objectOffset!;
+    const word = new DataView(new ArrayBuffer(8)); word.setFloat64(0, value);
+    expect(word.getBigUint64(0)).toBe(0xbfd62b9586ad0a21n);
+    const changed = structuredClone(rendererProofPlan); word.setBigUint64(0, 0xbfd62b9586ad0a20n);
+    const oneUlp = word.getFloat64(0); expect(Math.fround(oneUlp)).toBe(Math.fround(value));
+    changed.steps.reflections.find(step => step.id === 'soft-motion-8')!.controls.reflections!.objectOffset = oneUlp;
+    expect(() => validateRendererProofPlan(changed)).toThrow('controls.reflections.objectOffset');
+    // The known f64 discrepancy rounded to identical source records; that does not permit input mismatch.
+    const source = (offset: number) => {
+      const data = buildGiTraceData(createReflectionScene({ roughness: .08, objectOffset: offset }));
+      const updater = new GiTraceUpdater(data); updater.dispose();
+      return [data.nodeData, data.triangleData, data.boxData, data.materialData, data.uniformData].map(bytes => new Uint8Array(bytes));
+    };
+    expect(source(oneUlp)).toEqual(source(value));
+  });
+
+  it('validates both explicit scopes and takes an immutable owned snapshot before any await', () => {
+    for (const mode of ['run', 'skip-unchanged-candidate-only'] as const) {
+      const input = JSON.parse(JSON.stringify(createRendererProofPlan(mode)));
+      const snapshot = validateRendererProofPlan(input);
+      expect(snapshot).toEqual(input); expect(snapshot).not.toBe(input);
+      input.steps.reflections[0].controls.temporal = true; input.streamedTimes[0] = 99;
+      expect(snapshot.steps.reflections[0]!.controls.temporal).toBe(false); expect(snapshot.streamedTimes[0]).toBe(0);
+      expect(Object.isFrozen(snapshot.steps.reflections[0]!.controls)).toBe(true);
+      expect(() => { snapshot.streamedTimes[0] = 99; }).toThrow();
+    }
+    for (const value of [undefined, null, {}, { ...rendererProofPlan, streamedChurn: 'skip' }]) {
+      expect(() => validateRendererProofPlan(value)).toThrow('churn mode');
+    }
+  });
+
+  it('rejects every mutated primitive plus missing, additional, reordered and sparse plan input', () => {
+    const paths: string[][] = [];
+    const visit = (value: unknown, path: string[]) => {
+      if (value !== null && typeof value === 'object') for (const [key, child] of Object.entries(value)) visit(child, [...path, key]);
+      else paths.push(path);
+    };
+    visit(rendererProofPlan, []); expect(paths.length).toBeGreaterThan(2000);
+    for (const path of paths) {
+      const copy = structuredClone(rendererProofPlan);
+      let parent = copy as unknown as Record<string, unknown>;
+      for (const key of path.slice(0, -1)) parent = parent[key] as Record<string, unknown>;
+      const key = path.at(-1)!, value = parent[key];
+      parent[key] = typeof value === 'number' ? value + 1 : typeof value === 'boolean' ? !value : `${value}-mutated`;
+      expect(() => validateRendererProofPlan(copy), path.join('.')).toThrow();
+    }
+    const variants = [
+      (p: typeof rendererProofPlan) => { delete (p.steps.reflections[0] as { controls?: unknown }).controls; },
+      (p: typeof rendererProofPlan) => { Object.assign(p.steps.reflections[0]!.controls, { unknownControl: false }); },
+      (p: typeof rendererProofPlan) => { const list = p.steps.reflections as Array<typeof p.steps.reflections[0]>; [list[0], list[1]] = [list[1]!, list[0]!]; },
+      (p: typeof rendererProofPlan) => { p.streamedTimes.length++; },
+      (p: typeof rendererProofPlan) => { p.streamedTimes[0] = -0; },
+      (p: typeof rendererProofPlan) => { p.settings.seed = NaN; },
+      (p: typeof rendererProofPlan) => { p.limits.successfulFramesPerArm = Infinity; },
+    ];
+    for (const mutate of variants) { const copy = structuredClone(rendererProofPlan); mutate(copy); expect(() => validateRendererProofPlan(copy)).toThrow(); }
+    expect(() => validateRendererProofPlan(Object.fromEntries(Object.entries(rendererProofPlan).reverse()))).toThrow('keys/order');
+  });
+
+  it('rejects a missing or mutated frozen plan before either renderer factory can execute', async () => {
+    let calls = 0;
+    const factory = async () => { calls++; throw Error('Renderer creation must not run'); };
+    for (const input of [undefined, { ...rendererProofPlan, settings: { ...rendererProofPlan.settings, seed: 1 } }]) {
+      await expect(runRendererPairValidation({} as GPUDevice, factory, factory, { manifestUrl: '', traceProxyUrl: '' }, input)).rejects.toThrow();
+    }
+    expect(calls).toBe(0);
+  });
   it('stays within explicit submission/checkpoint limits with one bounded failure and immutable input controls', () => {
     for (const kind of ['gi', 'reflections', 'integrated'] as const) {
       const steps = rendererProofPlan.steps[kind];
@@ -35,7 +108,7 @@ describe('frozen renderer-pair proof schedule', () => {
     expect(rendererProofPlan.settings).toMatchObject({ roughness: 0, temporal: false, probesPerUpdate: 32, raysPerProbe: 64,
       resolutionScale: 1, maxRaysPerFrame: 32768, maxDistance: 16, requestedResidentPoolBytes: 8 * 1024 ** 2, allocatedCanonicalResidentPoolBytes: 80 * 65536 });
     expect(rendererProofPlan.steps.reflections.slice(0, 12).map(step => step.id)).toEqual(Array.from({ length: 12 }, (_, i) => `sharp-warm-${i + 1}`));
-    expect(rendererProofPlan.version).toBe('issue20-renderer-pair-v2');
+    expect(rendererProofPlan.version).toBe('issue20-renderer-pair-v3');
     expect(rendererProofPlan.steps.reflections[12]).toMatchObject({ id: 'sharp-moved-point4', checkpoint: true, controls: { reflections: { objectOffset: .4, roughness: 0 } } });
     expect(rendererProofPlan.steps.gi.some(step => step.id === 'sharp-moved-point4')).toBe(false);
     expect(rendererProofPlan.steps.reflections.find(step => step.id === 'world-S0')?.controls.reflections?.roughness).toBe(.08);

@@ -94,8 +94,15 @@ export function classifyReportedTriangle(ray: GiRay, t: GiTriangle) {
   return { distance, weights, boundary, admissible, inInterval, cosine };
 }
 
+export type TraceProofFullControlId = 'full-correctness-only' | 'full-performance';
+export function traceWriteControlId(value: unknown): TraceProofFullControlId {
+  check(value === 'full-correctness-only' || value === 'full-performance', 'Unknown frozen full-control identity.');
+  return value;
+}
+
 /** Pure CPU dry plan. Runner must serialize/hash this before requesting a GPU window. */
-export function traceWriteFailurePlan(staticTriangles: readonly GiTriangle[]) {
+export function traceWriteFailurePlan(staticTriangles: readonly GiTriangle[], selectedControl: TraceProofFullControlId = 'full-correctness-only') {
+  const fullControl = traceWriteControlId(selectedControl);
   const initial = buildGiTraceData(createIntegratedScene(), staticTriangles);
   return [GiTraceUpdater, FullTraceUpdater].map((Constructor, arm) => {
     const data = clone(initial), updater = new Constructor(data), writes: { buffer: number; offset: number; bytes: number }[] = [];
@@ -106,7 +113,7 @@ export function traceWriteFailurePlan(staticTriangles: readonly GiTriangle[]) {
         writes.push({ buffer: target.id, offset, bytes });
       } } as unknown as GPUQueue, buffers as unknown as GPUBuffer[]);
       check(writes.length >= 2, 'Failure plan needs at least two writes.');
-      return { arm: arm === 0 ? 'incremental' : 'full-correctness-only', writes, failureIndices: [0, 1, writes.length - 1] };
+      return { arm: arm === 0 ? 'incremental' : fullControl, writes, failureIndices: [0, 1, writes.length - 1] };
     } finally { updater.dispose(); }
   });
 }
@@ -118,8 +125,9 @@ interface Arm { name: string; identity: number; bufferIdentities: number[]; data
 
 /** Stage A alone: actual native GPU sources, two maintenance paths and one query shader. */
 export async function runTraceWriteValidation(device: GPUDevice, inputs: { staticTriangles: readonly GiTriangle[]; rays: readonly GiRay[] },
-  onProgress?: (event: unknown) => Promise<void>) {
-  const report = { status: 'running', stage: 'A-actual-trace-writes', correctnessOnly: true, cases: [] as unknown[],
+  onProgress?: (event: unknown) => Promise<void>, selectedControl: TraceProofFullControlId = 'full-correctness-only') {
+  const fullControl = traceWriteControlId(selectedControl);
+  const report = { status: 'running', stage: 'A-actual-trace-writes', correctnessOnly: true, fullControl, cases: [] as unknown[],
     writes: [] as WriteRecord[], readbacks: [] as unknown[], queries: [] as unknown[], failures: [] as unknown[],
     input: {} as Record<string, unknown>, cleanup: { createdBuffers: 0, destroyedBuffers: 0, liveArms: 0 } };
   const cursor = { cases: 0, writes: 0, readbacks: 0, queries: 0, failures: 0 }; let progressSequence = 0;
@@ -160,7 +168,7 @@ export async function runTraceWriteValidation(device: GPUDevice, inputs: { stati
     return arm;
   };
   const pair = (scene: GiSceneData = createIntegratedScene(), persistent = inputs.staticTriangles) => {
-    const initial = buildGiTraceData(scene, persistent); return [makeArm('incremental', clone(initial), false), makeArm('full-correctness-only', clone(initial), true)] as const;
+    const initial = buildGiTraceData(scene, persistent); return [makeArm('incremental', clone(initial), false), makeArm(fullControl, clone(initial), true)] as const;
   };
   const release = (arm: Arm) => {
     if (arm.disposed) return; arm.disposed = true; arm.updater.dispose();
@@ -200,7 +208,7 @@ export async function runTraceWriteValidation(device: GPUDevice, inputs: { stati
     check(inputs.staticTriangles.length === 2048 && inputs.rays.length === 512, 'Canonical proxy/ray count differs.');
     for (const ray of inputs.rays) check([...ray.origin, ...ray.direction, ray.tMin, ray.tMax].every(x => Number.isFinite(x) && Object.is(x, Math.fround(x))), 'Ray ABI must contain exact transferred f32 values.');
     const rayBytes = packGiRays(inputs.rays); check(await digest(rayBytes) === traceWriteRaySha256, 'Frozen ray ABI hash differs.');
-    const failurePlan = traceWriteFailurePlan(inputs.staticTriangles);
+    const failurePlan = traceWriteFailurePlan(inputs.staticTriangles, fullControl);
     report.input = { raySha256: traceWriteRaySha256, rayBytes: rayBytes.byteLength, rayCount: 512, staticTriangleCount: 2048,
       states: traceWriteStates, queryStates: traceWriteQueryStates, readbackLayouts: traceWriteReadbackLayouts, readbackOrdering: 'Copy submission and map complete before the next CPU source mutation; queued target version is sampled in that interval.', failureTarget, retryTarget, failurePlan, gates: updateOracleGates,
       reportedSourceInterval: traceWriteReportedSourceInterval };

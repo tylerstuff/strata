@@ -6,7 +6,7 @@ import { packGiRays } from '../../packages/core/src/gi/trace-data.js';
 import { createIntegratedScene } from '../../packages/core/src/integrated/integrated-scene.js';
 import { generatedTraceProxy, updateRayCorpus } from '../helpers/gi-trace-update-reference.js';
 import { classifyReportedTriangle, traceWriteCanonicalWrites, traceWriteFailurePlan, traceWriteQueryStates, traceWriteRaySha256,
-  traceWriteReportedSourceInterval, traceWriteStates } from '../browser/trace-update-write-validation.js';
+  traceWriteControlId, traceWriteReportedSourceInterval, traceWriteStates } from '../browser/trace-update-write-validation.js';
 const triangle: GiTriangle = { id: 7, boxId: 2, materialId: 1, p0: [0, 0, 0], p1: [2, 0, 0], p2: [0, 2, 0], normal: [0, 0, 1] };
 const ray = (x: number, y: number): GiRay => ({ origin: [x, y, 2], direction: [0, 0, -1], tMin: .001, tMax: 4 });
 describe('frozen actual-write proof inputs and independent reported-primitive gates', () => {
@@ -71,5 +71,13 @@ describe('frozen actual-write proof inputs and independent reported-primitive ga
     }
     expect(plans[1]!.writes.map(w => w.buffer)).toEqual([0, 1, 2, 3, 4]);
     expect(plans[0]!.writes).not.toEqual(plans[1]!.writes);
+  });
+  it('identifies the selected bundled control without changing the default plan or numerical gates', () => {
+    const original = traceWriteFailurePlan(generatedTraceProxy());
+    const named = traceWriteFailurePlan(generatedTraceProxy(), 'full-performance');
+    expect(named).toEqual(original.map((plan, index) => ({ ...plan, arm: index === 0 ? 'incremental' : 'full-performance' })));
+    for (const id of ['full-correctness-only', 'full-performance']) expect(traceWriteControlId(id)).toBe(id);
+    for (const id of [undefined, 'full', 'incremental', true]) expect(() => traceWriteControlId(id)).toThrow('control identity');
+    // This test checks reporting only. The Node bundling test checks actual helper substitution.
   });
 });

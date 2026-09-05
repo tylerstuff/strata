@@ -23,6 +23,11 @@ const mutations = [ {}, { objectOffset: -.4 }, { objectOffset: .4 }, {}, { doorO
   { wallColor: 'neutral', roughness: .3, lightIntensity: 2 },
   { objectOffset: -.4, doorOpen: false, wallColor: 'red', lightIntensity: 1, roughness: .08 }, {}, {},
 ] as const;
+// Exact f64 values from the reviewed ed83499 steps.json. Math.sin is not
+// specified bit-for-bit across JS engines; never regenerate these in a browser.
+const motionOffsets = [0.19999999999999998, 0.34641016151377546, 0.4, 0.3464101615137755,
+  0.19999999999999998, 4.898587196589413e-17, -0.1999999999999999, -0.3464101615137754,
+  -0.4, -0.34641016151377546, -0.20000000000000018, -9.797174393178826e-17] as const;
 function freeze<T>(value: T): T {
   if (value && typeof value === 'object') { for (const child of Object.values(value)) freeze(child); Object.freeze(value); }
   return value;
@@ -44,7 +49,7 @@ function steps(kind: RendererProofKind): readonly RendererProofStep[] {
       reflections: { objectOffset: world.objectOffset, roughness: world.roughness } }, index > 0);
   }
   for (let i = 0; i < 12; i++) add(`${kind === 'gi' ? 'steady' : 'soft-motion'}-${i + 1}`,
-    { reflections: { objectOffset: .4 * Math.sin((i + 1) * Math.PI * 2 / 12) } }, i === 11);
+    { reflections: { objectOffset: motionOffsets[i]! } }, i === 11);
   for (let i = 0; i < 12; i++) add(`stopped-${i + 1}`, { reflections: { objectOffset: 0 } }, i === 11);
   add('hard-reset-cancel', { gi: { resetCache: true } }, false, 'cancel');
   add('hard-reset-retry', {}, true);
@@ -62,13 +67,16 @@ function steps(kind: RendererProofKind): readonly RendererProofStep[] {
   return freeze(result);
 }
 export const rendererProofPlan = freeze({
-  version: 'issue20-renderer-pair-v2', format: 'rgba8unorm' as GPUTextureFormat,
+  version: 'issue20-renderer-pair-v3', format: 'rgba8unorm' as GPUTextureFormat,
+  streamedChurn: 'run' as RendererProofChurn,
   settings: { temporal: false, probesPerUpdate: 32, raysPerProbe: 64, seed: 1337, roughness: 0,
     resolutionScale: 1, maxRaysPerFrame: 32768, maxDistance: 16, screenTracing: false, requestedResidentPoolBytes: 8 * 1024 ** 2,
     allocatedCanonicalResidentPoolBytes: 80 * 65536, streamedPoolBytes: 1024 ** 2 },
   limits: { successfulFramesPerArm: 96, textureCheckpointsPerFixture: 24, streamedFramesPerPose: 30,
     streamedDeadlineMs: 90_000, totalDeadlineMs: 600_000 },
   streamedTimes: [0, 34, 46, 0],
+  streamedStep: { action: 'submit' as const, controls: { temporal: false, gi: { enabled: false }, reflections: { mode: 'off' as const } },
+    width: 320, height: 180, checkpoint: false },
   exactCounts: { gi: { steps: 62, submissions: 59, checkpoints: 21 }, reflections: { steps: 63, submissions: 60, checkpoints: 22 },
     integrated: { steps: 63, submissions: 60, checkpoints: 22 } },
   modeTransitions: Object.fromEntries((['gi', 'reflections', 'integrated'] as const).map(kind => {
@@ -85,8 +93,36 @@ export const rendererProofPlan = freeze({
     geometrySelection: 'tileId-ordered8u32 records', geometryResidency: 'pageId-ordered u32 physical slot,0xffffffff absent' },
   steps: { gi: steps('gi'), reflections: steps('reflections'), integrated: steps('integrated') },
   textureScope: 'Current-epoch valid probe tiles; current-frame raw reflection texels; full resolved metadata/radiance and linear HDR. Padding stripped.',
-  limitations: 'Correctness only. Full-control BigInt maintenance is ineligible for performance. Streamed churn is candidate-only and can be unexercised.',
+  limitations: 'Correctness only. Selected full-control identity and timing eligibility are recorded separately. Streamed churn is candidate-only; an explicit frozen skip is not evidence of exercised churn.',
 });
+
+export type RendererProofChurn = 'run' | 'skip-unchanged-candidate-only';
+export function createRendererProofPlan(streamedChurn: RendererProofChurn = 'run'): typeof rendererProofPlan {
+  requireProof(streamedChurn === 'run' || streamedChurn === 'skip-unchanged-candidate-only', 'Unknown renderer proof churn mode.');
+  return freeze({ ...rendererProofPlan, streamedChurn });
+}
+/** Validate every key, ordered array element and primitive (including f64 bits).
+ * Return an owned immutable snapshot before any asynchronous renderer work. */
+export function validateRendererProofPlan(input: unknown): typeof rendererProofPlan {
+  const snapshot: unknown = structuredClone(input);
+  const mode = (snapshot as { streamedChurn?: unknown } | null)?.streamedChurn;
+  requireProof(mode === 'run' || mode === 'skip-unchanged-candidate-only', 'Unknown renderer proof churn mode.');
+  const expected = createRendererProofPlan(mode);
+  function compare(actual: unknown, canonical: unknown, path: string): void {
+    if (canonical === null || typeof canonical !== 'object') {
+      requireProof(Object.is(actual, canonical), `Frozen renderer plan differs at ${path}.`); return;
+    }
+    requireProof(actual !== null && typeof actual === 'object' && Array.isArray(actual) === Array.isArray(canonical),
+      `Frozen renderer plan shape differs at ${path}.`);
+    if (Array.isArray(canonical)) requireProof((actual as unknown[]).length === canonical.length, `Frozen renderer plan length differs at ${path}.`);
+    const keys = Object.keys(canonical), actualKeys = Object.keys(actual);
+    requireProof(keys.length === actualKeys.length && keys.every((key, i) => actualKeys[i] === key),
+      `Frozen renderer plan keys/order differ at ${path}.`);
+    for (const key of keys) compare((actual as Record<string, unknown>)[key], (canonical as Record<string, unknown>)[key], `${path}.${key}`);
+  }
+  compare(snapshot, expected, 'renderer');
+  return freeze(snapshot as typeof rendererProofPlan);
+}
 
 type Renderer = GiRenderer | ReflectionRenderer | IntegratedRenderer;
 type Bag = Readonly<Record<string, number | string | boolean | null>>;
@@ -531,9 +567,10 @@ async function summarize(frame: RendererProofFrame) {
     buffers: await resources(frame.buffers), textures: await resources(frame.textures) };
 }
 export async function runRendererPairValidation(device: GPUDevice, candidateFactory: RendererProofFactory, fullFactory: RendererProofFactory,
-  assetUrls: { manifestUrl: string; traceProxyUrl: string }, onProgress?: (event: unknown) => Promise<void>) {
+  assetUrls: { manifestUrl: string; traceProxyUrl: string }, frozenPlan: unknown, onProgress?: (event: unknown) => Promise<void>) {
+  const plan = validateRendererProofPlan(frozenPlan);
   const report: { version: string; plan: typeof rendererProofPlan; pairs: unknown[]; streamed: unknown; cleanup: unknown[]; status: string } =
-    { version: rendererProofPlan.version, plan: rendererProofPlan, pairs: [], streamed: null, cleanup: [], status: 'running' };
+    { version: plan.version, plan, pairs: [], streamed: null, cleanup: [], status: 'running' };
   const started = performance.now(); let arms: RendererProofArm[] = [], last: unknown;
   const progress = (event: unknown) => onProgress ? proofDeadline(onProgress(event), 'renderer proof progress persistence') : Promise.resolve();
   try {
@@ -547,8 +584,8 @@ export async function runRendererPairValidation(device: GPUDevice, candidateFact
           full: { ...full.initial, trace: await Promise.all(full.initial.trace.map(bytes => byteRecord(bytes))) } }, frames: [] };
       report.pairs.push(pair);
       await progress({ stage: 'renderer-pair-start', kind, initial: pair.initial });
-      for (const step of rendererProofPlan.steps[kind]) {
-        requireProof(performance.now() - started < rendererProofPlan.limits.totalDeadlineMs, 'Renderer pair overall deadline exceeded.');
+      for (const step of plan.steps[kind]) {
+        requireProof(performance.now() - started < plan.limits.totalDeadlineMs, 'Renderer pair overall deadline exceeded.');
         const a = await candidate.step(step), b = await full.step(step); last = { kind, step, candidate: await summarize(a), full: await summarize(b) };
         pair.frames.push(last);
         a.cpuTrace.forEach((bytes, i) => equal(bytes, b.cpuTrace[i]!, `${kind}/${step.id} full CPU target${i}`));
@@ -569,13 +606,18 @@ export async function runRendererPairValidation(device: GPUDevice, candidateFact
       report.cleanup.push(candidate.dispose(), full.dispose()); arms = [];
       await progress({ stage: 'renderer-pair-finish', kind, frames: pair.frames.length, cleanup: report.cleanup.slice(-2) });
     }
+    if (plan.streamedChurn === 'skip-unchanged-candidate-only') {
+      report.streamed = { status: 'skipped', mode: plan.streamedChurn, records: [],
+        claim: 'Explicit frozen omission of unchanged candidate-only Stage C; no churn evidence from this run.' };
+      await progress({ stage: 'streamed-skipped', evidence: report.streamed });
+      report.status = 'passed'; return report;
+    }
     const arm = await candidateFactory(device, { kind: 'integrated', ...assetUrls, residency: 'streamed' }); arms.push(arm);
     const before = arm.initial.gi, start = performance.now(), records: unknown[] = []; let initialGpu: ArrayBuffer[] | undefined, churn = false;
     let previousResidency: Uint32Array | undefined, mappingChanges = 0, deadlineReached = false;
-    stream: for (const [pose, time] of rendererProofPlan.streamedTimes.entries()) for (let frame = 0; frame < rendererProofPlan.limits.streamedFramesPerPose; frame++) {
-      if (performance.now() - start >= rendererProofPlan.limits.streamedDeadlineMs || performance.now() - started >= rendererProofPlan.limits.totalDeadlineMs) { deadlineReached = true; break stream; }
-      const value = await arm.step({ id: `streamed-${pose}-${frame}`, action: 'submit', controls: { temporal: false, gi: { enabled: false }, reflections: { mode: 'off' } },
-        time, width: 320, height: 180, checkpoint: false });
+    stream: for (const [pose, time] of plan.streamedTimes.entries()) for (let frame = 0; frame < plan.limits.streamedFramesPerPose; frame++) {
+      if (performance.now() - start >= plan.limits.streamedDeadlineMs || performance.now() - started >= plan.limits.totalDeadlineMs) { deadlineReached = true; break stream; }
+      const value = await arm.step({ id: `streamed-${pose}-${frame}`, ...plan.streamedStep, time });
       initialGpu ??= value.gpuTrace; value.gpuTrace.forEach((bytes, i) => equal(bytes, initialGpu![i]!, 'streamed persistent trace source'));
       for (const key of Object.keys(before).filter(key => key.startsWith('trace') && !key.startsWith('traceLastSubmitted'))) requireProof(value.gi[key] === before[key], `Streamed camera/page activity changed ${key}`);
       const residency = new Uint32Array(value.buffers.geometryResidency!), changedMappings = [...residency.entries()]

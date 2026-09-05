@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { decodeProofRays, finalizeProofReport, newExternalDirectory, parseProofArguments, parseProofInputJson, proofInputJson, proofHash, verifyProof } from './test-trace-updates.mjs';
+import { bundleTraceProof, decodeProofRays, finalizeProofReport, newExternalDirectory, parseProofArguments, parseProofInputJson, proofInputJson,
+  proofHash, traceProofBundleReplacements, traceProofControlSpec, verifyProof } from './test-trace-updates.mjs';
 
 test('GPU mode requires an explicit run, adapter class and reviewed manifest digest', () => {
   for (const args of [[], ['--run'], ['--prepare-only', '--run'], ['--help'],
@@ -17,6 +19,47 @@ test('GPU mode requires an explicit run, adapter class and reviewed manifest dig
   assert.equal(result['--run'], true); assert.equal(result['--adapter'], 'hardware');
   const draft = parseProofArguments(['--prepare-only', '--asset-root', '/tmp/assets', '--rays', '/tmp/rays.bin', '--output', '/tmp/proof', '--allow-dirty-draft']);
   assert.equal(draft['--run'], undefined); assert.equal(draft['--allow-dirty-draft'], true);
+  assert.equal(draft['--full-control'], 'full-correctness-only'); assert.equal(draft['--renderer-churn'], 'run');
+});
+
+test('control selection and churn omission require explicit frozen prepare arguments; run cannot override either', () => {
+  const prepare = ['--prepare-only', '--asset-root', '/tmp/assets', '--rays', '/tmp/rays.bin', '--output', '/tmp/proof'];
+  const options = parseProofArguments([...prepare, '--full-control', 'full-performance', '--renderer-churn', 'skip-unchanged-candidate-only']);
+  assert.equal(options['--full-control'], 'full-performance'); assert.equal(options['--renderer-churn'], 'skip-unchanged-candidate-only');
+  for (const flags of [['--full-control', 'full'], ['--renderer-churn', 'skip'], ['--full-control', 'full-performance', '--full-control', 'full-performance']]) {
+    assert.throws(() => parseProofArguments([...prepare, ...flags]));
+  }
+  const run = ['--run', '--manifest', '/tmp/manifest.json', '--manifest-sha256', 'a'.repeat(64), '--output', '/tmp/proof', '--adapter', 'hardware'];
+  for (const flags of [['--full-control', 'full-performance'], ['--renderer-churn', 'skip-unchanged-candidate-only']]) {
+    assert.throws(() => parseProofArguments([...run, ...flags]));
+  }
+  assert.equal(traceProofControlSpec().timingEligibility, 'correctness-only');
+  assert.equal(traceProofControlSpec('full-performance').timingEligibility, 'requires-matching-passed-direct-and-renderer-gates');
+});
+
+test('actual proof bundles substitute only the chosen control and preserve candidate source bytes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'strata-proof-control-bundles-'));
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const production = 'packages/core/src/gi/trace-updates.ts', bigint = 'tests/helpers/full-trace-updater.ts';
+  const candidateBytes = await readFile(join(root, production));
+  const entry = (direct) => ({ contents: `export { GiTraceUpdater } from './${production}';\n`
+    + (direct ? `export { GiTraceUpdater as FullTraceUpdater } from './${bigint}';` : ''),
+    resolveDir: root, sourcefile: 'control-selection-fixture.ts', loader: 'ts' });
+  try {
+    for (const id of ['full-correctness-only', 'full-performance']) for (const role of ['direct', 'candidate', 'full']) {
+      const spec = traceProofControlSpec(id), replacements = traceProofBundleReplacements(id, role);
+      const result = await bundleTraceProof(entry(role === 'direct'), directory, `${id}-${role}.mjs`, replacements);
+      assert.deepEqual(result.substitutions.map(({ requested, actual }) => ({ requested, actual })), replacements);
+      if (role === 'candidate') { assert.deepEqual(replacements, []); assert.equal(result.modules[spec.path], undefined); }
+      else assert.equal(result.modules[spec.path], proofHash(await readFile(join(root, spec.path))));
+      if (role !== 'full') assert.equal(result.modules[production], proofHash(candidateBytes));
+      else assert.equal(result.modules[production], undefined);
+      if (id === 'full-performance') assert.equal(result.modules[bigint], undefined);
+      for (const file of result.files) assert.equal(proofHash(await readFile(join(directory, file.name))), file.sha256);
+      assert.equal(result.performanceEligible, false, 'A correctness bundle is never timing evidence.');
+    }
+    assert.deepEqual(await readFile(join(root, production)), candidateBytes);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test('frozen ray decoding preserves exact f32 words and byte offset without normalization', () => {
