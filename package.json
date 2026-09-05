@@ -33,7 +33,7 @@
     "test:geometry": "node scripts/test-geometry.mjs && node scripts/test-geometry-fallback.mjs && node scripts/test-geometry-retention.mjs",
     "test:gi": "node scripts/test-gi.mjs",
     "test:gi-motion": "node scripts/test-gi-motion.mjs --smoke",
-    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run test:gallery:unit && npm run build && npm run test:consumers && npm run test:gallery && npm run benchmark:smoke && npm run test:raster && npm run test:imported && npm run test:imported-indirect && npm run test:geometry && npm run test:gi && npm run test:probe-volume && npm run test:gi-motion && npm run test:reflections && npm run test:integrated && npm run test:authored-boxes && npm run check:authoring",
+    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run test:gallery:unit && npm run build && npm run test:consumers && npm run test:gallery && npm run benchmark:smoke && npm run test:raster && npm run test:imported && npm run test:imported-indirect && npm run test:imported-spatial && npm run test:geometry && npm run test:gi && npm run test:probe-volume && npm run test:gi-motion && npm run test:reflections && npm run test:integrated && npm run test:authored-boxes && npm run check:authoring",
     "example": "node scripts/serve-example.mjs",
     "test:reflections": "node scripts/test-reflections.mjs",
     "test:integrated": "node scripts/test-integrated.mjs",
@@ -43,6 +43,7 @@
     "test:authored-boxes": "node scripts/test-authored-boxes.mjs",
     "test:imported": "node scripts/test-imported.mjs",
     "test:imported-indirect": "node scripts/test-imported-indirect.mjs && npm run test:imported-progressive",
+    "test:imported-spatial": "node scripts/test-imported-spatial.mjs",
     "test:imported-progressive": "node scripts/test-imported-progressive.mjs"
   },
   "devDependencies": {

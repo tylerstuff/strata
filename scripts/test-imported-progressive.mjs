@@ -76,7 +76,9 @@ try {
   const effectPaths = Object.keys(report.builtBefore).filter(path => /\/imported-indirect-effect-[^/]+\.js$/.test(path));
   const preparationPaths = Object.keys(report.builtBefore).filter(path => /\/static-trace-data-[^/]+\.js$/.test(path));
   assert(effectPaths.length && preparationPaths.length, 'Built package is missing the optional progressive modules; run npm run build.');
-  report.lazyModules = { effectPaths, preparationPaths };
+  const spatialPaths = Object.keys(report.builtBefore).filter(path => /\/imported-indirect-spatial-shader-[^/]+\.js$/.test(path));
+  assert(spatialPaths.length, 'Built package is missing the separately loaded spatial reconstruction module.');
+  report.lazyModules = { effectPaths, preparationPaths, spatialPaths };
   harnessBytes = await readFile(join(root, harnessPath)); runnerBytes = await readFile(runnerPath);
   const bundle = await build({ absWorkingDir: root, entryPoints: [harnessPath], bundle: true, write: false, metafile: true,
     external: ['/packages/core/dist/*'], format: 'esm', platform: 'browser', target: 'es2022' });
@@ -125,9 +127,12 @@ try {
       await drainResponses(); assert.deepEqual(report.responseErrors, []);
       const paths = [...new Set(report.loadedRuntime.map(record => record.path))].sort();
       const effect = effectPaths.filter(path => paths.includes(path)), preparation = preparationPaths.filter(path => paths.includes(path));
-      const stages = ['empty', 'direct', 'progressive', 'complete'];
+      const spatial = spatialPaths.filter(path => paths.includes(path));
+      const stages = ['empty', 'direct', 'progressive', 'spatial', 'complete'];
       assert.equal(name, stages[report.publicLoadingStages.length], 'Unexpected or duplicate public loading stage.');
-      report.publicLoadingStages.push({ name, paths, effect, preparation });
+      report.publicLoadingStages.push({ name, paths, effect, preparation, spatial });
+      if (['empty', 'direct', 'progressive'].includes(name)) assert.equal(spatial.length, 0, `${name} eagerly loaded spatial reconstruction.`);
+      else assert(spatial.length > 0, 'Capability scene did not load spatial reconstruction.');
       if (name === 'empty' || name === 'direct') {
         assert.equal(effect.length, 0, `${name} scene eagerly loaded the indirect effect.`);
         assert.equal(preparation.length, 0, `${name} scene eagerly loaded static tracing preparation.`);
@@ -153,7 +158,7 @@ try {
     assert.equal(report.result.status, 'passed', report.result.failure ?? 'Public progressive browser checks failed.');
     assert.equal(report.result.ordinaryHosting.crossOriginIsolated, false);
     for (const field of ['allocatedGpuBufferBytes', 'allocatedGpuTextureBytes', 'wasmMemoryBytes']) assert.equal(report.result.disposed?.[field], 0, `Disposal retained ${field}.`);
-    assert.deepEqual(report.publicLoadingStages.map(stage => stage.name), ['empty', 'direct', 'progressive', 'complete']);
+    assert.deepEqual(report.publicLoadingStages.map(stage => stage.name), ['empty', 'direct', 'progressive', 'spatial', 'complete']);
     if (!report.softwareGpu) {
       assert.notEqual(report.result.adapter.isFallbackAdapter, true, 'Hardware validation selected a fallback adapter.');
       assert(!/swiftshader|llvmpipe|software rasterizer|software adapter/i.test(JSON.stringify(report.result.adapter)), 'Hardware validation selected a software adapter.');
