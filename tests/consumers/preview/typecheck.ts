@@ -1,5 +1,5 @@
 import { createProceduralScene, sceneRevision, type SceneDocument } from '@strata-engine/authoring';
-import type { BoxSceneDescriptor, FrameMetrics, SceneCommitReceipt } from '@strata-engine/core';
+import type { AuthoredFrameMetadata, BoxSceneDescriptor, FrameMetrics, SceneCommitReceipt } from '@strata-engine/core';
 import {
   PreviewError, PreviewSession, createPreviewSession, prepareAuthoredPreviewLoad, publishCapture,
   type AuthoredPreviewLoadInput, type AuthoredPreviewView,
@@ -73,3 +73,13 @@ void runtimeAdapterTypes;
 
 const factory: (options?: Parameters<typeof createPreviewSession>[0]) => Promise<PreviewSession<BoxSceneDescriptor, AuthoredPreviewView, SceneCommitReceipt, FrameMetrics>> = createPreviewSession;
 void factory;
+
+function authoredMotionTypes(frame: PreviewDriverFrame<SceneCommitReceipt, FrameMetrics>): void {
+  if (!frame.metrics.authored) return;
+  const motion: AuthoredFrameMetadata['motion'] = frame.metrics.authored.motion;
+  const previousSubmittedFrameId: number | null = motion.previousSubmittedFrameId;
+  const valid: boolean = motion.valid;
+  const resetReason: 'first-frame' | 'camera-cut' | 'viewport-change' | null = motion.resetReason;
+  void [previousSubmittedFrameId, valid, resetReason];
+}
+void authoredMotionTypes;

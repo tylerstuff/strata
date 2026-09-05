@@ -435,6 +435,7 @@ export async function runAuthoredBoxValidation({ software = false } = {}) {
     encoder.copyTextureToBuffer({ texture: target }, { buffer: staging, bytesPerRow: size * 4 }, [size, size]);
     encoder.copyTextureToBuffer({ texture: depth, aspect: 'depth-only' }, { buffer: staging, offset: payloadBytes, bytesPerRow: size * 4 }, [size, size]);
     device.queue.submit([encoder.finish()]);
+    renderer.submitted(frameCount + 1);
     await bounded(staging.mapAsync(0x01), 'Authored readback');
     let result: Capture;
     try { const copy = staging.getMappedRange().slice(0); result = { color: new Uint8Array(copy, 0, payloadBytes), depth: new Float32Array(copy, payloadBytes), authored: stats.authored }; }
@@ -590,17 +591,34 @@ export async function validateAuthoredEngine() {
     const frame = engine.render({ camera, debugView: 'base-color', temporal: false, timeSeconds: 0.25 });
     check(frame.scene.sceneGeneration === first.sceneGeneration && frame.scene.sourceRevision === descriptor.sourceRevision, 'Submitted identity differs from commit receipt.');
     check(frame.authored?.camera.position[0] === 0.125 && frame.authored.timeSeconds === 0.25, 'Effective camera/time metadata lost the override.');
+    check(frame.authored.motion.previousSubmittedFrameId === null && !frame.authored.motion.valid
+      && frame.authored.motion.resetReason === 'first-frame', 'First authored motion pair is not explicitly invalid.');
     await engine.waitForIdle(30000);
     check(engine.getTelemetry().scene.lastSubmittedFrameId === frame.frameId, 'Frame submission bookkeeping is stale.');
+    const reverted = engine.render({ temporal: false });
+    check(reverted.authored?.camera.position[0] === descriptor.camera.position[0]
+      && reverted.authored.motion.previousSubmittedFrameId === frame.frameId && reverted.authored.motion.valid,
+    'Descriptor-camera reversion did not use the submitted override as its predecessor.');
+    const cut = engine.render({ temporal: false, cameraCut: true });
+    check(cut.authored?.motion.previousSubmittedFrameId === reverted.frameId && !cut.authored.motion.valid
+      && cut.authored.motion.resetReason === 'camera-cut', 'Public camera cut was not forwarded.');
+    const afterCut = engine.render({ temporal: false });
+    check(afterCut.authored?.motion.previousSubmittedFrameId === cut.frameId && afterCut.authored.motion.valid, 'Successful cut did not become the next baseline.');
+    engine.resize(640, 320);
+    const viewportChange = engine.render({ temporal: false });
+    check(viewportChange.authored?.motion.previousSubmittedFrameId === afterCut.frameId && !viewportChange.authored.motion.valid
+      && viewportChange.authored.motion.resetReason === 'viewport-change', 'Submitted viewport change did not invalidate motion.');
+    await engine.waitForIdle(30000);
     const second = await engine.setScene({ renderer: 'authored-boxes', scene: descriptor });
     check(second.sceneGeneration > first.sceneGeneration && second.sourceRevision === first.sourceRevision, 'Repeated source revision reused its runtime generation.');
     engine.resize(640, 320); const resized = engine.render({ temporal: false, cameraCut: true }); await engine.waitForIdle(30000);
     check(resized.authored?.aspect === 2 && resized.authored.width === 640 && resized.authored.camera.position[0] === 0, 'Resize/aspect or per-frame camera override leaked into later frames.');
+    check(resized.authored.motion.previousSubmittedFrameId === null && resized.authored.motion.resetReason === 'first-frame', 'Scene replacement matched motion across generations.');
     const clear = await engine.setScene(null); const cleared = engine.render(); await engine.waitForIdle(30000);
     check(clear.renderer === 'clear' && cleared.scene.sceneGeneration === clear.sceneGeneration, 'Clear receipt differs from submitted clear.');
     const active = engine.getTelemetry(); check(active.gpuErrorCount === 0, 'Public engine recorded a GPU error.');
     engine.dispose(); const disposed = engine.getTelemetry();
     check(disposed.allocatedGpuBufferBytes === 0 && disposed.allocatedGpuTextureBytes === 0 && disposed.wasmMemoryBytes === 0, 'Public engine disposal retained allocations.');
-    return { info: engine.info, first, frame, second, resized, clear, cleared, active, disposed };
+    return { info: engine.info, first, frame, reverted, cut, afterCut, viewportChange, second, resized, clear, cleared, active, disposed };
   } finally { engine.dispose(); }
 }

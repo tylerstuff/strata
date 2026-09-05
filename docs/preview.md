@@ -81,6 +81,9 @@ scene, physical dimensions and submitted frame ID. Only then does it return a
 the actual commit receipt; reloading the same source revision produces a distinct
 load token when Core commits a new generation. `viewRevision` hashes complete
 effective view data and stays independent of source revision and timing data.
+Per-frame authored motion provenance is retained in captured `frames[].authored.motion`
+and excluded from `resolvedView`: submitting an unchanged view advances the previous
+submitted frame ID without changing its view revision.
 
 Failures retain their stage. Load errors expose `commitOccurred` (`null` means
 commit evidence is still unknown), `committedReceipt`, and `lastObservedCommit`.
