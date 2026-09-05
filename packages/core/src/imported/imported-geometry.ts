@@ -62,8 +62,14 @@ function samplerDescriptor(s: ImportedSampler): GPUSamplerDescriptor {
   if (!s || typeof s !== 'object' || Array.isArray(s)) fail('texture sampler must be an object.');
   const wrap = (v: number): GPUAddressMode => { if (v === 33071) return 'clamp-to-edge'; if (v === 33648) return 'mirror-repeat'; if (v === 10497) return 'repeat'; return fail('unsupported texture wrapping.'); };
   if (![9728, 9729].includes(s.magFilter) || ![9728, 9729, 9984, 9985, 9986, 9987].includes(s.minFilter)) fail('unsupported texture filter.');
-  return { addressModeU: wrap(s.wrapS), addressModeV: wrap(s.wrapT), magFilter: s.magFilter === 9728 ? 'nearest' : 'linear',
-    minFilter: [9728, 9984, 9986].includes(s.minFilter) ? 'nearest' : 'linear', mipmapFilter: [9986, 9987].includes(s.minFilter) ? 'linear' : 'nearest', lodMaxClamp: [9728, 9729].includes(s.minFilter) ? 0 : 32 };
+  const magFilter = s.magFilter === 9728 ? 'nearest' : 'linear';
+  const minFilter = [9728, 9984, 9986].includes(s.minFilter) ? 'nearest' : 'linear';
+  const mipmapFilter = [9986, 9987].includes(s.minFilter) ? 'linear' : 'nearest';
+  // WebGPU anisotropy requires all three filters to be linear. Keep authored
+  // nearest and non-mipmapped filtering intact rather than upgrading those modes.
+  return { addressModeU: wrap(s.wrapS), addressModeV: wrap(s.wrapT), magFilter, minFilter, mipmapFilter,
+    maxAnisotropy: magFilter === 'linear' && minFilter === 'linear' && mipmapFilter === 'linear' ? 8 : 1,
+    lodMaxClamp: [9728, 9729].includes(s.minFilter) ? 0 : 32 };
 }
 function validateMaterial(material: ImportedMaterial): void {
   if (!material || typeof material !== 'object' || Array.isArray(material)) fail('material must be an object.');
