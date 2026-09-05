@@ -554,6 +554,32 @@ test('integrated reports preserve source representations and independently disab
   assert.doesNotThrow(() => validateBenchmarkReport(integratedFixture({ motion: true, timed: true })));
 });
 
+test('rolling diffuse reports separate motion from hard invalidation without inventing radiometric freshness', () => {
+  const make = () => {
+    const report = integratedFixture({ motion: true, timed: true }); const run = report.runs[0];
+    let revision = 1; let age = 1; let previous;
+    for (const frame of run.frames) {
+      const gi = frame.gi;
+      const hard = previous && ['doorOpen', 'wallColor', 'lightIntensity'].some(key => gi[key] !== previous[key]);
+      revision += Number(Boolean(hard)); age = hard ? 1 : age + 1;
+      Object.assign(gi, { objectMotionRollingRefresh: true, diffuseInvalidationRevision: revision, cacheEpoch: revision,
+        framesSinceReset: age, probeUpdatesSinceReset: age * 32, refreshFrontier: age * 32 % 384,
+        sampleFrameIndex: frame.frameId - 1, maxSampleAgeFrames: 11 });
+      previous = gi;
+    }
+    run.allocations.gi = { ...run.frames.at(-1).gi }; return report;
+  };
+  assert.doesNotThrow(() => validateBenchmarkReport(make()));
+  for (const mutate of [
+    run => { run.frames[2].gi.diffuseInvalidationRevision++; },
+    run => { run.frames[2].gi.maxSampleAgeFrames = 12; },
+    run => { run.frames[2].gi.refreshFrontier = 0; },
+    run => { run.frames[2].gi.sampleFrameIndex--; },
+    run => { delete run.frames[2].gi.diffuseInvalidationRevision; },
+    run => { run.frames[2].gi.framesSinceReset = 1; run.frames[2].gi.probeUpdatesSinceReset = 32; run.frames[2].gi.refreshFrontier = 32; },
+  ]) { const report = make(); mutate(report.runs[0]); assert.throws(() => validateBenchmarkReport(report)); }
+});
+
 test('integrated validation rejects dropped terrain, stale tracing identity and mislabeled delayed counts', () => {
   for (const mutate of [
     run => { delete run.frames[0].integrated; },

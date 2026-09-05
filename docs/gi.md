@@ -1,5 +1,7 @@
 # World-space diffuse GI proof
 
+Continuous rigid-object motion uses a bounded diffuse refresh cycle in the reflection and integrated fixtures. See [the motion scheduling evidence](gi-motion.md) for its separate invalidation/observation-age contract, reference errors and remaining quality limitations.
+
 The opt-in `gi` renderer implements a small two-room lighting experiment with software triangle tracing and a fixed irradiance-probe cache. Hardware and software-WebGPU checks demonstrate offscreen color transfer, cache invalidation and finite update budgets. The clean hardware evidence below comes from commit `32de6374e7a0aa18823f12a63e4f0c63de29dbd6`. The room remains dim and probe interpolation has visible artifacts; this does not establish a game's 60 FPS performance or Lumen-equivalent quality. Matched GI-off/on frame performance is reported separately in the [M2 GI benchmark](benchmarks/2026-09-05-m2-gi.md).
 
 The experiment depends on the [raster foundation](raster.md), not on streamed virtual geometry. It uses ordinary WebGPU compute, storage buffers and textures. There are no native ray-tracing APIs, screen-space ray traces, screen-space reflections, baked indirect lightmaps, or camera-visible-surface requirements for probe updates.

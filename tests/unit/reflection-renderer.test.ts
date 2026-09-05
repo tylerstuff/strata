@@ -104,19 +104,19 @@ describe('reflection renderer integration', () => {
     renderer.dispose();
   });
 
-  it('invalidates both caches when the shared object or roughness changes, preserving exact source materials', async () => {
+  it('rolls diffuse updates for object motion but hard-resets changed materials, preserving source materials', async () => {
     const gpu = fixture(); const renderer = await gpu.create(); const render = frames(gpu, renderer); render();
     const firstCube = renderer.currentScene.boxes[renderer.currentScene.objectBoxId]!;
     render({ reflections: { objectOffset: 0.4 } });
     expect(renderer.currentScene.boxes[renderer.currentScene.objectBoxId]!.center[2]).toBeCloseTo(firstCube.center[2] + 0.4);
-    expect(renderer.giTelemetry).toMatchObject({ worldRevision: 2, cacheEpoch: 2, framesSinceReset: 1 });
+    expect(renderer.giTelemetry).toMatchObject({ worldRevision: 2, diffuseInvalidationRevision: 1, cacheEpoch: 1, framesSinceReset: 2 });
     expect(renderer.reflectionTelemetry).toMatchObject({ worldRevision: 2, cacheEpoch: 2, framesSinceReset: 1 });
     render({ reflections: { roughness: 0.3 } });
     const mirror = renderer.currentScene.boxes[renderer.currentScene.reflectorBoxId]!;
     expect(renderer.currentScene.materials[mirror.materialId]).toMatchObject({ roughness: 0.3, metallic: 1 });
-    expect(renderer.giTelemetry).toMatchObject({ worldRevision: 3, cacheEpoch: 3 });
+    expect(renderer.giTelemetry).toMatchObject({ worldRevision: 3, diffuseInvalidationRevision: 2, cacheEpoch: 2 });
     expect(renderer.reflectionTelemetry).toMatchObject({ worldRevision: 3, cacheEpoch: 3 });
-    render(); expect(renderer.giTelemetry.cacheEpoch).toBe(3); expect(renderer.reflectionTelemetry.cacheEpoch).toBe(3); renderer.dispose();
+    render(); expect(renderer.giTelemetry.cacheEpoch).toBe(2); expect(renderer.reflectionTelemetry.cacheEpoch).toBe(3); renderer.dispose();
   });
 
   it('resets reflection history once for explicit reset or camera cuts without resetting world GI', async () => {
@@ -141,7 +141,27 @@ describe('reflection renderer integration', () => {
     expect(renderer.probeCache.telemetry).toMatchObject({ cacheEpoch: 1, sourceFrameId: 1, submittedFrames: 1 });
     render({ cameraCut: true });
     expect(renderer.reflectionTelemetry).toMatchObject({ cacheEpoch: 2, sourceFrameId: 2, submittedFrames: 2, framesSinceReset: 1 });
-    expect(renderer.giTelemetry).toMatchObject({ cacheEpoch: 2, sourceFrameId: 2, submittedFrames: 2 }); renderer.dispose();
+    expect(renderer.giTelemetry).toMatchObject({ cacheEpoch: 1, sourceFrameId: 2, submittedFrames: 2, refreshFrontier: 64 }); renderer.dispose();
+  });
+
+  it('keeps hard light, door, wall, explicit reset and re-enable exclusions across soft motion and cancellation', async () => {
+    const gpu = fixture(); const renderer = await gpu.create(); const render = frames(gpu, renderer);
+    for (let index = 0; index < 24; index++) render({ reflections: { objectOffset: Math.sin(index) * 0.4 } });
+    expect(renderer.giTelemetry).toMatchObject({ cacheEpoch: 1, framesSinceReset: 24, refreshFrontier: 0 });
+    let epoch = 1;
+    for (const gi of [{ lightIntensity: 0 }, { doorOpen: false }, { wallColor: 'neutral' as const }, { resetCache: true }]) {
+      renderer.encode(gpu.encoder, {} as GPUTextureView, 1280, 720, 1, { gi }); renderer.cancelFrame();
+      expect(renderer.probeCache.telemetry.cacheEpoch).toBe(epoch);
+      render();
+      expect(renderer.giTelemetry).toMatchObject({ cacheEpoch: ++epoch, framesSinceReset: 1, refreshFrontier: 32 });
+    }
+    render({ gi: { enabled: false }, reflections: { objectOffset: 0.4 } });
+    const submitted = renderer.probeCache.telemetry.submittedFrames;
+    render({ reflections: { objectOffset: -0.4 } });
+    expect(renderer.probeCache.telemetry.submittedFrames).toBe(submitted);
+    render({ gi: { enabled: true } });
+    expect(renderer.giTelemetry).toMatchObject({ cacheEpoch: ++epoch, framesSinceReset: 1, refreshFrontier: 32 });
+    renderer.dispose();
   });
 
   it('refreshes composer bind groups by history identity across resize while reusing stable frame banks', async () => {

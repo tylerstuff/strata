@@ -85,7 +85,9 @@ var<workgroup> oldProbe: GiProbeState;
     if (status == -1.0) { backfaces++; } if (status == -2.0) { failures++; }
   }
   let valid = backfaces * 4u <= probeConfig.budget.z && failures == 0u;
-  let history = select(0.0, probeConfig.settings.x, oldProbe.epoch == probeConfig.budget.w && oldProbe.valid != 0u && valid);
+  let previousAge = probeConfig.sequence.x - min(probeConfig.sequence.x, oldProbe.lastFrame);
+  let history = select(0.0, probeConfig.settings.x, oldProbe.epoch == probeConfig.budget.w && oldProbe.valid != 0u && valid
+    && oldProbe.lastFrame <= probeConfig.sequence.x && previousAge <= probeConfig.sequence.w);
   let irradianceSize = probeConfig.atlas.y; let momentSize = probeConfig.atlas.z;
   for (var texel = lane; texel < momentSize * momentSize; texel += 64u) {
     let local = vec2u(texel % momentSize, texel / momentSize);
@@ -161,7 +163,8 @@ fn sampleProbeDiagnostics(world: vec3f) -> vec4f {
   let probe = u32(cell.x) + u32(cell.y) * giProbeConfig.grid.x + u32(cell.z) * giProbeConfig.grid.x * giProbeConfig.grid.y;
   let state = giProbeStates[probe]; let current = state.epoch == giProbeConfig.budget.w;
   let age = giProbeConfig.sequence.x - min(giProbeConfig.sequence.x, state.lastFrame);
-  return vec4f(select(0.0, 1.0, current && state.valid != 0u), f32(age), select(0.0, 1.0, current), length(world - giProbePosition(probe, giProbeConfig)));
+  let recent = state.lastFrame <= giProbeConfig.sequence.x && age < giProbeConfig.sequence.w;
+  return vec4f(select(0.0, 1.0, current && state.valid != 0u && recent), f32(age), select(0.0, 1.0, current), length(world - giProbePosition(probe, giProbeConfig)));
 }
 fn sampleProbeIrradiance(world: vec3f, normal: vec3f, viewDirection: vec3f) -> vec3f {
   let point = world + normal * giProbeConfig.settings.z + viewDirection * 0.02;
@@ -174,7 +177,9 @@ fn sampleProbeIrradiance(world: vec3f, normal: vec3f, viewDirection: vec3f) -> v
     if (any(cell < vec3i(0)) || any(cell >= vec3i(giProbeConfig.grid.xyz))) { continue; }
     let probe = u32(cell.x) + u32(cell.y) * giProbeConfig.grid.x + u32(cell.z) * giProbeConfig.grid.x * giProbeConfig.grid.y;
     let state = giProbeStates[probe];
-    if (state.epoch != giProbeConfig.budget.w || state.valid == 0u) { continue; }
+    let age = giProbeConfig.sequence.x - min(giProbeConfig.sequence.x, state.lastFrame);
+    if (state.epoch != giProbeConfig.budget.w || state.valid == 0u || state.lastFrame > giProbeConfig.sequence.x
+      || age >= giProbeConfig.sequence.w) { continue; }
     let position = giProbePosition(probe, giProbeConfig);
     let delta = point - position; let distance = length(delta); let direction = select(normal, delta / max(distance, 1e-5), distance > 1e-5);
     let factors = select(vec3f(1.0) - fraction, fraction, offset != vec3i(0));

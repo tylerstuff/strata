@@ -17,18 +17,22 @@ export interface ProbeBindings {
 }
 export interface ProbeFrame {
   readonly revision: number;
+  /** Hard diffuse invalidation. Omit to invalidate on every world revision. */
+  readonly invalidationRevision?: number;
   readonly frameIndex: number;
   readonly reset?: boolean;
   readonly timestamps?: { readonly trace?: GPUComputePassTimestampWrites; readonly update?: GPUComputePassTimestampWrites };
 }
 interface Atlas { irradiance: GPUTexture; visibility: GPUTexture; irradianceView: GPUTextureView; visibilityView: GPUTextureView }
-interface Pending { index: number; epoch: number; revision: number; frontier: number; frames: number; frameIndex: number; reset: boolean }
+interface Pending { index: number; epoch: number; revision: number; invalidationRevision: number; frontier: number; frames: number; frameIndex: number; reset: boolean }
 
 /** Fixed world-space irradiance cache. No screen-space inputs or native ray-tracing features. */
 export class ProbeCache {
   private committedIndex = 0;
   private epoch = 0;
   private revision = -1;
+  private invalidationRevision = -1;
+  private lastFrameIndex = -1;
   private frontier = 0;
   private frames = 0;
   private submittedFrames = 0;
@@ -124,6 +128,10 @@ export class ProbeCache {
   }
   get telemetry(): Readonly<Record<string, number | boolean | null>> {
     return { sourceFrameId: this.sourceFrameId, worldRevision: this.revision, cacheEpoch: this.epoch, probeCount: 384,
+      diffuseInvalidationRevision: this.invalidationRevision < 0 ? null : this.invalidationRevision,
+      refreshFrontier: this.frontier, maxSampleAgeFrames: Math.ceil(384 / this.probesPerUpdate) - 1,
+      // This bounds the latest observation age, not the age of the .85 irradiance-history contribution.
+      sampleFrameIndex: this.lastFrameIndex < 0 ? null : this.lastFrameIndex,
       probesPerUpdate: this.probesPerUpdate, raysPerProbe: this.raysPerProbe,
       primaryRaysPerFrame: this.probesPerUpdate * this.raysPerProbe, maxShadowRaysPerFrame: this.probesPerUpdate * this.raysPerProbe,
       updatePeriodFrames: Math.ceil(384 / this.probesPerUpdate), framesSinceReset: this.frames,
@@ -134,10 +142,12 @@ export class ProbeCache {
 
   encode(encoder: GPUCommandEncoder, frame: ProbeFrame): { bindings: ProbeBindings; dispatchCalls: number; uploadBytes: number; primaryRays: number; probeUpdates: number } {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Probe cache was disposed.');
-    if (![frame.revision, frame.frameIndex].every(value => Number.isInteger(value) && value >= 0 && value <= 0xffffffff)
+    const invalidationRevision = frame.invalidationRevision ?? frame.revision;
+    if (![frame.revision, frame.frameIndex, invalidationRevision].every(value => Number.isInteger(value) && value >= 0 && value <= 0xffffffff)
+      || frame.invalidationRevision === null
       || (frame.reset !== undefined && typeof frame.reset !== 'boolean')) throw new StrataError('INVALID_OPTIONS', 'Probe revision/frame index must be uint32.');
     this.cancelFrame();
-    const reset = this.revision !== frame.revision || frame.reset === true;
+    const reset = this.invalidationRevision !== invalidationRevision || frame.reset === true || frame.frameIndex < this.lastFrameIndex;
     const epoch = reset ? this.epoch + 1 : this.epoch;
     if (epoch > 0xffffffff) throw new StrataError('UNSUPPORTED_LIMIT', 'Probe epoch exhausted; recreate this scene.');
     const start = reset ? 0 : this.frontier; const index = 1 - this.committedIndex;
@@ -145,7 +155,7 @@ export class ProbeCache {
     floats.set([-5.5, 0.5, -3.5, 1], 0); words.set([12, 4, 8, 384], 4);
     words.set([start, this.probesPerUpdate, this.raysPerProbe, epoch], 8);
     floats.set([this.hysteresis, 32, 0.12, 32], 12);
-    words.set([frame.frameIndex, reset ? 1 : 0, this.seed, 0], 16); words.set([24, 8, 16, 0], 20);
+    words.set([frame.frameIndex, reset ? 1 : 0, this.seed, Math.ceil(384 / this.probesPerUpdate)], 16); words.set([24, 8, 16, 0], 20);
     this.device.queue.writeBuffer(this.configs[index]!, 0, data);
     this.device.queue.writeBuffer(this.statistics, 0, new Uint32Array(8));
     // Copy preserves probes outside this frame's finite update window.
@@ -156,7 +166,7 @@ export class ProbeCache {
     trace.dispatchWorkgroups(Math.ceil(this.probesPerUpdate * this.raysPerProbe / 64)); trace.end();
     const update = encoder.beginComputePass({ label: 'Strata GI irradiance and visibility update', ...(frame.timestamps?.update ? { timestampWrites: frame.timestamps.update } : {}) });
     update.setPipeline(this.updatePipeline); update.setBindGroup(0, this.updateBindings[index]!); update.dispatchWorkgroups(this.probesPerUpdate); update.end();
-    this.pending = { index, epoch, revision: frame.revision, frontier: (start + this.probesPerUpdate) % 384,
+    this.pending = { index, epoch, revision: frame.revision, invalidationRevision, frontier: (start + this.probesPerUpdate) % 384,
       frames: reset ? 1 : this.frames + 1, frameIndex: frame.frameIndex, reset };
     return { bindings: this.frameBindings(index), dispatchCalls: 2, uploadBytes: 128,
       primaryRays: this.probesPerUpdate * this.raysPerProbe, probeUpdates: this.probesPerUpdate };
@@ -165,6 +175,7 @@ export class ProbeCache {
     if (!this.pending || this.disposed) return;
     const pending = this.pending; this.pending = undefined;
     this.committedIndex = pending.index; this.epoch = pending.epoch; this.revision = pending.revision;
+    this.invalidationRevision = pending.invalidationRevision; this.lastFrameIndex = pending.frameIndex;
     this.frontier = pending.frontier; this.frames = pending.frames; this.sourceFrameId = frameId; this.submittedFrames++;
   }
   cancelFrame(): void { this.pending = undefined; }
