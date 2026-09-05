@@ -186,14 +186,14 @@ function isSoftwareAdapter(adapter) {
   return adapter?.isFallbackAdapter === true || /swiftshader|llvmpipe|software rasterizer|software adapter/i.test(JSON.stringify(adapter));
 }
 
-async function captureEvidence(page, path) {
+async function captureEvidence(page, path, timeoutMs) {
   // Capture the intrinsic render resolution after measurement, independently
   // from the responsive CSS size recorded during the timed window.
   await page.locator('canvas').evaluate((canvas) => {
     canvas.style.width = `${canvas.width}px`;
     canvas.style.height = `${canvas.height}px`;
   });
-  const png = await page.locator('canvas').screenshot({ path, timeout: 15_000 });
+  const png = await page.locator('canvas').screenshot({ path, timeout: timeoutMs });
   const content = await page.evaluate(async (base64) => {
     const image = new Image();
     image.src = `data:image/png;base64,${base64}`;
@@ -227,6 +227,27 @@ async function captureEvidence(page, path) {
     passed, ...content,
     method: 'Browser-composited PNG sampled at 64×36; reject transparent, uniform, or near-uniform captures. This checks visible scene content, not a pixel-exact visual regression.',
   };
+}
+
+async function captureDiagnostics(page, browserErrors) {
+  const diagnostics = { pageClosed: page.isClosed(), browserErrors: browserErrors.slice(-8) };
+  if (diagnostics.pageClosed) return diagnostics;
+  let timer;
+  try {
+    diagnostics.runtime = await Promise.race([
+      page.evaluate(() => ({
+        visibility: document.visibilityState,
+        canvas: (() => { const canvas = document.querySelector('canvas'); return canvas ? { width: canvas.width, height: canvas.height } : null; })(),
+        ...globalThis.strataBenchmark?.diagnostics?.(),
+      })),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Browser diagnostics did not respond within 2 seconds.')), 2000); }),
+    ]);
+  } catch (error) {
+    diagnostics.error = error.message;
+  } finally {
+    clearTimeout(timer);
+  }
+  return diagnostics;
 }
 
 async function main() {
@@ -309,6 +330,7 @@ async function main() {
     }
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
+    page.on('crash', () => errors.push('The benchmark browser page crashed.'));
     page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
     page.setDefaultTimeout(30_000);
     await page.goto(server.url);
@@ -364,11 +386,24 @@ async function main() {
       samples.push({ phase: 'after', ...await powerSnapshot() });
       for (const sample of samples) checkPower(sample, sessionPower, options.requireAcPerformance);
       const captureFilename = `${width}x${height}.png`;
-      // The measured window has completed. Capture a known camera time separately.
-      const captureState = await page.evaluate(() => globalThis.strataBenchmark.capture(0));
-      const captureValidation = await captureEvidence(page, resolve(directory, captureFilename));
-      result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0, captureValidation, ...captureState };
+      // Retain the completed measurements even if a later queue fence or
+      // browser compositor screenshot fails. A failure is never a valid run.
       report.runs.push(result);
+      // The measured window has completed. Capture a known camera time separately.
+      let captureState;
+      let captureValidation;
+      try {
+        captureState = await page.evaluate(() => globalThis.strataBenchmark.capture(0));
+        // Software smoke runs can drain substantial queued work and need a
+        // longer compositor deadline; this never changes measured frame data.
+        captureValidation = await captureEvidence(page, resolve(directory, captureFilename), options.smoke ? 120_000 : 15_000);
+      } catch (error) {
+        const diagnostics = await captureDiagnostics(page, errors);
+        result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0,
+          captureFailure: { message: error.message, diagnostics } };
+        throw new Error(`The ${width}x${height} post-measurement capture failed: ${error.message}\nCapture diagnostics: ${JSON.stringify(diagnostics)}`, { cause: error });
+      }
+      result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0, captureValidation, ...captureState };
       if (errors.length) throw new Error(`Browser errors during capture: ${errors.join('; ')}`);
       if (!captureValidation.passed) throw new Error(`The ${width}x${height} procedural scene capture is blank or lacks visible geometry; the failed image and measurements were retained locally.`);
       if (!result.frames?.length || !result.frames.every((frame) => frame.drawCalls > 0

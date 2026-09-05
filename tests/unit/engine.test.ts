@@ -32,7 +32,7 @@ function gpuFixture() {
     destroy: vi.fn(),
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
-    queue: { submit: vi.fn() },
+    queue: { submit: vi.fn(), onSubmittedWorkDone: vi.fn(async () => {}) },
     createCommandEncoder: vi.fn(() => encoder),
   };
   const adapter = {
@@ -114,6 +114,33 @@ describe('engine lifecycle', () => {
     expect(fixture.context.unconfigure).toHaveBeenCalledOnce();
     expect(() => engine.render()).toThrowError(expect.objectContaining({ code: 'ENGINE_DISPOSED' }));
     expect(() => engine.resize(10, 10)).toThrowError(expect.objectContaining({ code: 'ENGINE_DISPOSED' }));
+  });
+
+  it('fences submitted GPU work without profiling and does not submit extra frames', async () => {
+    const engine = await ready(); const completion = deferred<void>();
+    fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(completion.promise);
+    engine.render(); let finished = false;
+    const waiting = engine.waitForIdle().then(() => { finished = true; });
+    await flushMicrotasks(); expect(finished).toBe(false);
+    expect(fixture.device.queue.submit).toHaveBeenCalledTimes(1);
+    completion.resolve(); await waiting;
+    expect(finished).toBe(true);
+    expect(engine.getTelemetry().submittedFrames).toBe(1);
+  });
+
+  it('bounds GPU work waits and reports failures or disposal without leaking timers', async () => {
+    const engine = await ready(); vi.useFakeTimers();
+    fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(new Promise(() => {}));
+    const timeout = expect(engine.waitForIdle(10)).rejects.toMatchObject({ code: 'GPU_WORK_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(10); await timeout;
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(engine.waitForIdle(0)).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
+    fixture.device.queue.onSubmittedWorkDone.mockRejectedValueOnce(new Error('Queue failed'));
+    await expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    const completion = deferred<void>(); fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(completion.promise);
+    const disposed = expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'ENGINE_DISPOSED' });
+    engine.dispose(); completion.resolve(); await disposed;
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('loads integrated scenes lazily with cancellation, mixed counters and shared lighting telemetry', async () => {

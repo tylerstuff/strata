@@ -22,6 +22,8 @@ export type StrataErrorCode =
   | 'SCENE_LOAD_ABORTED'
   | 'GPU_VALIDATION_FAILED'
   | 'GPU_TIMING_TIMEOUT'
+  | 'GPU_WORK_TIMEOUT'
+  | 'GPU_WORK_FAILED'
   | 'RENDER_FAILED';
 
 /** A runtime failure with a stable code and, when available, its original cause. */

@@ -50,6 +50,7 @@ async function lifecycle() {
     // @ts-expect-error A persistent trace proxy is mandatory for integrated coverage.
     const missingProxy: IntegratedSceneOptions = { renderer: 'integrated', manifestUrl: '/manifest.json' };
     void integratedTelemetry; void missingProxy;
+    await engine.waitForIdle();
     engine.dispose();
     return { abiVersion, memoryBytes, format, state };
   } catch (error) {

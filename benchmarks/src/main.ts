@@ -260,22 +260,29 @@ async function capture(timeSeconds = 0, debugView = lastOptions?.debugView ?? 'f
     ...(reflections ? { reflections: { mode: lastOptions!.reflectionMode, roughness: lastOptions!.reflectionRoughness,
       maxDistance: lastOptions!.reflectionMaxDistance, updateEvery: lastOptions!.reflectionUpdateEvery, objectOffset: 0, ...scenario.reflections, resetHistory: true } } : {}),
   });
+  if (lastOptions?.mode === 'smoke') await engine.waitForIdle(120_000);
   await nextFrame();
   // Accumulate a fixed number of held-time frames after the single reset.
   const settleFrames = lastOptions?.mode !== 'smoke' && lighting && lastOptions!.giEnabled ? 240 : reflections && lastOptions?.mode !== 'smoke' ? 32 : 8;
   for (let frame = 0; frame < settleFrames; frame++) {
     engine.render({ timeSeconds: timeSeconds + (debugView === 'motion' ? (frame + 1) / 60 : 0), temporal: lastOptions?.temporal ?? true, debugView });
+    if (lastOptions?.mode === 'smoke') await engine.waitForIdle(120_000);
     await nextFrame();
   }
+  // Screenshots run after timing and fence all submissions, including unprofiled ones.
+  await engine.waitForIdle(120_000);
   return { settleFrames };
 }
 
 declare global {
   interface Window {
-    strataBenchmark: { ready: boolean; run: typeof run; capture: typeof capture; dispose(): void };
+    strataBenchmark: { ready: boolean; run: typeof run; capture: typeof capture;
+      diagnostics(): { engineState: string; telemetry: ReturnType<Engine['getTelemetry']> | null }; dispose(): void };
   }
 }
-window.strataBenchmark = { ready: true, run, capture, dispose: () => engine?.dispose() };
+window.strataBenchmark = { ready: true, run, capture,
+  diagnostics: () => ({ engineState: engine?.state ?? 'uninitialized', telemetry: engine?.getTelemetry() ?? null }),
+  dispose: () => engine?.dispose() };
 startButton.addEventListener('click', () => {
   const resolution = document.querySelector<HTMLSelectElement>('#resolution')!.value;
   const [width, height] = resolution.split('x').map(Number);

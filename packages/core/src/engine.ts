@@ -493,6 +493,24 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         }
         assertReady();
       },
+      async waitForIdle(timeoutMs = 5000) {
+        assertReady();
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+          throw new StrataError('INVALID_OPTIONS', 'GPU work timeout must be positive and at most 2147483647 ms.');
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new StrataError('GPU_WORK_TIMEOUT', `GPU work exceeded ${timeoutMs} ms.`)), timeoutMs);
+        });
+        try {
+          await Promise.race([device!.queue.onSubmittedWorkDone(), deadline]);
+          assertReady();
+        } catch (cause) {
+          assertReady();
+          if (cause instanceof StrataError) throw cause;
+          throw new StrataError('GPU_WORK_FAILED', 'Waiting for submitted GPU work failed.', { cause });
+        } finally { clearTimeout(timer); }
+      },
       dispose() {
         if (state === 'disposed') return;
         state = 'disposed';

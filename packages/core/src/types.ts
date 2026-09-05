@@ -134,6 +134,8 @@ export interface Engine {
   drainGpuTimings(): GpuTiming[];
   /** Wait for timestamp readbacks after capture, bounded by timeoutMs (default 5000). */
   flushGpuTimings(timeoutMs?: number): Promise<void>;
+  /** Fence GPU work submitted before this call, even without profiling. No presentation guarantee. Default timeout: 5000 ms. */
+  waitForIdle(timeoutMs?: number): Promise<void>;
   /** Release GPU/worker resources and canvas ownership. Safe to call repeatedly. */
   dispose(): void;
 }

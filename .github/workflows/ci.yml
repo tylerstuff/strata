@@ -83,8 +83,8 @@ jobs:
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
-      - name: Validate integrated benchmark reports with a fresh generated fixture
-        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke -- --renderer integrated --generated-fixture
+      - name: Validate integrated benchmark reports through empty reflection trace regions
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke -- --renderer integrated --generated-fixture --duration 12
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
