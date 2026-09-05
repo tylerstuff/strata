@@ -50,6 +50,29 @@ reflections, shadowing by the model, or interior occlusion. A dark room cannot b
 correctly lit by adding unrestricted distant light. Material AO attenuates diffuse
 environment irradiance only; specular environment light has no occlusion model.
 
+## Animated normal and tangent transforms
+
+Rigid and skinned vertices transform normals by the inverse transpose and tangents
+by the linear transform, retaining reflection handedness. The shader removes a
+positive common matrix scale before forming cofactors and scales directions before
+normalizing them. Small valid transforms therefore do not trigger a fallback merely
+because of the model's units. The determinant sign uses separately scaled columns;
+the normal cofactors retain relative column magnitudes for nonuniform scale.
+
+A collapsed blended skin matrix has no unique inverse-transpose normal. When its
+normal direction vanishes, the shader retains the local normal and constructs a
+finite perpendicular tangent when needed. The same tangent repair applies after
+interpolation. This is a rendering fallback, not a recovered physical surface;
+severely ill-conditioned transforms remain limited by float32 precision. This
+correction does not establish improved shadows, texture detail, or any particular
+character's appearance.
+
+Generated transform checks use an independent double-precision linear solver on
+the exact float32 matrix inputs, including small/large uniform scales, reflections,
+nonuniform scale, shear and degenerate blends. The imported browser validation
+executes the production WGSL against these witnesses. CPU fixture checks alone do
+not validate shader execution or accept visual quality.
+
 ## Incident radiance contract
 
 The source of truth is `radiance` in `scripts/imported-environment-bake.mjs`.
