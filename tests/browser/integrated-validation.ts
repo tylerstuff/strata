@@ -318,10 +318,21 @@ async function lifecycle() {
   const bindingBuffers = s.renderer.traceBindings.map(entry => (entry.resource as GPUBufferBinding).buffer);
   const proxy = s.renderer.traceData.staticTriangles; const motions = [];
   for (const offset of [.05, .1, .15, .2]) {
-    const epoch = s.renderer.giTelemetry.cacheEpoch; const result = await step({ reflections: { objectOffset: offset } });
-    require(result.gi.cacheEpoch !== epoch && result.reflections.worldRevision === result.gi.worldRevision, 'Rigid-object motion did not refit and invalidate both world caches.');
+    const previousGi = s.renderer.giTelemetry; const previousReflection = s.renderer.reflectionTelemetry;
+    const result = await step({ reflections: { objectOffset: offset } });
+    require(result.gi.cacheEpoch === previousGi.cacheEpoch
+      && result.gi.diffuseInvalidationRevision === previousGi.diffuseInvalidationRevision
+      && result.gi.framesSinceReset === Number(previousGi.framesSinceReset) + 1
+      && result.gi.refreshFrontier === (Number(previousGi.refreshFrontier) + Number(previousGi.probesPerUpdate)) % 384,
+    'Rigid-object motion restarted the integrated diffuse cache instead of advancing its bounded refresh.');
+    require(result.reflections.worldRevision === Number(previousReflection.worldRevision) + 1
+      && result.reflections.worldRevision === result.gi.worldRevision
+      && result.reflections.cacheEpoch === Number(previousReflection.cacheEpoch) + 1,
+    'Rigid-object motion failed to refit the shared world and invalidate reflection history.');
     require(s.renderer.traceData.staticTriangles === proxy && s.renderer.traceBindings.every((entry, i) => (entry.resource as GPUBufferBinding).buffer === bindingBuffers[i]), 'Rigid refit replaced persistent trace allocations.');
-    motions.push({ offset, giEpoch: result.gi.cacheEpoch, reflectionEpoch: result.reflections.cacheEpoch });
+    motions.push({ offset, worldRevision: result.gi.worldRevision, giEpoch: result.gi.cacheEpoch,
+      diffuseInvalidationRevision: result.gi.diffuseInvalidationRevision, refreshFrontier: result.gi.refreshFrontier,
+      reflectionEpoch: result.reflections.cacheEpoch });
   }
   const proof = await traceProxyProof(); const epoch = s.renderer.giTelemetry.cacheEpoch; const frame = s.frame;
   const encoder = s.device.createCommandEncoder(); s.renderer.encode(encoder, s.context.getCurrentTexture().createView(), s.width, s.height, 0, { temporal: false });
