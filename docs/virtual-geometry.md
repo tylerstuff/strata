@@ -36,6 +36,8 @@ Scene creation accepts an optional `AbortSignal`. Replacing a pending scene requ
 
 The geometry pool is only one part of GPU memory. Metadata, page mappings, triangle work lists, indirect arguments, bounded readback buffers, PBR targets and temporal histories are reported separately in total engine allocations. CPU staging counts cover page payloads/reservations, not browser network buffers, manifest objects or general JavaScript heap.
 
+An internal [host-driven initialization path](geometry-initialization.md) shares request, storage and initialization-upload budgets across cooked providers. It preserves ordinary scene creation and does not yet provide world streaming or an aggregate budget for normal rendering frames.
+
 ## Comparisons and telemetry
 
 `geometryMode` selects the same source and LOD data:
