@@ -88,6 +88,12 @@ test('absolute completion admission rejects overdue resolve and rejection even b
   clock = 0;
   assert.equal(await withPhaseDeadline(() => { clock = 9; return 7; }, 'on time', 10, now), 7);
 });
+test('an operation queued before expiry cannot start after the monotonic deadline', async () => {
+  let clock = 0, calls = 0;
+  const pending = withPhaseDeadline(() => { calls++; return 'must not start'; }, 'queued operation', 10, () => clock);
+  clock = 10;
+  await assert.rejects(pending, /deadline/); assert.equal(calls, 0);
+});
 test('disk reports stay provisional and a late completed write cannot return an admitted child success', async () => {
   const report = () => ({ status: 'pass', browserErrors: [], cleanup: { deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
   let clock = 100, written;

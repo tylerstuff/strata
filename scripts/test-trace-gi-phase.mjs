@@ -218,7 +218,10 @@ export async function withPhaseDeadline(operation, label, milliseconds, now = ()
   const expired = cause => Object.assign(Error(`${label} deadline exceeded.`), cause === undefined ? {} : { cause });
   let timer;
   try {
-    const result = await Promise.race([Promise.resolve().then(() => typeof operation === 'function' ? operation() : operation),
+    const result = await Promise.race([Promise.resolve().then(() => {
+      if (now() >= deadline) throw expired();
+      return typeof operation === 'function' ? operation() : operation;
+    }),
       new Promise((_, reject) => { timer = setTimeout(() => reject(expired()), milliseconds); })]);
     if (now() >= deadline) throw expired();
     return result;
@@ -290,7 +293,7 @@ export async function runPhase(args) {
       timeout: remainingWork(30000), args: ['--enable-unsafe-webgpu'] });
     if (stopped) { await browserServer.kill(); throw Error('Timed out during browser launch.'); }
     const child = browserServer.process(); report.browserProcess = { pid: child.pid, spawnedAt: new Date().toISOString() };
-    browser = await chromium.connect(browserServer.wsEndpoint(), { timeout: remainingWork(15000) }); active(); report.browser = browser.version();
+    active(); browser = await chromium.connect(browserServer.wsEndpoint(), { timeout: remainingWork(15000) }); active(); report.browser = browser.version();
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 1 });
     page.setDefaultTimeout(15000); page.setDefaultNavigationTimeout(15000);
     page.on('pageerror', e => report.browserErrors.push(String(e))); page.on('console', m => { if (m.type() === 'error') report.browserErrors.push(m.text()); });
@@ -350,7 +353,7 @@ export async function runPhase(args) {
     for (const run of PHASE_RUNS) {
       active(); activeCell = { ...run, bytes: 0, eventBytes: 0, artifacts: [], pngs: [], events: [] }; report.cells.push(activeCell);
       const cell = activeCell;
-      const completed = await withPhaseDeadline(page.evaluate(async run => {
+      const completed = await withPhaseDeadline(() => page.evaluate(async run => {
         const s = globalThis.strataPhaseState;
         const firstShader = s.shaderDescriptors.length;
         try {
@@ -387,14 +390,14 @@ export async function runPhase(args) {
       if (browser && !report.cleanup.deviceDestroyed) {
         // Failure cleanup is also recorded; cell resources are destroyed by the helper's finally block.
         const pages = browser.contexts().flatMap(c => c.pages());
-        if (pages[0]) report.failedDeviceCleanup = await withPhaseDeadline(pages[0].evaluate(async () => {
+        if (pages[0]) report.failedDeviceCleanup = await withPhaseDeadline(() => pages[0].evaluate(async () => {
           const s = globalThis.strataPhaseState; if (!s) return null;
           return s.finishDevice();
         }), 'Failure device cleanup', 2000);
       }
     } catch (error) { report.browserErrors.push(String(error)); }
     try {
-      await withPhaseDeadline((async () => {
+      await withPhaseDeadline(async () => {
         const cleanup = await Promise.allSettled([
           (async () => { if (browserServer) await closePhaseBrowser(browserServer); report.cleanup.browserExited = true; })(),
           (async () => { if (server) await server.close(); report.cleanup.serverClosed = true; })(),
@@ -403,10 +406,11 @@ export async function runPhase(args) {
         // Callback admission is closed; drain the complete accepted chain only after browser closure.
         await writes; report.cleanup.artifactsDrained = true;
         await verifyPhase(args['--manifest'], args['--manifest-sha256']); report.cleanup.frozenInputsVerified = true;
-      })(), 'Browser/server/artifact cleanup', PHASE_LIMITS.cleanupMs);
+      }, 'Browser/server/artifact cleanup', PHASE_LIMITS.cleanupMs);
     } catch (error) { report.status = 'fail'; report.browserErrors.push(String(error)); }
     if (browserServer && !report.cleanup.browserExited) {
       report.cleanup.forcedKill = true;
+      // Start cleanup of the already-owned process immediately; retain this promise even if observation expires.
       try { await withPhaseDeadline(browserServer.kill(), 'Owned browser kill', Math.max(1, PHASE_LIMITS.totalMs - (performance.now() - started) - 100));
         const p = browserServer.process(); report.cleanup.browserExited = p.exitCode !== null || p.signalCode !== null;
       } catch (error) { report.browserErrors.push(String(error)); }
