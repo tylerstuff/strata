@@ -1,5 +1,5 @@
 import { createEngine, SceneCommitError, type Engine, type FrameMetrics, type RenderOptions, type SceneCommitReceipt } from '@strata-engine/core';
-import { estimateImportedTextureAllocation, loadGltf } from '@strata-engine/core/gltf';
+import { estimateImportedTextureAllocation, loadGltf, measureImportedPoseBounds } from '@strata-engine/core/gltf';
 import type { GalleryAsset } from './catalog.js';
 import { fitOrbitToBounds, normalizeOrbit, orbitEye, type GalleryOrbit } from './orbit.js';
 import { GalleryMeasurements } from './state.js';
@@ -31,6 +31,24 @@ export interface GalleryAnimation {
   readonly timeSeconds: number;
   readonly loop: boolean;
   readonly playing: boolean;
+}
+interface PoseFrameIdentity {
+  readonly engineEpoch: number;
+  readonly sceneCommit: SceneCommitReceipt;
+  readonly modelId: string;
+  readonly viewRevision: number;
+  readonly frameId: number;
+  readonly viewport: { readonly width: number; readonly height: number };
+  readonly requestedAnimation: NonNullable<ImportedControls['animation']>;
+  /** Resolved pose from this submitted frame's Core receipt, not delayed telemetry. */
+  readonly animation: NonNullable<ImportedControls['animation']>;
+}
+export interface GalleryPoseFrameReceipt {
+  readonly format: 'strata.gallery.pose-frame';
+  readonly version: 1;
+  readonly source: PoseFrameIdentity;
+  readonly measurement: Awaited<ReturnType<typeof measureImportedPoseBounds>>;
+  readonly applied: PoseFrameIdentity & { readonly orbit: GalleryOrbit };
 }
 
 const limits = { minimumDistance: 0.15, maximumDistance: 50 };
@@ -69,7 +87,9 @@ export class GalleryRuntime {
   #cameraIsFitted = false;
   #animation: GalleryAnimation = freshAnimation();
   #live = false;
-  #busy: 'settings' | 'capture' | null = null;
+  #busy: 'settings' | 'capture' | 'pose-frame' | null = null;
+  #poseFrameJob: { controller: AbortController; stage: 'measuring' | 'submitting' } | null = null;
+  #poseFrame: GalleryPoseFrameReceipt | null = null;
   #raf: number | null = null;
   #lastTimestamp: number | null = null;
   #lastUiTimestamp = 0;
@@ -127,6 +147,7 @@ export class GalleryRuntime {
   }
   #fault(error: unknown) {
     if (this.#phase === 'disposed') return;
+    this.#poseFrameJob?.controller.abort(stopped('The gallery stopped while measuring the pose.'));
     this.#stopFrames();
     this.#live = false;
     this.#error = failure(error);
@@ -136,8 +157,14 @@ export class GalleryRuntime {
 
   async selectModel(model: GalleryAsset): Promise<void> {
     model = structuredClone(model);
-    if (this.#busy) throw new Error('A capture or view change is still settling.');
+    if (this.#busy && !(this.#busy === 'pose-frame' && this.#poseFrameJob?.stage === 'measuring')) throw new Error('A capture or view change is still settling.');
     this.#healthy();
+    if (this.#poseFrameJob) {
+      this.#poseFrameJob.controller.abort(stopped('Model selection canceled current-pose framing.'));
+      this.#poseFrameJob = null;
+      this.#busy = null;
+    }
+    this.#poseFrame = null;
     const request = ++this.#request;
     this.#load?.abort(stopped('A newer model selection superseded this load.'));
     this.#stopFrames();
@@ -228,7 +255,7 @@ export class GalleryRuntime {
     this.#measurements.recordGpuTimings(engine.drainGpuTimings());
     return frame;
   }
-  async #settleFrames(engine: Engine, signal?: AbortSignal, collectTimings = false) {
+  async #settleFrames(engine: Engine, signal?: AbortSignal, collectTimings = false, preserveResizeCamera = false) {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       await engine.waitForIdle();
       if (collectTimings) await engine.flushGpuTimings();
@@ -236,7 +263,7 @@ export class GalleryRuntime {
       this.#healthy();
       if (!this.#pendingSize) return;
       if (attempt === 3) throw new Error('Viewport kept changing while the gallery was preparing a stable frame.');
-      this.#applySize();
+      this.#applySize(preserveResizeCamera);
       this.#submit(true);
     }
   }
@@ -251,7 +278,7 @@ export class GalleryRuntime {
           if (clip && !this.#animation.loop && timeSeconds >= clip.duration) {
             timeSeconds = clip.duration;
             this.#animation = { ...this.#animation, playing: false };
-          } else if (clip && this.#animation.loop && clip.duration > 0) timeSeconds %= clip.duration;
+          } else if (clip && this.#animation.loop) timeSeconds = clip.duration > 0 ? timeSeconds % clip.duration : 0;
           this.#animation = { ...this.#animation, timeSeconds };
         }
         this.#lastTimestamp = timestamp;
@@ -383,7 +410,7 @@ export class GalleryRuntime {
   }
   async setOrbit(value: Partial<GalleryOrbit>) {
     const next = normalizeOrbit({ ...this.#orbit, ...value }, limits);
-    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = false; });
+    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = false; this.#poseFrame = null; });
   }
   async resetCamera() {
     const engine = this.#ready();
@@ -391,7 +418,96 @@ export class GalleryRuntime {
       ?? [this.#canvas.width, this.#canvas.height];
     // Reject an impossible fit before mutating an otherwise healthy ready view.
     const next = this.#fitCamera(width!, height!);
-    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = true; });
+    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = true; this.#poseFrame = null; });
+  }
+  async frameCurrentPose(): Promise<GalleryPoseFrameReceipt> {
+    const engine = this.#ready(), prepared = this.#asset, model = this.#model, scene = this.#sceneCommit;
+    const submitted = this.#submittedView, frame = this.#lastFrame;
+    const resolvedAnimation = frame?.imported?.animation;
+    if (!prepared || !model || !scene || !submitted?.controls.animation || !frame || !resolvedAnimation
+      || submitted.frameId !== frame.frameId || engine.getTelemetry().submittedFrames !== frame.frameId
+      || resolvedAnimation.clipId !== submitted.controls.animation.clipId || resolvedAnimation.loop !== submitted.controls.animation.loop
+      || !this.#sameScene(engine, scene) || this.#pendingSize) {
+      throw new Error('Current-pose framing requires a settled submitted model view.');
+    }
+    const source: PoseFrameIdentity = structuredClone({ engineEpoch: this.#epoch, sceneCommit: scene, modelId: model.id,
+      viewRevision: this.#viewRevision, frameId: frame.frameId,
+      viewport: { width: this.#canvas.width, height: this.#canvas.height },
+      requestedAnimation: submitted.controls.animation, animation: resolvedAnimation });
+    const request = this.#request;
+    const playback = { live: this.#live, animation: structuredClone(this.#animation) };
+    const direction = { azimuth: this.#orbit.azimuth, elevation: this.#orbit.elevation };
+    const job = { controller: new AbortController(), stage: 'measuring' as 'measuring' | 'submitting' };
+    const owns = () => this.#poseFrameJob === job && this.#ownsRequest(request);
+    const assertCurrent = (frameId = source.frameId, viewRevision = source.viewRevision, viewport = source.viewport) => {
+      if (!owns()) throw stopped('Current-pose framing was superseded.');
+      job.controller.signal.throwIfAborted();
+      this.#healthy();
+      const pose = this.#lastFrame?.imported?.animation;
+      if (this.#phase !== 'ready' || this.#engine !== engine || this.#epoch !== source.engineEpoch
+        || this.#asset !== prepared || this.#model !== model || !this.#sameScene(engine, source.sceneCommit)
+        || this.#viewRevision !== viewRevision || this.#lastFrame?.frameId !== frameId
+        || this.#submittedView?.frameId !== frameId || engine.getTelemetry().submittedFrames !== frameId
+        || pose?.clipId !== source.animation.clipId || pose?.timeSeconds !== source.animation.timeSeconds || pose?.loop !== source.animation.loop
+        || this.#canvas.width !== viewport.width || this.#canvas.height !== viewport.height || this.#pendingSize) {
+        throw stopped('The submitted view changed while current-pose framing was pending.');
+      }
+    };
+    this.#poseFrameJob = job; this.#busy = 'pose-frame'; this.#stopFrames();
+    let applied = false, initialFencePending = false;
+    try {
+      this.#changed(); assertCurrent();
+      // Fence the already submitted pose without creating a new animation frame.
+      initialFencePending = true;
+      await engine.waitForIdle(); initialFencePending = false; assertCurrent();
+      const measurement = structuredClone(await measureImportedPoseBounds(prepared, structuredClone(source.animation), { signal: job.controller.signal }));
+      assertCurrent();
+      if (measurement.animation.clipId !== source.animation.clipId || measurement.animation.timeSeconds !== source.animation.timeSeconds
+        || measurement.animation.loop !== source.animation.loop) throw new Error('Measured animation does not match the submitted pose.');
+      const next = fitOrbitToBounds(measurement.bounds, direction, source.viewport.width / source.viewport.height, verticalFov, limits);
+      // No asynchronous boundary separates the final identity check and camera commit.
+      assertCurrent(); job.stage = 'submitting';
+      this.#orbit = next; this.#cameraIsFitted = false; this.#viewRevision += 1; applied = true;
+      this.#submit(true);
+      // A responsive resize after camera application keeps this manual orbit.
+      // The receipt identifies the final fenced frame, including a queued size.
+      await this.#settleFrames(engine, job.controller.signal, false, true);
+      const fittedFrame = this.#lastFrame!, fittedRevision = this.#viewRevision;
+      const viewport = { width: this.#canvas.width, height: this.#canvas.height };
+      assertCurrent(fittedFrame.frameId, fittedRevision, viewport);
+      const receipt: GalleryPoseFrameReceipt = { format: 'strata.gallery.pose-frame', version: 1, source, measurement,
+        applied: { ...structuredClone(source), frameId: fittedFrame.frameId, viewRevision: fittedRevision, viewport, orbit: structuredClone(next) } };
+      this.#poseFrame = structuredClone(receipt);
+      return structuredClone(receipt);
+    } catch (error) {
+      if (owns()) {
+        if (applied || initialFencePending || engine.state !== 'ready' || engine.getTelemetry().gpuErrorCount > 0 || !this.#sameScene(engine, source.sceneCommit)) {
+          this.#fault(error);
+        } else if (this.#phase === 'ready' && this.#pendingSize) {
+          // A responsive resize cancels measurement. Honor it without making the
+          // failed pose-fit action refit the old rest bounds or move the camera.
+          job.stage = 'submitting';
+          try {
+            this.#applySize(true); this.#submit(true);
+            await this.#settleFrames(engine, undefined, false, true);
+            if (owns()) this.#assertScene(engine, source.sceneCommit);
+          } catch (resizeError) { if (owns()) this.#fault(resizeError); }
+        }
+      }
+      // The optional CPU helper wraps cancellation in a StrataError. Preserve
+      // the gallery's AbortError reason so a superseded UI action stays quiet.
+      if (job.controller.signal.aborted && (error as { code?: unknown } | null)?.code === 'SCENE_LOAD_ABORTED') {
+        throw job.controller.signal.reason ?? error;
+      }
+      throw error;
+    } finally {
+      if (owns()) {
+        this.#poseFrameJob = null; this.#busy = null;
+        if (this.#phase === 'ready') { this.#live = playback.live; this.#animation = playback.animation; }
+        // The first resumed callback has no elapsed-job delta.
+        this.#stopFrames(); this.#changed(); this.#schedule();
+      }
+    }
   }
   async setAnimation(value: Partial<GalleryAnimation>) {
     const next = { ...this.#animation, ...value };
@@ -408,6 +524,11 @@ export class GalleryRuntime {
     const max = this.#engine?.info.maxTextureDimension2D ?? Infinity;
     width = Math.min(max, width); height = Math.min(max, height);
     if (this.#canvas.width === width && this.#canvas.height === height) { this.#pendingSize = null; return; }
+    if (this.#poseFrameJob) {
+      this.#pendingSize = [width, height];
+      if (this.#poseFrameJob.stage === 'measuring') this.#poseFrameJob.controller.abort(stopped('Viewport resize canceled current-pose framing.'));
+      return;
+    }
     if (this.#cameraIsFitted && this.#asset) this.#fitCamera(width, height);
     this.#pendingSize = [width, height];
     if (!this.#busy && this.#phase === 'ready') {
@@ -424,12 +545,12 @@ export class GalleryRuntime {
     if (!this.#asset) throw new Error('A loaded model is required to fit the camera.');
     return fitOrbitToBounds(this.#asset.bounds, initialOrbit, width / height, verticalFov, limits);
   }
-  #applySize() {
+  #applySize(preserveCamera = false) {
     if (!this.#pendingSize || !this.#engine) return;
     const max = this.#engine.info.maxTextureDimension2D;
     const [width, height] = this.#pendingSize.map(value => Math.min(max, value)) as [number, number];
     if (this.#canvas.width === width && this.#canvas.height === height) { this.#pendingSize = null; return; }
-    const fitted = this.#cameraIsFitted && this.#asset ? this.#fitCamera(width, height) : null;
+    const fitted = !preserveCamera && this.#cameraIsFitted && this.#asset ? this.#fitCamera(width, height) : null;
     this.#engine.resize(width, height);
     this.#pendingSize = null;
     if (fitted) this.#orbit = fitted;
@@ -474,7 +595,7 @@ export class GalleryRuntime {
       settings: { scenePreset: this.#scenePreset, lightingPreset: this.#lightingPreset, debugView: this.#debugView, orbit: this.#orbit, animation: this.#animation, temporal: this.#temporal,
         shading: this.#shading, environment: this.#environment, textureCap: this.#textureCap, textureDecision: this.#textureDecision, effective: this.#controls() },
       live: this.#live, busy: this.#busy, viewport: { width: this.#canvas.width, height: this.#canvas.height },
-      frame: this.#lastFrame, submittedView: this.#submittedView, measurements: this.#measurements.snapshot(this.#identity()),
+      frame: this.#lastFrame, submittedView: this.#submittedView, poseFrame: this.#poseFrame, measurements: this.#measurements.snapshot(this.#identity()),
       telemetry: this.#engine?.getTelemetry() ?? null, engineInfo: this.#engine?.info ?? null,
     };
     return structuredClone(result);
@@ -485,6 +606,10 @@ export class GalleryRuntime {
     this.#request += 1;
     this.#initialization.abort();
     this.#load?.abort();
+    this.#poseFrameJob?.controller.abort(stopped('Gallery disposal canceled current-pose framing.'));
+    this.#poseFrameJob = null;
+    if (this.#busy === 'pose-frame') this.#busy = null;
+    this.#poseFrame = null;
     this.#stopFrames();
     this.#live = false;
     this.#engine?.dispose();
