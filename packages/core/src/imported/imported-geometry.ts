@@ -59,10 +59,28 @@ export function importedTextureExtent(width: number, height: number, edge: numbe
   return { width: w, height: h, mipLevels, bytes };
 }
 function samplerDescriptor(s: ImportedSampler): GPUSamplerDescriptor {
+  if (!s || typeof s !== 'object' || Array.isArray(s)) fail('texture sampler must be an object.');
   const wrap = (v: number): GPUAddressMode => { if (v === 33071) return 'clamp-to-edge'; if (v === 33648) return 'mirror-repeat'; if (v === 10497) return 'repeat'; return fail('unsupported texture wrapping.'); };
   if (![9728, 9729].includes(s.magFilter) || ![9728, 9729, 9984, 9985, 9986, 9987].includes(s.minFilter)) fail('unsupported texture filter.');
   return { addressModeU: wrap(s.wrapS), addressModeV: wrap(s.wrapT), magFilter: s.magFilter === 9728 ? 'nearest' : 'linear',
     minFilter: [9728, 9984, 9986].includes(s.minFilter) ? 'nearest' : 'linear', mipmapFilter: [9986, 9987].includes(s.minFilter) ? 'linear' : 'nearest', lodMaxClamp: [9728, 9729].includes(s.minFilter) ? 0 : 32 };
+}
+function validateMaterial(material: ImportedMaterial): void {
+  if (!material || typeof material !== 'object' || Array.isArray(material)) fail('material must be an object.');
+  if (typeof material.name !== 'string') fail('material name must be a string.');
+  const factor = (value: unknown, name: string, minimum: number, maximum = Infinity): void => {
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isFinite(Math.fround(value)) || value < minimum || value > maximum) fail(`${name} is outside its finite material range.`);
+  };
+  const color = (value: unknown, length: number, name: string): void => {
+    if (!Array.isArray(value) || value.length !== length) fail(`${name} must contain exactly ${length} components.`);
+    for (const component of value) factor(component, name, 0, 1);
+  };
+  color(material.baseColorFactor, 4, 'baseColorFactor'); color(material.emissiveFactor, 3, 'emissiveFactor');
+  factor(material.metallicFactor, 'metallicFactor', 0, 1); factor(material.roughnessFactor, 'roughnessFactor', 0, 1);
+  factor(material.emissiveStrength, 'emissiveStrength', 0, 1e6); factor(material.normalScale, 'normalScale', -Infinity);
+  factor(material.occlusionStrength, 'occlusionStrength', 0, 1); factor(material.alphaCutoff, 'alphaCutoff', 0);
+  if (!['OPAQUE', 'MASK'].includes(material.alphaMode)) fail('only OPAQUE and MASK materials are supported.');
+  if (typeof material.doubleSided !== 'boolean' || (material.unlit !== undefined && typeof material.unlit !== 'boolean')) fail('doubleSided and optional unlit must be booleans.');
 }
 type DeformationMode = 'static' | 'rigid' | 'skin';
 interface Mesh { vertices: GPUBuffer; indices: GPUBuffer; indexCount: number; material: number; ground: boolean;
@@ -110,7 +128,8 @@ export class ImportedGeometry implements RasterGeometryGroup {
       if (meshes.some(mesh => mesh.mode === mode && materials[mesh.material]!.doubleSided === doubleSided)) batches.push(new ImportedBatch(this, mode, doubleSided, batches.length === 0));
     }
     this.providers = batches;
-    this.updateLightMatrix();
+    const fit = this.fitLightMatrix(this.settings, this.palettes.map(palette => palette.data));
+    this.visibleBounds = fit.bounds; this.light = fit.matrix;
   }
   static async create(device: GPUDevice, asset: ImportedAsset, signal?: AbortSignal): Promise<ImportedGeometry> {
     checkSignal(signal);
@@ -132,13 +151,15 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const roles = (m: ImportedMaterial) => [m.baseColorTexture, m.metallicRoughnessTexture, m.normalTexture, m.occlusionTexture, m.emissiveTexture];
     let plannedTextureBytes = 8; // Shared one-pixel sRGB and linear white fallbacks.
     for (const material of definitions) {
-      if (!material || !['OPAQUE', 'MASK'].includes(material.alphaMode)) fail('only OPAQUE and MASK materials are supported.');
+      validateMaterial(material);
       for (const [role, ref] of roles(material).entries()) {
-        if (!ref) continue;
+        if (ref === undefined) continue;
+        if (!ref || typeof ref !== 'object' || Array.isArray(ref)) fail('material texture reference must be an object.');
         if (!Number.isSafeInteger(ref.image) || ref.image < 0 || ref.image >= asset.images.length) fail('material references an absent image.');
         samplerDescriptor(ref.sampler);
         const srgb = role === 0 || role === 4, key = `${ref.image}/${srgb}`; if (textureRequests.has(key)) continue;
         const image = asset.images[ref.image]!;
+        if (!image || !['image/png', 'image/jpeg'].includes(image.mimeType) || !(image.bytes instanceof Uint8Array) || !image.bytes.byteLength) fail('referenced image must contain encoded PNG or JPEG bytes.');
         const extent = importedTextureExtent(image.width, image.height, Math.min(asset.maxTextureDimension, device.limits.maxTextureDimension2D));
         plannedTextureBytes += extent.bytes; textureRequests.set(key, { image: ref.image, srgb, extent });
       }
@@ -264,28 +285,33 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const animation = controls.animation === undefined ? this.animation : controls.animation;
     const pose = this.evaluator.evaluate(animation);
     const sources = [pose.nodeMatrices, ...pose.skinMatrices];
+    // The evaluator reuses its arrays. Validate the entire candidate before copying any
+    // palette or publishing controls/telemetry, so an out-of-range pose is atomic.
+    const fit = this.fitLightMatrix(next, sources);
     this.palettes.forEach((palette, i) => palette.data.set(sources[i]!));
     const animationCut = this.committedAnimation !== undefined && pose.clipId !== this.committedAnimation.clipId;
     this.pendingAnimation = { clipId: pose.clipId, timeSeconds: pose.timeSeconds, loop: pose.loop }; this.animation = { ...animation };
     const changedLighting = JSON.stringify(next.lighting) !== JSON.stringify(this.settings.lighting);
     const cut = changedLighting || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
-    this.settings = next; this.lightDirty ||= changedLighting; this.updateLightMatrix(); return cut || animationCut;
+    this.settings = next; this.lightDirty ||= changedLighting;
+    this.visibleBounds = fit.bounds; this.light = fit.matrix; return cut || animationCut;
   }
-  private updateLightMatrix(): void {
+  private fitLightMatrix(settings: Settings, palettes: readonly Float32Array[]): { bounds: ImportedBounds; matrix: Float32Array<ArrayBuffer> } {
     const out = pointBounds();
     for (const mesh of this.meshes) {
-      if (mesh.ground && this.settings.presentation !== 'ground') continue;
+      if (mesh.ground && settings.presentation !== 'ground') continue;
       for (const entry of mesh.bounds) {
         if (mesh.mode === 'static') { addPoint(out, entry.bounds.min); addPoint(out, entry.bounds.max); }
-        else transformedBounds(entry.bounds, this.palettes[mesh.palette]!.data, entry.matrix * 16, out);
+        else transformedBounds(entry.bounds, palettes[mesh.palette]!, entry.matrix * 16, out);
       }
     }
-    const { min, max } = out; this.visibleBounds = { min: [...min], max: [...max] };
+    const { min, max } = out;
+    if (![...min, ...max].every(v => Number.isFinite(v) && Math.abs(v) <= 8192)) fail('bounds exceed the finite normalized preview range (8192 units).');
     const center: ImportedVec3 = [(min[0]! + max[0]!) / 2, (min[1]! + max[1]!) / 2, (min[2]! + max[2]!) / 2];
     const radius = Math.max(.5, Math.hypot(max[0]! - min[0]!, max[1]! - min[1]!, max[2]! - min[2]!) / 2);
-    const l = this.settings.lighting.directionToLight; const distance = radius * 2 + .1;
+    const l = settings.lighting.directionToLight; const distance = radius * 2 + .1;
     const eye: ImportedVec3 = [center[0] + l[0] * distance, center[1] + l[1] * distance, center[2] + l[2] * distance];
-    this.light = multiplyMatrices(orthographicMatrix(radius * 1.05, .01, radius * 4 + .2), lookAt(eye, center));
+    return { bounds: { min: [...min], max: [...max] }, matrix: multiplyMatrices(orthographicMatrix(radius * 1.05, .01, radius * 4 + .2), lookAt(eye, center)) };
   }
   camera(width: number, height: number, _time: number, jitter: readonly [number, number]): CameraFrame {
     const camera = this.settings.camera; const view = lookAt(camera.eye, camera.target); const y = 1 / Math.tan(camera.verticalFov / 2);

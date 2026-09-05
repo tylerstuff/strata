@@ -30,7 +30,7 @@ function gpu() {
   };
   return { device: device as unknown as GPUDevice, raw: device, pass, encoder: encoder as unknown as GPUCommandEncoder, buffers, textures, writes };
 }
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('imported scene resource and temporal contracts', () => {
   it('accounts full rectangular mip chains after an aspect-preserving edge cap', () => {
@@ -59,6 +59,25 @@ describe('imported scene resource and temporal contracts', () => {
     const g = gpu(), a = textured(8192); const decode = vi.fn(); vi.stubGlobal('createImageBitmap', decode);
     await expect(ImportedGeometry.create(g.device, { ...a, images: [{ ...a.images[0]!, width: 8192, height: 8192 }] })).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
     expect(decode).not.toHaveBeenCalled(); expect(g.raw.createTexture).not.toHaveBeenCalled(); expect(g.raw.createBuffer).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['missing doubleSided', { doubleSided: undefined }], ['nonboolean doubleSided', { doubleSided: 1 }], ['nonboolean unlit', { unlit: 'true' }],
+    ['missing base component', { baseColorFactor: [1, 1, 1] }],
+    ['compensating vector lengths', { baseColorFactor: [1, 1, 1], emissiveFactor: [0, 0, 0, 0] }],
+    ['sparse base factor', { baseColorFactor: [1, , 1, 1] }], ['base factor range', { baseColorFactor: [1, 2, 1, 1] }],
+    ['emissive factor range', { emissiveFactor: [0, -1, 0] }], ['metallic factor range', { metallicFactor: 2 }],
+    ['roughness factor range', { roughnessFactor: -.1 }], ['emissive strength range', { emissiveStrength: 1e7 }],
+    ['normal scale finite', { normalScale: NaN }], ['normal scale float32 overflow', { normalScale: 1e100 }],
+    ['occlusion strength range', { occlusionStrength: 1.1 }], ['alpha cutoff range', { alphaCutoff: -.1 }],
+    ['unsupported alpha mode', { alphaMode: 'BLEND' }], ['material name', { name: null }],
+    ['null texture reference', { normalTexture: null }], ['absent image', { normalTexture: { image: 100, sampler: {} } }],
+    ['missing sampler', { normalTexture: { image: 0 } }],
+    ['invalid texture wrapping', { normalTexture: { image: 0, sampler: { magFilter: 9729, minFilter: 9987, wrapS: 0, wrapT: 10497 } } }],
+  ])('rejects %s before any material allocation or image decoding', async (_name, invalid) => {
+    const g = gpu(), a = textured(); const decode = vi.fn(); vi.stubGlobal('createImageBitmap', decode);
+    await expect(ImportedGeometry.create(g.device, { ...a, materials: [{ ...a.materials[0]!, ...invalid } as ImportedMaterial] })).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
+    expect(decode).not.toHaveBeenCalled(); expect(g.raw.createTexture).not.toHaveBeenCalled(); expect(g.raw.createBuffer).not.toHaveBeenCalled();
+    expect(g.raw.createRenderPipelineAsync).not.toHaveBeenCalled();
   });
   it('closes an asynchronously decoded bitmap and destroys prior resources when creation is cancelled', async () => {
     const g = gpu(), controller = new AbortController(); const bitmap = { width: 8, height: 4, close: vi.fn() };
@@ -117,6 +136,31 @@ describe('imported scene resource and temporal contracts', () => {
     expect(current[14]).toBe(20); expect([...previous]).toEqual([...current]);
     expect(r.importedTelemetry.bounds.min[2]).toBe(20); expect(r.importedTelemetry.bounds.max[2]).toBe(20);
     expect(r.currentCamera!.far).toBeGreaterThan(20);
+    r.submitted(2); r.dispose();
+  });
+  it('rejects an out-of-range pose atomically and cancels history without publishing its controls or telemetry', async () => {
+    const g = gpu(), a = asset(); const animated: ImportedAsset = { ...a, primitives: [{ ...a.primitives[0]!, deformation: { node: 0, vertices: a.primitives[0]!.vertices } }],
+      rig: { nodes: [{ parent: null, translation: [0, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] }], skins: [] },
+      clips: [{ id: 'move', name: 'move', duration: 2, channels: [{ node: 0, path: 'translation', interpolation: 'LINEAR', times: new Float32Array([0, 1, 2]), values: new Float32Array([0, 0, 0, 0, 0, 20, 0, 0, 9000]) }] }] };
+    const r = await ImportedRenderer.create(g.device, 'rgba8unorm', { renderer: 'imported', asset: animated });
+    r.encode(g.encoder, {} as GPUTextureView, 128, 128, 0, { temporal: false, imported: { animation: { clipId: 'move', timeSeconds: .5, loop: false } } }); r.submitted(1);
+    const before = structuredClone(r.importedTelemetry), camera = structuredClone(r.currentCamera);
+    const writes = g.writes.length, cancel = vi.spyOn(ImportedGeometry.prototype, 'cancelFrame');
+    expect(() => r.encode(g.encoder, {} as GPUTextureView, 128, 128, .016, { temporal: false, imported: {
+      animation: { clipId: 'move', timeSeconds: 2, loop: false }, presentation: 'ground', background: [1, 0, 0],
+      camera: { eye: [4, 2, 3], target: [0, 1, 0], verticalFov: Math.PI / 3 },
+      lighting: { directionToLight: [0, 1, 0], color: [1, 1, 1], intensity: 1, ambient: [0, 0, 0] },
+    } })).toThrow(/8192/);
+    expect(cancel).toHaveBeenCalledOnce(); expect(g.writes).toHaveLength(writes);
+    expect(r.importedTelemetry).toEqual(before); expect(r.currentCamera).toEqual(camera);
+    // Omitting controls retries the last accepted pose/settings, not the rejected candidate.
+    const retried = r.encode(g.encoder, {} as GPUTextureView, 128, 128, .016, { temporal: false });
+    expect(retried.triangles).toBe(3); // Two mesh passes plus presentation; no rejected ground.
+    expect(r.importedTelemetry).toEqual(before); expect(r.currentCamera).toEqual(camera);
+    const current = g.writes.filter(w => w.label === 'Strata imported current palette 0').at(-1)!.data;
+    const previous = g.writes.filter(w => w.label === 'Strata imported previous palette 0').at(-1)!.data;
+    expect(current[14]).toBe(10); expect([...previous]).toEqual([...current]);
+    expect(g.writes.slice(writes).some(w => w.label === 'Strata imported directional light and explicit fill')).toBe(false);
     r.submitted(2); r.dispose();
   });
 });

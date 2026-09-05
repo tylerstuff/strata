@@ -139,7 +139,7 @@ export interface ImportedControls {
 }
 export interface ImportedTelemetry {
   readonly sourceUrl: string;
-  /** Conservative current pose bounds, including retained root motion. */
+  /** Conservative current visible bounds, including retained root motion and the optional ground. */
   readonly bounds: ImportedBounds;
   readonly triangles: number;
   readonly primitives: number;

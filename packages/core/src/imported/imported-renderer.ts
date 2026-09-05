@@ -35,9 +35,11 @@ export class ImportedRenderer {
   encode(encoder: GPUCommandEncoder, target: GPUTextureView, width: number, height: number, timeSeconds: number,
     controls: Controls = {}, timestamps: RasterTimestamps = {}): SceneFrameStats {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported renderer is disposed.');
-    normalizeRasterControls(controls);
-    const reset = this.geometry.update(controls.imported);
-    try { return this.raster.encode(encoder, target, width, height, timeSeconds, { ...controls, cameraCut: Boolean(controls.cameraCut || reset || this.forceReset) }, timestamps); }
+    try {
+      normalizeRasterControls(controls);
+      const reset = this.geometry.update(controls.imported);
+      return this.raster.encode(encoder, target, width, height, timeSeconds, { ...controls, cameraCut: Boolean(controls.cameraCut || reset || this.forceReset) }, timestamps);
+    }
     catch (cause) { this.cancelFrame(); throw cause; }
   }
   submitted(_frameId: number): void { this.geometry.submitted(); this.forceReset = false; }
