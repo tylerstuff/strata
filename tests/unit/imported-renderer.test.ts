@@ -34,6 +34,24 @@ function gpu() {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('imported scene resource and temporal contracts', () => {
+  it('borrows the same material resources and excludes unoccluded fill for both progressive comparison states', async () => {
+    const g = gpu(), a = asset();
+    const geometry = await ImportedGeometry.create(g.device, a);
+    const count = g.textures.length, bytes = geometry.gpuTextureBytes;
+    const borrowed = geometry.borrowIndirectMaterial(0);
+    expect(borrowed).toMatchObject({ baseColorFactor: [1, 1, 1, 1], metallicFactor: 0, emissiveFactor: [0, 0, 0], emissiveStrength: 1 });
+    expect(g.textures).toHaveLength(count); expect(geometry.gpuTextureBytes).toBe(bytes);
+    geometry.useIndirectBaseline();
+    geometry.update({ lighting: { directionToLight: [0, 1, 0], color: [1, 1, 1], intensity: 2, ambient: [8, 7, 6],
+      environment: { preset: 'sky', intensity: 3, rotationRadians: .4 } } });
+    geometry.prepare(true, false);
+    const light = g.writes.filter(w => w.label === 'Strata imported directional light and explicit fill').at(-1)!.data;
+    expect([...light.subarray(4, 7)]).toEqual([2, 2, 2]); expect([...light.subarray(8, 11)]).toEqual([0, 0, 0]);
+    const environment = g.writes.filter(w => w.label === 'Strata imported environment and shading').at(-1)!.data;
+    expect(environment[4]).toBe(0);
+    expect(geometry.lighting.environment).toEqual({ preset: 'sky', intensity: 3, rotationRadians: .4 });
+    geometry.dispose(); for (const resource of [...g.buffers, ...g.textures]) expect(resource.destroy).toHaveBeenCalledOnce();
+  });
   it('accounts full rectangular mip chains after an aspect-preserving edge cap', () => {
     expect(importedTextureExtent(8, 4, 4)).toEqual({ width: 4, height: 2, mipLevels: 3, bytes: 44 });
     expect(importedTextureExtent(1, 9, 4)).toEqual({ width: 1, height: 4, mipLevels: 3, bytes: 28 });

@@ -1,4 +1,6 @@
-/** Optional glTF inspection path. No virtual geometry, imported GI or scene-traced reflection participation. */
+import type { ImportedIndirectOptions, ImportedIndirectProgress, ImportedIndirectReadback } from './imported-indirect-types.js';
+
+/** Optional glTF inspection path. No virtual geometry or scene-traced reflections. */
 export type ImportedVec3 = readonly [number, number, number];
 export type ImportedVec4 = readonly [number, number, number, number];
 export interface ImportedBounds { readonly min: ImportedVec3; readonly max: ImportedVec3; }
@@ -121,6 +123,8 @@ export interface ImportedSceneOptions {
   /** CPU data remains caller-owned and reusable; do not mutate it during scene creation. */
   readonly asset: ImportedAsset;
   readonly signal?: AbortSignal;
+  /** Opt-in static, single-material diffuse preview. Full-resolution accumulation has an explicit pixel budget. */
+  readonly indirect?: ImportedIndirectOptions;
 }
 /** Generated distant incident radiance. It has no scene visibility, GI, local reflections or interior occlusion. */
 export interface ImportedEnvironment {
@@ -131,6 +135,8 @@ export interface ImportedEnvironment {
   readonly rotationRadians?: number;
 }
 export interface ImportedControls {
+  /** Requires a scene created with indirect options. Disabling retains the matching direct-only baseline. */
+  readonly indirect?: { readonly enabled: boolean };
   /** Authored is the default. Relit changes only unlit materials to geometric-normal matte dielectric (roughness .65). */
   readonly shading?: 'authored' | 'relit';
   /** verticalFov is in radians. Camera motion retains reprojection history. */
@@ -150,6 +156,18 @@ export interface ImportedControls {
   readonly animation?: { readonly clipId: string | null; readonly timeSeconds: number; readonly loop: boolean };
 }
 export interface ImportedTelemetry {
+  readonly indirect?: {
+    readonly mode: 'progressive-diffuse';
+    /** Both enabled and disabled comparisons use no TAA, ambient fill or unoccluded environment illumination. */
+    readonly temporal: false;
+    readonly rasterAmbient: 'disabled';
+    readonly rasterEnvironment: 'disabled';
+    readonly progress: ImportedIndirectProgress;
+    /** Captured by waitForIdle, tagged with its own accumulation revision and submitted-frame count. */
+    readonly sampleCounters: ImportedIndirectReadback | null;
+    readonly estimatedPeakCpuBytes: number;
+    readonly preparedTraceGpuBytes: number;
+  };
   readonly sourceUrl: string;
   /** Conservative current visible bounds, including retained root motion and the optional ground. */
   readonly bounds: ImportedBounds;

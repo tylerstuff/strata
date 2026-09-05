@@ -185,7 +185,8 @@ describe('engine lifecycle', () => {
     const load = vi.spyOn(ImportedRenderer, 'create').mockResolvedValue(value as unknown as ImportedRendererType);
     const engine = await ready(); const abort = new AbortController(); const asset = {} as ImportedAsset;
     await engine.setScene({ renderer: 'imported', asset, signal: abort.signal });
-    expect(load).toHaveBeenCalledWith(fixture.device, 'bgra8unorm', expect.objectContaining({ asset, signal: expect.any(AbortSignal) }));
+    expect(load).toHaveBeenCalledWith(fixture.device, 'bgra8unorm', expect.objectContaining({ asset, signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ cpu: expect.any(Object), additionalResidentCpuBytes: 0 }));
     const controls = { imported: { animation: { clipId: 'test', timeSeconds: 0.25, loop: false } }, temporal: false };
     const frame = engine.render(controls);
     expect(value.encode.mock.calls[0]?.[5]).toEqual(controls);
@@ -215,6 +216,55 @@ describe('engine lifecycle', () => {
     result.resolve(late as unknown as ImportedRendererType); await rejected;
     expect(late.dispose).toHaveBeenCalledOnce();
     expect(engine.getTelemetry().imported).toBeUndefined();
+  });
+
+  it('waits for cancelled imported creation cleanup before reserving a replacement', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const first = deferred<ImportedRendererType>();
+    const next = { initialUploadBytes: 0, dispose: vi.fn() };
+    const load = vi.spyOn(ImportedRenderer, 'create').mockReturnValueOnce(first.promise).mockResolvedValueOnce(next as unknown as ImportedRendererType);
+    const engine = await ready();
+    const pending = engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'SCENE_LOAD_SUPERSEDED' });
+    await flushMicrotasks();
+    const replacement = engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset });
+    await flushMicrotasks(); await rejected;
+    expect(load).toHaveBeenCalledOnce();
+    expect(load.mock.calls[0]![2].signal!.aborted).toBe(true);
+    const late = { initialUploadBytes: 0, dispose: vi.fn() };
+    first.resolve(late as unknown as ImportedRendererType);
+    await replacement;
+    expect(load).toHaveBeenCalledTimes(2); expect(late.dispose).toHaveBeenCalledOnce();
+    engine.dispose(); expect(next.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('preflights progressive resize before changing canvas size and collects revision-tagged counters on idle', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const value = { hasIndirect: true, retainedCpuBytes: 1234, initialUploadBytes: 0, gpuBufferBytes: 0, gpuTextureBytes: 0,
+      validateSize: vi.fn((width: number) => { if (width > 1000) throw new StrataError('UNSUPPORTED_LIMIT', 'pixel budget'); }),
+      readIndirectProgress: vi.fn(async () => {}), dispose: vi.fn() };
+    vi.spyOn(ImportedRenderer, 'create').mockResolvedValue(value as unknown as ImportedRendererType);
+    const engine = await ready();
+    await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: {} });
+    const size = [fixture.canvas.width, fixture.canvas.height];
+    expect(() => engine.resize(1500, 500)).toThrow('pixel budget');
+    expect([fixture.canvas.width, fixture.canvas.height]).toEqual(size);
+    engine.resize(100, 100); expect([fixture.canvas.width, fixture.canvas.height]).toEqual([100, 100]);
+    await engine.waitForIdle(); expect(value.readIndirectProgress).toHaveBeenCalledOnce();
+    engine.dispose();
+  });
+
+  it('keeps a direct-only replacement behind the cancelled worker acknowledgement barrier', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const acknowledgement = deferred<void>();
+    vi.mocked(cpu.waitForStaticBvhIdle).mockReturnValueOnce(acknowledgement.promise);
+    const value = { initialUploadBytes: 0, dispose: vi.fn() };
+    const load = vi.spyOn(ImportedRenderer, 'create').mockResolvedValue(value as unknown as ImportedRendererType);
+    const engine = await ready();
+    const pending = engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset });
+    await flushMicrotasks(); expect(load).not.toHaveBeenCalled();
+    acknowledgement.resolve(); await pending;
+    expect(load).toHaveBeenCalledOnce(); engine.dispose();
   });
 
   it('reports missing browser WebGPU without touching the canvas or CPU', async () => {

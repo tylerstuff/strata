@@ -22,6 +22,42 @@ Origin offsets depend on original positions, triangle extent and representable f
 
 ## Integration and lifecycle
 
+The engine integration is explicitly selected at scene creation:
+
+```ts
+engine.resize(640, 360); // 230,400 physical pixels, within the default budget.
+await engine.setScene({ renderer: 'imported', asset, indirect: {} });
+engine.render({ imported: { lighting, indirect: { enabled: true } } });
+await engine.waitForIdle();
+const state = engine.getTelemetry().imported?.indirect;
+// Compare the same direct baseline without the accumulated indirect contribution.
+engine.render({ imported: { indirect: { enabled: false } } });
+```
+
+`indirect` accepts the effect's bounded `maxPixels`, `pixelBatch`, `maxSamples`,
+`maxVisits` and `seed` options. Admission checks the physical viewport before CPU
+preparation or material allocation, then checks it again before commitment in case
+the host resized during loading. Oversized later resizes reject before changing
+the canvas. The engine serializes imported creation and awaits worker cleanup even
+for a direct-only replacement after cancelled tracing. Memory preflight includes
+the previous imported scene's retained source buffers and the acknowledged WASM
+high-water mark. Prepared tracing arrays are released after upload; browser GC and
+driver residency are outside the payload estimate.
+
+The progressive scene always excludes raster ambient/environment terms and TAA,
+including while `indirect.enabled` is false. The requested environment remains the
+incident source for visibility-tested transport. Telemetry records those exclusions,
+the submitted accumulation revision and the preparation estimates. `waitForIdle`
+also collects revision-tagged sample counters; simultaneous calls share the pending
+readback. Counters from an older revision are never published as current. A ground
+presentation is rejected because it is absent from the tracing source. Recreate the
+scene without `indirect` to return to the ordinary imported rendering path.
+
+The integration is under validation; CPU orchestration checks and the static-house
+preparation result do not establish correct rendered house transport. No gallery GI
+control should be presented as accepted until the generated GPU checks and a fixed
+interior witness pass.
+
 `ImportedIndirectEffect` implements the existing `RasterGiProvider`. Root integration owns CPU preparation, material handles, controls and activation. It must disable raster TAA to provide an unjittered camera, zero ordinary ambient fill and exclude diffuse SH IBL while this effect is active. Interior correctness comparisons also keep specular IBL off. Both the GI-on and matched GI-off references need the same direct baseline. These exclusions prevent double counting or unoccluded fill from appearing through walls.
 
 `prepare()` and `compose()` encode work; the owner must call `submitted()` only after successful queue submission, or `cancelFrame()` on failure. Camera, resolution, lighting, environment and option changes reset accumulation. Enabling after a pause also resets it. A failed frame forces a reset before reuse. Composing adds only accumulated indirect radiance to the current direct HDR, preserving direct-light and texture detail.

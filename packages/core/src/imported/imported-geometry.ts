@@ -7,6 +7,7 @@ import { createImportedPoseEvaluator } from './imported-animation.js';
 import { importedMipmapShader, importedShader } from './imported-shaders.js';
 import { createEnvironmentResources, environmentTextureBytes, environmentUniform, environmentUniformBytes, snapshotEnvironment } from './imported-environment.js';
 import { estimateImportedTextureAllocation } from './imported-texture-plan.js';
+import type { ImportedIndirectMaterial } from './imported-indirect-types.js';
 export { importedTextureExtent } from './imported-texture-plan.js';
 
 const geometryBudget = 256 * 1024 * 1024;
@@ -101,7 +102,7 @@ function transformedBounds(bounds: ImportedBounds, matrices: Float32Array, offse
     addPoint(out, q);
   }
 }
-interface Material { buffer: GPUBuffer; textures: readonly GPUTexture[]; samplers: readonly GPUSampler[]; doubleSided: boolean; }
+interface Material { buffer: GPUBuffer; textures: readonly GPUTexture[]; samplers: readonly GPUSampler[]; doubleSided: boolean; definition: ImportedMaterial; }
 interface Owned { buffers: GPUBuffer[]; textures: GPUTexture[]; bufferBytes: number; textureBytes: number; initialUploadBytes: number; }
 const groundMaterial: ImportedMaterial = { name: 'Strata explicit ground', baseColorFactor: [.22, .22, .22, 1], metallicFactor: 0, roughnessFactor: .9, emissiveFactor: [0, 0, 0], emissiveStrength: 1, normalScale: 1, occlusionStrength: 1, alphaMode: 'OPAQUE', alphaCutoff: .5, doubleSided: false };
 function groundVertices(): Float32Array<ArrayBuffer> {
@@ -115,6 +116,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   private settings: Settings = snapshot({ lighting: importedDefaults.lighting }, importedDefaults);
   private lightDirty = false;
   private environmentDirty = false;
+  private indirectBaseline = false;
   private disposed = false;
   private current: CameraFrame | undefined;
   private light: Float32Array<ArrayBuffer> = new Float32Array(16);
@@ -243,7 +245,8 @@ export class ImportedGeometry implements RasterGeometryGroup {
       const materials = definitions.map(m => {
         const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), Number(Boolean(m.normalTexture)), Number(Boolean(m.unlit))]);
         if (data.byteLength !== materialBytes || !data.every(Number.isFinite)) fail('material factors must be finite.');
-        return { buffer: buffer('Strata imported material', data, 0x40), textures: roles(m).map((ref, role) => ref ? gpuImages.get(`${ref.image}/${role === 0 || role === 4}`)! : fallbacks[Number(role === 0 || role === 4)]!), samplers: roles(m).map(sampler), doubleSided: m.doubleSided };
+        return { buffer: buffer('Strata imported material', data, 0x40), textures: roles(m).map((ref, role) => ref ? gpuImages.get(`${ref.image}/${role === 0 || role === 4}`)! : fallbacks[Number(role === 0 || role === 4)]!), samplers: roles(m).map(sampler), doubleSided: m.doubleSided,
+          definition: { ...m, baseColorFactor: [...m.baseColorFactor] as const, emissiveFactor: [...m.emissiveFactor] as const } };
       });
       const palettes = initialPalettes.map((data, index) => ({ current: buffer(`Strata imported current palette ${index}`, data.length ? data : new Float32Array(16), 0x80),
         previous: buffer(`Strata imported previous palette ${index}`, data.length ? data : new Float32Array(16), 0x80), data: data.slice(), committed: data.slice() }));
@@ -288,6 +291,24 @@ export class ImportedGeometry implements RasterGeometryGroup {
   get gpuBufferBytes(): number { return this.disposed ? 0 : this.owned.bufferBytes; }
   get gpuTextureBytes(): number { return this.disposed ? 0 : this.owned.textureBytes; }
   get initialUploadBytes(): number { return this.owned.initialUploadBytes; }
+  /** Request settings retain the incident environment even when its unoccluded raster term is excluded. */
+  get lighting(): NonNullable<ImportedControls['lighting']> { return snapshot({}, this.settings).lighting; }
+  useIndirectBaseline(): void {
+    if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
+    this.indirectBaseline = true; this.lightDirty = true; this.environmentDirty = true;
+  }
+  /** Borrowed resources remain owned by this geometry. No allocation, decode or upload is repeated. */
+  borrowIndirectMaterial(index: number): ImportedIndirectMaterial {
+    if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
+    const resource = this.materials[index];
+    if (!Number.isInteger(index) || !resource || resource.definition.unlit || resource.definition.alphaMode !== 'OPAQUE') fail('indirect material must be a used lit OPAQUE material.');
+    const m = resource.definition;
+    return { baseColorTexture: resource.textures[0]!.createView(), baseSampler: resource.samplers[0]!,
+      metallicRoughnessTexture: resource.textures[1]!.createView(), metallicRoughnessSampler: resource.samplers[1]!,
+      emissiveTexture: resource.textures[4]!.createView(), emissiveSampler: resource.samplers[4]!,
+      baseColorFactor: [...m.baseColorFactor], metallicFactor: m.metallicFactor,
+      emissiveFactor: [...m.emissiveFactor], emissiveStrength: m.emissiveStrength, doubleSided: m.doubleSided };
+  }
   get telemetry(): ImportedTelemetry { return { ...this.summary,
     animation: this.pendingAnimation, bounds: this.visibleBounds, textures: this.textureRecords,
     shading: this.settings.shading ?? 'authored', environment: snapshotEnvironment(this.settings.lighting.environment) }; }
@@ -338,11 +359,11 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (!owner) return 0;
     let uploadBytes = 0;
     if (this.lightDirty) {
-      const data = new Float32Array(lightBytes / 4); data.set(this.settings.lighting.directionToLight); data.set(this.settings.lighting.color.map(v => v * this.settings.lighting.intensity), 4); data.set(this.settings.lighting.ambient, 8);
+      const data = new Float32Array(lightBytes / 4); data.set(this.settings.lighting.directionToLight); data.set(this.settings.lighting.color.map(v => v * this.settings.lighting.intensity), 4); data.set(this.indirectBaseline ? [0, 0, 0] : this.settings.lighting.ambient, 8);
       this.device.queue.writeBuffer(this.lightBuffer, 0, data); this.lightDirty = false; uploadBytes += lightBytes;
     }
     if (this.environmentDirty) {
-      this.device.queue.writeBuffer(this.environment.uniform, 0, environmentUniform(snapshotEnvironment(this.settings.lighting.environment), this.settings.shading ?? 'authored'));
+      this.device.queue.writeBuffer(this.environment.uniform, 0, environmentUniform(this.indirectBaseline ? null : snapshotEnvironment(this.settings.lighting.environment), this.settings.shading ?? 'authored'));
       this.environmentDirty = false; uploadBytes += environmentUniformBytes;
     }
     if (this.meshes.some(mesh => mesh.mode !== 'static')) for (const palette of this.palettes) {

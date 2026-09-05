@@ -129,6 +129,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   }
 
   let pendingSceneAbort: AbortController | undefined;
+  // Serialize imported creation so a cancelled CPU preparation finishes cleanup
+  // before a replacement copies the same large source or reserves another job.
+  let importedBuildTail: Promise<void> = Promise.resolve();
   let profiler: GpuProfiler | undefined;
   let submittedFrames = 0;
   let totalUploadBytes = 0;
@@ -350,6 +353,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       resize(width, height) {
         assertReady();
         validateSize(width, height, info.maxTextureDimension2D);
+        if (scene?.kind === 'imported' && scene.value.hasIndirect) scene.value.validateSize(width, height);
         if (canvas.width !== width) canvas.width = width;
         if (canvas.height !== height) canvas.height = height;
       },
@@ -363,6 +367,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         // or superseding an already valid pending request.
         const snapshot = sceneOptions === null ? null : sceneOptions.renderer === 'authored-boxes'
           ? { ...sceneOptions, scene: validateAuthoredBoxScene(sceneOptions.scene) } : { ...sceneOptions };
+        if (snapshot?.renderer === 'imported' && snapshot.indirect !== undefined) {
+          if (!snapshot.indirect || typeof snapshot.indirect !== 'object' || Array.isArray(snapshot.indirect)) throw new StrataError('INVALID_OPTIONS', 'Imported indirect options must be an object.');
+          snapshot.indirect = { ...snapshot.indirect };
+        }
         const userSignal = snapshot?.renderer === 'virtual' || snapshot?.renderer === 'integrated' || snapshot?.renderer === 'authored-boxes' || snapshot?.renderer === 'imported'
           ? snapshot.signal : undefined;
         if (userSignal !== undefined && (!userSignal || typeof userSignal.aborted !== 'boolean'
@@ -414,7 +422,22 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           } else if (snapshot!.renderer === 'imported') {
             const { ImportedRenderer } = await import('./imported/imported-renderer.js');
             assertCurrentRequest();
-            return { kind: 'imported', value: await ImportedRenderer.create(ownedDevice, format, { ...snapshot!, signal: requestAbort.signal }) };
+            const preceding = importedBuildTail;
+            let release!: () => void;
+            importedBuildTail = new Promise<void>(resolve => { release = resolve; });
+            try {
+              await preceding; assertCurrentRequest();
+              // Even a direct-only replacement must wait for a cancelled tracing
+              // job to release its worker inputs before decoding new textures.
+              await cpu!.waitForStaticBvhIdle(); assertCurrentRequest();
+              const additionalResidentCpuBytes = (scene?.kind === 'imported' ? scene.value.retainedCpuBytes ?? 0 : 0)
+                + [...retiredScenes].reduce((sum, retired) => sum + (retired.kind === 'imported' ? retired.value.retainedCpuBytes ?? 0 : 0), 0);
+              const value = await ImportedRenderer.create(ownedDevice, format, { ...snapshot!, signal: requestAbort.signal },
+                { cpu: cpu!, width: canvas.width, height: canvas.height, additionalResidentCpuBytes });
+              try { if (value.hasIndirect) value.validateSize(canvas.width, canvas.height); }
+              catch (cause) { value.dispose(); throw cause; }
+              return { kind: 'imported', value };
+            } finally { release(); }
           } else if (snapshot!.renderer === 'integrated') {
             const { IntegratedRenderer } = await import('./integrated/integrated-renderer.js');
             assertCurrentRequest();
@@ -473,7 +496,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         }
         if (scene?.kind === 'imported' && (requestedControls.gi !== undefined || requestedControls.reflections !== undefined
           || (requestedControls.debugView !== undefined && !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'].includes(requestedControls.debugView)))) {
-          throw new StrataError('UNSUPPORTED_FEATURE', 'Imported scenes support raster diagnostics without GI or traced reflections.');
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Imported scenes use raster diagnostics and their own optional indirect controls; room GI and traced-reflection controls are unsupported.');
         }
         if (scene?.kind === 'authored-boxes') {
           if (requestedControls.temporal === true || requestedControls.gi !== undefined || requestedControls.reflections !== undefined
@@ -589,6 +612,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         try {
           await Promise.race([device!.queue.onSubmittedWorkDone(), deadline]);
           assertReady();
+          if (scene?.kind === 'imported' && scene.value.hasIndirect) {
+            await Promise.race([scene.value.readIndirectProgress(), deadline]);
+            assertReady();
+          }
         } catch (cause) {
           assertReady();
           if (cause instanceof StrataError) throw cause;

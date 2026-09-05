@@ -357,8 +357,9 @@ export class RasterRenderer {
     if (this.disposed) return;
     this.disposed = true;
     this.temporal.dispose();
-    for (const pair of this.resources.geometryPipelines) pair.provider?.dispose();
+    // Indirect providers may borrow material views owned by geometry.
     this.gi?.dispose();
+    for (const pair of this.resources.geometryPipelines) pair.provider?.dispose();
     for (const resource of [...this.resources.buffers, ...this.resources.textures, ...(this.targets?.textures ?? [])]) resource.destroy();
     this.targets = undefined;
     this.previousCamera = undefined;
