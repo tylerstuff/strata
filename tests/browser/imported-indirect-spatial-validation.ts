@@ -436,6 +436,7 @@ export async function validateImportedSpatial() {
       const group = device.createBindGroup({ layout: group1Layout, entries: [nb, tb, vb, ib, states, counters, guides].map((b, binding) => ({ binding, resource: { buffer: b } })) });
       return { pipeline, states, counters, guides, group };
     });
+    let traceSweepNumber = 0;
     async function traceSweep(clearDepth: boolean) {
       const each = 64 * 32 + 16 + 16 + 64 * 32, readback = buffer('Trace comparison exact word readback', each * 2, 0x01 | 0x08);
       try {
@@ -452,15 +453,33 @@ export async function validateImportedSpatial() {
         device.queue.submit([encoder.finish()]); await bounded(readback.mapAsync(1), 'Actual ordinary/optional trace comparison');
         const data = readback.getMappedRange().slice(0); readback.unmap();
         const ordinary = new Uint32Array(data, 0, (64 * 32 + 16) / 4), optional = new Uint32Array(data, each, (64 * 32 + 16) / 4);
+        const guideBytes = data.slice(each + 64 * 32 + 16), guideView = new DataView(guideBytes);
+        // Retain the actual words before parity or radiometric assertions. An
+        // immutable failed report must contain the evidence needed to distinguish
+        // material/fixture defects from harmless interpolation rounding.
+        cases.push({ name: 'actual-trace-sweep-readback', sweep: ++traceSweepNumber,
+          ordinaryStateAndCounterWords: [...ordinary], optionalStateAndCounterWords: [...optional],
+          optionalGuideWords: [...new Uint32Array(guideBytes)],
+          decoded: Array.from({ length: 64 }, (_, i) => ({ pixel: [i % 8, Math.floor(i / 8)],
+            sum: [0, 1, 2].map(c => float(optional[i * 8 + c]!)), samples: optional[i * 8 + 3],
+            attempts: optional[i * 8 + 4], status: optional[i * 8 + 5],
+            rho: [0, 1, 2].map(c => guideView.getFloat32(16 + i * 32 + c * 4, true)),
+            identity: guideView.getUint32(16 + i * 32 + 12, true),
+            point: [0, 1, 2].map(c => guideView.getFloat32(16 + i * 32 + 16 + c * 4, true)),
+            footprint: guideView.getFloat32(16 + i * 32 + 28, true) })),
+          expectedAnalyticRho: [.25, .5, .75], expectedAnalyticFirstSum: [.125, .5, 1.5],
+          sourceSha256: await sha(sourceTriangles), frameWords: [...fw] });
         require(ordinary.every((word, i) => word === optional[i]), 'Optional guide/integer storage changed raw estimator words/counters.');
-        return { words: [...optional], guideBytes: data.slice(each + 64 * 32 + 16), sourceHash: await sha(sourceTriangles) };
+        return { words: [...optional], guideBytes, sourceHash: await sha(sourceTriangles) };
       } finally { removeBuffer(readback); }
     }
     const firstTrace = await traceSweep(true), firstGuide = new DataView(firstTrace.guideBytes);
     for (let i = 0; i < 64; i++) {
       require(firstTrace.words[i * 8 + 3] === 1 && firstTrace.words[i * 8 + 4] === 1 && firstTrace.words[i * 8 + 5] === 0, 'Trace comparison did not complete exactly one sample.');
-      [.125, .5, 1.5].forEach((v, c) => require(firstTrace.words[i * 8 + c] === bits(v), 'Independent constant-environment rho*L oracle failed.'));
-      [.25, .5, .75].forEach((v, c) => require(firstGuide.getUint32(16 + i * 32 + c * 4, true) === bits(v), 'Guide did not retain exact source rho bits.'));
+      [.125, .5, 1.5].forEach((v, c) => require(firstTrace.words[i * 8 + c] === bits(v),
+        `Independent constant-environment rho*L oracle failed at pixel${i}, channel${c}: actual=${float(firstTrace.words[i * 8 + c]!)} word=${firstTrace.words[i * 8 + c]}, expected=${v} word=${bits(v)}.`));
+      [.25, .5, .75].forEach((v, c) => require(firstGuide.getUint32(16 + i * 32 + c * 4, true) === bits(v),
+        `Guide rho differs at pixel${i}, channel${c}: actual=${firstGuide.getFloat32(16 + i * 32 + c * 4, true)} word=${firstGuide.getUint32(16 + i * 32 + c * 4, true)}, expected=${v} word=${bits(v)}.`));
       const identity = firstGuide.getUint32(16 + i * 32 + 12, true);
       require((identity & 0xfff00000) === 0x00100000 && (identity & 0xfffff) < 2, 'Guide did not store valid packed identity/original orientation.');
       const x = i % 8 - 3.5, y = 3.5 - Math.floor(i / 8);
