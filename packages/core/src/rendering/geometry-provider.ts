@@ -6,6 +6,8 @@ export interface RasterGeometryProvider {
   readonly shaderSource: string;
   readonly vertexEntryPoint: string;
   readonly shadowEntryPoint: string;
+  readonly fragmentEntryPoint?: string;
+  readonly usesMaterialTextures?: boolean;
   readonly halfExtent: number;
   readonly selectionPass: boolean;
   readonly vertexBuffers?: GPUVertexBufferLayout[];

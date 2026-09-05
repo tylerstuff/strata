@@ -4,14 +4,15 @@ import { GpuProfiler } from './profiling/gpu-profiler.js';
 import type { SceneRenderer } from './rendering/scene-renderer.js';
 import type { RasterRenderer } from './rendering/raster-renderer.js';
 import type { VirtualRenderer } from './geometry/virtual-renderer.js';
+import type { GiRenderer } from './gi/gi-renderer.js';
 import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics, RenderOptions } from './types.js';
 
-type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer };
+type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer } | { kind: 'gi'; value: GiRenderer };
 
 // Module evaluation is intentionally safe without navigator, document or Worker.
 const ownedCanvases = new WeakSet<HTMLCanvasElement>();
 const defaultTimeoutMs = 30_000;
-const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage'] as const;
+const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility'] as const;
 const defaultRenderOptions: RenderOptions = Object.freeze({});
 
 function validateRenderOptions(options: RenderOptions): void {
@@ -313,6 +314,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         droppedGpuSamples: profiler?.droppedSamples ?? 0,
         gpuErrorCount, lastGpuError,
         ...(scene?.kind === 'virtual' ? { geometry: scene.value.geometryTelemetry } : {}),
+        ...(scene?.kind === 'gi' ? { gi: scene.value.giTelemetry } : {}),
       };
     }
 
@@ -328,8 +330,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       async setScene(sceneOptions) {
         assertReady();
         if (sceneOptions !== null && (!sceneOptions || typeof sceneOptions !== 'object' || Array.isArray(sceneOptions)
-          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual'].includes(sceneOptions.renderer)))) {
-          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse, raster or virtual, or null to clear.');
+          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual', 'gi'].includes(sceneOptions.renderer)))) {
+          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse, raster, virtual or gi, or null to clear.');
         }
         if (sceneOptions?.renderer === 'virtual' && sceneOptions.signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
         const generation = ++sceneGeneration;
@@ -360,6 +362,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             const { VirtualRenderer } = await import('./geometry/virtual-renderer.js');
             assertCurrentRequest();
             next = { kind: 'virtual', value: await VirtualRenderer.create(ownedDevice, format, { ...snapshot, signal: requestAbort.signal }) };
+          } else if (snapshot.renderer === 'gi') {
+            const { GiRenderer } = await import('./gi/gi-renderer.js');
+            assertCurrentRequest();
+            next = { kind: 'gi', value: await GiRenderer.create(ownedDevice, format, snapshot) };
           } else if (snapshot.renderer === 'raster') {
             const { RasterRenderer } = await import('./rendering/raster-renderer.js');
             assertCurrentRequest();
@@ -436,7 +442,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           device!.queue.submit([encoder.finish()]);
           if (scene && scene.kind !== 'diffuse') forceRasterCameraCut = false;
           submittedFrames++;
-          if (scene?.kind === 'virtual') scene.value.submitted(frameId);
+          if (scene?.kind === 'virtual' || scene?.kind === 'gi') scene.value.submitted(frameId);
           if (timing) profiler!.submitted(timing);
           const stats = telemetry();
           const metrics: FrameMetrics = {
@@ -447,12 +453,13 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             wasmMemoryBytes: stats.wasmMemoryBytes,
             triangleCountSourceFrameId: scene?.kind === 'virtual' ? scene.value.geometryTelemetry.sourceFrameId : frameId,
             ...(stats.geometry ? { geometry: stats.geometry } : {}),
+            ...(stats.gi ? { gi: stats.gi } : {}),
           };
           return metrics;
         } catch (cause) {
           // Encoding can advance ping-pong histories before a later pass or submission fails.
           forceRasterCameraCut = true;
-          if (scene?.kind === 'virtual') scene.value.cancelFrame();
+          if (scene?.kind === 'virtual' || scene?.kind === 'gi') scene.value.cancelFrame();
           if (timing) profiler!.cancel(timing);
           throw new StrataError('RENDER_FAILED', 'WebGPU frame submission failed.', { cause });
         }

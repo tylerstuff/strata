@@ -1,6 +1,6 @@
 # Runtime foundation
 
-The package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, diffuse/PBR rendering, bounded static-terrain streaming, CPU/GPU telemetry, physical-pixel resizing, and disposal. Indirect lighting, general imported virtual geometry, game systems and the editor remain planned. See [the raster guide](raster.md) for PBR and [the virtual geometry guide](virtual-geometry.md) for the restricted cooked-terrain path. The final graphics performance target is unverified.
+The package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, diffuse/PBR rendering, bounded static-terrain streaming, experimental two-room world-space GI, CPU/GPU telemetry, physical-pixel resizing, and disposal. General imported virtual geometry, integrated lighting, reflections, game systems and the editor remain planned. See [the raster guide](raster.md), [virtual geometry guide](virtual-geometry.md) and [GI guide](gi.md) for each restricted scene path. The final graphics performance target is unverified.
 
 ## Build and run
 
@@ -51,6 +51,8 @@ The application owns the canvas element, its CSS layout, and its animation/resiz
 
 Initialization failures release partially created resources. A device request that resolves after cancellation is destroyed when it arrives. Aborting the initialization signal after successful creation does not dispose a running engine; call `dispose()` explicitly.
 
+`setScene({ renderer: 'gi', probesPerUpdate: 32, raysPerProbe: 64 })` creates the shared two-room raster/trace fixture. `render({ gi: { doorOpen: false, lightIntensity: 1 } })` patches its persistent world state. Changes invalidate the world cache and temporal history; camera cuts reset only screen history. `gi.enabled: false` pauses tracing/composition while retaining owned allocations. This experiment has a small exact triangle BVH built/refitted in TypeScript; its 132-triangle CPU work does not justify a WASM job boundary. GPU tracing, directional probe updates and shading run in WGSL. Debug views and per-frame `gi` telemetry expose budgets and epochs, with unmeasured GPU quantities explicitly null.
+
 `engine.info` describes the selected canvas format, enabled features, texture dimension limit, and CPU ABI/linear-memory size. WASM linear-memory bytes are not total browser memory or GPU memory.
 
 ## Device loss and errors
@@ -61,7 +63,7 @@ Device loss ends the current engine's usable lifetime. It releases the GPU confi
 
 ## Asset delivery and the CPU boundary
 
-The distribution contains `index.js`, TypeScript declarations, `worker.js`, and `strata_runtime.wasm`. Default URLs are module-relative, including when installed as a package. The package is tested through a production Vite build and a plain HTML ES-module import. Other bundlers need equivalent support for module workers and static `new URL(..., import.meta.url)` assets.
+The distribution contains `index.js`, TypeScript declarations, `worker.js`, `strata_runtime.wasm`, and ESM chunks for optional renderers/shared code. Publish or copy the complete `dist` directory: renderer modules load on first use, so copying only `index.js` is insufficient. The default engine/diffuse path does not fetch the GI renderer. Default worker/WASM URLs are module-relative, including when installed as a package. The package is tested through a production Vite build and a plain HTML ES-module import. Other bundlers need equivalent support for dynamic ESM imports, module workers and static `new URL(..., import.meta.url)` assets.
 
 Keep the worker same-origin with the page. Applications with a custom asset pipeline may set `workerUrl` and `wasmUrl`; relative overrides resolve against the document URL. Preserve the worker/WASM version pairing. A cross-origin WASM URL also needs a CORS response. Serving WASM as `application/wasm` is recommended, but the initial byte-buffer loader does not depend on that MIME type.
 

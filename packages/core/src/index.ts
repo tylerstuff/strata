@@ -5,4 +5,5 @@ export type {
   CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry,
   FrameMetrics, GpuTiming, ProceduralSceneOptions, RasterControls, RenderOptions,
   SceneOptions, VirtualSceneOptions, GeometryTelemetry, GeometryMode,
+  GiSceneOptions, GiControls, GiTelemetry,
 } from './types.js';

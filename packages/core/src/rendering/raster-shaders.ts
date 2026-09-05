@@ -176,6 +176,9 @@ fn toneMap(value: vec3f) -> vec3f {
     case 5u: { color = vec3f(clamp(velocity.xy * 64.0 + 0.5, vec2f(0.0), vec2f(1.0)), 0.5); }
     case 6u: { color = vec3f(mat.a, surface.a, 0.0); }
     case 7u, 8u, 9u, 10u: { color = raw.rgb; }
+    // Display gain makes weak transport visible in the labelled indirect-only diagnostic.
+    case 11u: { color = select(vec3f(0.0), linearToSrgb(toneMap(textureLoad(resolved, pixel, 0).rgb * 20.0)), settings.padding != 0u); }
+    case 12u, 13u, 14u, 15u: { color = select(vec3f(0.0), textureLoad(resolved, pixel, 0).rgb, settings.padding != 0u); }
     default: { color = linearToSrgb(toneMap(textureLoad(resolved, pixel, 0).rgb)); }
   }
   return vec4f(color, 1.0);

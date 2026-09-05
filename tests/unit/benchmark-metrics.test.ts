@@ -51,5 +51,32 @@ describe('benchmark measurements', () => {
     expect(() => normalizeOptions({ ...options, pixelError: 0 })).toThrow();
     expect(() => normalizeOptions({ ...options, pageLoadDelayMs: Infinity })).toThrow();
     expect(() => normalizeOptions({ ...options, poolBytes: 1 })).toThrow();
+    expect(normalizeOptions({ ...options, instanceCount: 512 }).instanceCount).toBe(0);
+  });
+
+  it('normalizes the fixed GI scene independently of instancing and temporal filtering', () => {
+    const options = normalizeOptions({ renderer: 'gi', instanceCount: 512 });
+    expect(options).toMatchObject({ instanceCount: 0, seed: 1337, cameraMode: 'overview', giEnabled: true,
+      probesPerUpdate: 32, raysPerProbe: 64, giScenario: 'door-light' });
+    expect(normalizeOptions({ renderer: 'gi', giEnabled: false, giScenario: 'static', cameraMode: 'receiver', temporal: false }))
+      .toMatchObject({ instanceCount: 0, giEnabled: false, giScenario: 'static', cameraMode: 'receiver', temporal: false });
+    for (const [probesPerUpdate, raysPerProbe] of [[1, 16], [127, 17], [128, 128]] as const) {
+      expect(normalizeOptions({ renderer: 'gi', probesPerUpdate, raysPerProbe }))
+        .toMatchObject({ probesPerUpdate, raysPerProbe });
+    }
+  });
+
+  it('rejects unsupported GI states and budgets before capture', () => {
+    expect(() => normalizeOptions({ renderer: 'gi', seed: 1 })).toThrow(/fixed probe seed/);
+    expect(() => normalizeOptions({ renderer: 'gi', cameraMode: 'coverage' })).toThrow(/camera\/scenario/);
+    for (const probesPerUpdate of [0, 129, 1.5, Infinity]) {
+      expect(() => normalizeOptions({ renderer: 'gi', probesPerUpdate })).toThrow(/probe\/ray budget/);
+    }
+    for (const raysPerProbe of [15, 129, 16.5, Number.NaN]) {
+      expect(() => normalizeOptions({ renderer: 'gi', raysPerProbe })).toThrow(/probe\/ray budget/);
+    }
+    // Browser callers are JavaScript and can pass values outside the TypeScript surface.
+    expect(() => normalizeOptions({ renderer: 'gi', giEnabled: 'false' as unknown as boolean })).toThrow();
+    expect(() => normalizeOptions({ renderer: 'gi', giScenario: 'unknown' as 'static' })).toThrow();
   });
 });
