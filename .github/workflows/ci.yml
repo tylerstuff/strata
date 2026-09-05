@@ -43,6 +43,16 @@ jobs:
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
+      - name: Validate raster shaders, temporal rejection, and resource transitions
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:raster
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate raster benchmark reports
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke -- --renderer raster
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
       - name: Save consumer test artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

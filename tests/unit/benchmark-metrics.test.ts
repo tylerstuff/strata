@@ -30,6 +30,8 @@ describe('benchmark measurements', () => {
     expect(() => normalizeOptions({ durationSeconds: 0 })).toThrow();
     expect(() => normalizeOptions({ seed: -1 })).toThrow();
     expect(() => normalizeOptions({ instanceCount: 0 })).toThrow();
+    expect(normalizeOptions({ renderer: 'raster', temporal: false }).temporal).toBe(false);
+    expect(() => normalizeOptions({ renderer: 'diffuse', debugView: 'depth' })).toThrow();
   });
 
   it('summarizes a long high-refresh capture without spreading frames onto the call stack', () => {

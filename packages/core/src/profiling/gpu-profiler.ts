@@ -10,44 +10,56 @@ interface Slot {
   readonly resolveBuffer: GPUBuffer;
   readonly readBuffer: GPUBuffer;
   readonly timestampWrites: GPURenderPassTimestampWrites;
+  readonly passWrites: readonly GPURenderPassTimestampWrites[];
+  readonly timestamps: Record<string, GPURenderPassTimestampWrites>;
+  readonly passNames: string[];
   busy: boolean;
   frameId: number;
-  pass: string;
+  passCount: number;
   pending: Promise<void> | null;
 }
 
 /** One bounded readback ring. Mapping never blocks normal frame submission. */
 export class GpuProfiler {
   private readonly slots: Slot[] = [];
-  private readonly results: GpuTiming[] = [];
+  private readonly results: GpuTiming[][] = [];
+  private resultCount = 0;
   private disposed = false;
   private dropped = 0;
   readonly allocatedBufferBytes: number;
 
-  constructor(device: GPUDevice, readonly capacity = 4, private readonly resultCapacity = 256) {
-    if (!Number.isInteger(capacity) || capacity < 1 || !Number.isInteger(resultCapacity) || resultCapacity < 1) {
+  constructor(
+    device: GPUDevice, readonly capacity = 4, private readonly resultCapacity = 256,
+    private readonly maxPasses = 4,
+  ) {
+    if (!Number.isInteger(capacity) || capacity < 1 || !Number.isInteger(resultCapacity) || resultCapacity < 1
+      || !Number.isInteger(maxPasses) || maxPasses < 1 || maxPasses > 32) {
       throw new RangeError('GPU profiling capacities must be positive integers.');
     }
-    this.allocatedBufferBytes = capacity * 32;
+    this.allocatedBufferBytes = capacity * maxPasses * 32;
     try {
       for (let index = 0; index < capacity; index++) {
         let querySet: GPUQuerySet | undefined;
         let resolveBuffer: GPUBuffer | undefined;
         let readBuffer: GPUBuffer | undefined;
         try {
-          querySet = device.createQuerySet({ label: `Strata timestamps ${index}`, type: 'timestamp', count: 2 });
+          querySet = device.createQuerySet({ label: `Strata timestamps ${index}`, type: 'timestamp', count: maxPasses * 2 });
           resolveBuffer = device.createBuffer({
-            label: `Strata timestamp resolve ${index}`, size: 16,
+            label: `Strata timestamp resolve ${index}`, size: maxPasses * 16,
             usage: bufferUsage.QUERY_RESOLVE | bufferUsage.COPY_SRC,
           });
           readBuffer = device.createBuffer({
-            label: `Strata timestamp readback ${index}`, size: 16,
+            label: `Strata timestamp readback ${index}`, size: maxPasses * 16,
             usage: bufferUsage.COPY_DST | bufferUsage.MAP_READ,
           });
+          const passWrites = Array.from({ length: maxPasses }, (_, passIndex) => ({
+            querySet: querySet!, beginningOfPassWriteIndex: passIndex * 2, endOfPassWriteIndex: passIndex * 2 + 1,
+          }));
           this.slots.push({
             querySet, resolveBuffer, readBuffer,
-            timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
-            busy: false, frameId: 0, pass: '', pending: null,
+            timestampWrites: passWrites[0]!, passWrites,
+            timestamps: Object.create(null) as Record<string, GPURenderPassTimestampWrites>,
+            passNames: [], busy: false, frameId: 0, passCount: 0, pending: null,
           });
         } catch (error) {
           readBuffer?.destroy();
@@ -63,65 +75,93 @@ export class GpuProfiler {
   }
 
   get droppedSamples(): number { return this.dropped; }
-  get pendingSamples(): number { return this.slots.filter((slot) => slot.busy).length; }
+  get pendingSamples(): number {
+    return this.slots.reduce((count, slot) => count + (slot.busy ? slot.passCount : 0), 0);
+  }
 
-  begin(frameId: number, pass: string): Slot | null {
+  begin(frameId: number, passes: string | readonly string[]): Slot | null {
     if (this.disposed) return null;
+    const names = typeof passes === 'string' ? [passes] : passes;
+    if (!names.length || names.length > this.maxPasses
+      || names.some((name, index) => !name.length || names.indexOf(name) !== index)) {
+      throw new StrataError('INVALID_OPTIONS', `GPU profiling needs 1–${this.maxPasses} unique pass names.`);
+    }
     const slot = this.slots.find((candidate) => !candidate.busy);
     if (!slot) {
-      this.dropped++;
+      this.dropped += names.length;
       return null;
     }
+    for (const name of slot.passNames) delete slot.timestamps[name];
+    slot.passNames.length = 0;
+    names.forEach((name, index) => {
+      slot.passNames.push(name);
+      slot.timestamps[name] = slot.passWrites[index]!;
+    });
     slot.busy = true;
     slot.frameId = frameId;
-    slot.pass = pass;
+    slot.passCount = names.length;
     return slot;
   }
 
   resolve(encoder: GPUCommandEncoder, slot: Slot): void {
-    encoder.resolveQuerySet(slot.querySet, 0, 2, slot.resolveBuffer, 0);
-    encoder.copyBufferToBuffer(slot.resolveBuffer, 0, slot.readBuffer, 0, 16);
+    encoder.resolveQuerySet(slot.querySet, 0, slot.passCount * 2, slot.resolveBuffer, 0);
+    encoder.copyBufferToBuffer(slot.resolveBuffer, 0, slot.readBuffer, 0, slot.passCount * 16);
   }
 
   /** Call only after submitting the command buffer that resolves this slot. */
   submitted(slot: Slot): void {
     const complete = async (): Promise<void> => {
       try {
-        await slot.readBuffer.mapAsync(mapRead, 0, 16);
+        await slot.readBuffer.mapAsync(mapRead, 0, slot.passCount * 16);
         if (this.disposed) return;
-        const values = new BigUint64Array(slot.readBuffer.getMappedRange(0, 16));
-        const start = values[0]!;
-        const end = values[1]!;
-        if (end < start) {
-          this.dropped++;
+        const values = new BigUint64Array(slot.readBuffer.getMappedRange(0, slot.passCount * 16));
+        const frame: GpuTiming[] = [];
+        for (let index = 0; index < slot.passCount; index++) {
+          const start = values[index * 2]!;
+          const end = values[index * 2 + 1]!;
+          if (start === undefined || end === undefined || end < start) {
+            this.dropped += slot.passCount;
+            return;
+          }
+          // WebGPU timestamps are nanoseconds. Quantized zero remains a valid measurement.
+          frame.push({ frameId: slot.frameId, pass: slot.passNames[index]!, gpuMs: Number(end - start) / 1_000_000 });
+        }
+        // Keep frame groups atomic so queue pressure cannot yield misleading partial sums.
+        if (frame.length > this.resultCapacity) {
+          this.dropped += frame.length;
           return;
         }
-        // WebGPU timestamps are nanoseconds. Zero is valid after browser quantization.
-        const gpuMs = Number(end - start) / 1_000_000;
-        if (this.results.length >= this.resultCapacity) {
-          this.results.shift();
-          this.dropped++;
+        while (this.resultCount + frame.length > this.resultCapacity) {
+          const removed = this.results.shift()!;
+          this.resultCount -= removed.length;
+          this.dropped += removed.length;
         }
-        this.results.push({ frameId: slot.frameId, pass: slot.pass, gpuMs });
+        this.results.push(frame);
+        this.resultCount += frame.length;
       } catch {
-        if (!this.disposed) this.dropped++;
+        if (!this.disposed) this.dropped += slot.passCount;
       } finally {
         try { slot.readBuffer.unmap(); } catch { /* The device may already be destroyed. */ }
         slot.busy = false;
         slot.pending = null;
       }
     };
-    slot.pending = complete();
+    const pending = complete();
+    // A synchronous mapAsync exception can complete cleanup before assignment.
+    if (slot.busy) slot.pending = pending;
   }
 
   cancel(slot: Slot): void {
     if (slot.busy && !slot.pending) {
       slot.busy = false;
-      this.dropped++;
+      this.dropped += slot.passCount;
     }
   }
 
-  drain(): GpuTiming[] { return this.results.splice(0); }
+  drain(): GpuTiming[] {
+    this.resultCount = 0;
+    return this.results.splice(0).flat();
+  }
 
   /** End-of-capture synchronization; intentionally absent from the render path. */
   async flush(timeoutMs = 5000): Promise<void> {
@@ -146,7 +186,7 @@ export class GpuProfiler {
     if (this.disposed) return;
     this.disposed = true;
     for (const slot of this.slots) {
-      if (slot.busy) this.dropped++;
+      if (slot.busy) this.dropped += slot.passCount;
       slot.busy = false;
       try { slot.readBuffer.destroy(); } catch { /* Continue releasing other slots. */ }
       try { slot.resolveBuffer.destroy(); } catch { /* Continue releasing other slots. */ }

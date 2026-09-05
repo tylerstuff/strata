@@ -189,6 +189,13 @@
             "null"
           ],
           "minimum": 0
+        },
+        "gpuPasses": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          }
         }
       }
     },

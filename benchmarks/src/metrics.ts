@@ -33,6 +33,7 @@ export interface FrameSample {
   frameIntervalMs: number;
   cpuSubmissionMs: number;
   gpuMs: number | null;
+  gpuPasses?: Record<string, number>;
   drawCalls: number;
   dispatchCalls: number;
   triangles: number;
@@ -65,6 +66,9 @@ export interface BenchmarkOptions {
   durationSeconds: number;
   seed: number;
   instanceCount: number;
+  renderer: 'diffuse' | 'raster';
+  temporal: boolean;
+  debugView: 'final' | 'direct' | 'shadow' | 'depth' | 'normal' | 'motion' | 'material';
   mode: 'performance' | 'sustained' | 'smoke';
   metadata: Record<string, unknown>;
 }
@@ -77,6 +81,9 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     durationSeconds: input.durationSeconds ?? 60,
     seed: input.seed ?? 1337,
     instanceCount: input.instanceCount ?? 512,
+    renderer: input.renderer ?? 'diffuse',
+    temporal: input.temporal ?? true,
+    debugView: input.debugView ?? 'final',
     mode: input.mode ?? 'performance',
     metadata: input.metadata ?? {},
   };
@@ -92,5 +99,10 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     throw new RangeError('Use a uint32 seed and 1–16384 instances.');
   }
   if (!['performance', 'sustained', 'smoke'].includes(result.mode)) throw new RangeError('Unknown benchmark mode.');
+  if (!['diffuse', 'raster'].includes(result.renderer) || typeof result.temporal !== 'boolean'
+    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'].includes(result.debugView)) {
+    throw new RangeError('Unknown renderer, temporal setting, or debug view.');
+  }
+  if (result.renderer === 'diffuse' && result.debugView !== 'final') throw new RangeError('Debug views require the raster renderer.');
   return result;
 }

@@ -2,11 +2,25 @@ import { StrataError } from './errors.js';
 import { initializeCpuRuntime } from './internal/cpu-runtime.js';
 import { GpuProfiler } from './profiling/gpu-profiler.js';
 import type { SceneRenderer } from './rendering/scene-renderer.js';
-import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics } from './types.js';
+import type { RasterRenderer } from './rendering/raster-renderer.js';
+import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics, RenderOptions } from './types.js';
+
+type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer };
 
 // Module evaluation is intentionally safe without navigator, document or Worker.
 const ownedCanvases = new WeakSet<HTMLCanvasElement>();
 const defaultTimeoutMs = 30_000;
+const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'] as const;
+const defaultRenderOptions: RenderOptions = Object.freeze({});
+
+function validateRenderOptions(options: RenderOptions): void {
+  if (!options || typeof options !== 'object' || Array.isArray(options)
+    || (options.temporal !== undefined && typeof options.temporal !== 'boolean')
+    || (options.cameraCut !== undefined && typeof options.cameraCut !== 'boolean')
+    || (options.debugView !== undefined && !debugViews.includes(options.debugView))) {
+    throw new StrataError('INVALID_OPTIONS', 'Use boolean temporal/cameraCut controls and a supported debugView.');
+  }
+}
 
 function snapshotLimits(limits: GPUSupportedLimits): Readonly<Record<string, number>> {
   const result: Record<string, number> = {};
@@ -91,11 +105,12 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   let context: GPUCanvasContext | undefined;
   let contextConfigured = false;
   let cpu: Awaited<ReturnType<typeof initializeCpuRuntime>> | undefined;
-  let scene: SceneRenderer | undefined;
+  let scene: OwnedScene | undefined;
   let sceneGeneration = 0;
   let profiler: GpuProfiler | undefined;
   let submittedFrames = 0;
   let totalUploadBytes = 0;
+  let forceRasterCameraCut = false;
   let gpuErrorCount = 0;
   let lastGpuError: string | null = null;
   let ownsCanvas = true;
@@ -117,7 +132,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     const ownedDevice = device;
     device = undefined;
     try { ownedDevice?.removeEventListener('uncapturederror', handleGpuError); } catch { /* Continue cleanup. */ }
-    try { ownedScene?.dispose(); } catch { /* Continue releasing profiler/device resources. */ }
+    try { ownedScene?.value.dispose(); } catch { /* Continue releasing profiler/device resources. */ }
     try { profiler?.dispose(); } catch { /* Continue releasing the canvas and worker. */ }
     if (contextConfigured) {
       contextConfigured = false;
@@ -287,8 +302,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     function telemetry(): EngineTelemetry {
       return {
         submittedFrames, totalUploadBytes,
-        allocatedGpuBufferBytes: device ? (scene?.gpuBufferBytes ?? 0) + (profiler?.allocatedBufferBytes ?? 0) : 0,
-        allocatedGpuTextureBytes: scene?.gpuTextureBytes ?? 0,
+        allocatedGpuBufferBytes: device ? (scene?.value.gpuBufferBytes ?? 0) + (profiler?.allocatedBufferBytes ?? 0) : 0,
+        allocatedGpuTextureBytes: scene?.value.gpuTextureBytes ?? 0,
         wasmMemoryBytes: cpu?.info.memoryBytes ?? 0,
         pendingGpuSamples: profiler?.pendingSamples ?? 0,
         droppedGpuSamples: profiler?.droppedSamples ?? 0,
@@ -307,45 +322,64 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       },
       async setScene(sceneOptions) {
         assertReady();
+        if (sceneOptions !== null && (!sceneOptions || typeof sceneOptions !== 'object' || Array.isArray(sceneOptions)
+          || (sceneOptions.renderer !== undefined && sceneOptions.renderer !== 'diffuse' && sceneOptions.renderer !== 'raster'))) {
+          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse or raster, or null to clear.');
+        }
         const generation = ++sceneGeneration;
         if (sceneOptions === null) {
-          scene?.dispose();
+          scene?.value.dispose();
           scene = undefined;
           return;
         }
+        const snapshot = { ...sceneOptions };
         const ownedDevice = device!;
-        let next: SceneRenderer;
-        try {
-          const { SceneRenderer } = await import('./rendering/scene-renderer.js');
+        const assertCurrentRequest = (): void => {
           assertReady();
           if (generation !== sceneGeneration) {
             throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
           }
-          next = await SceneRenderer.create(ownedDevice, format, sceneOptions);
+        };
+        let next: OwnedScene;
+        try {
+          if (snapshot.renderer === 'raster') {
+            const { RasterRenderer } = await import('./rendering/raster-renderer.js');
+            assertCurrentRequest();
+            next = { kind: 'raster', value: await RasterRenderer.create(ownedDevice, format, snapshot) };
+          } else {
+            const { SceneRenderer } = await import('./rendering/scene-renderer.js');
+            assertCurrentRequest();
+            next = { kind: 'diffuse', value: await SceneRenderer.create(ownedDevice, format, snapshot) };
+          }
         } catch (cause) {
           assertReady();
           if (cause instanceof StrataError) throw cause;
           throw new StrataError('SCENE_LOAD_FAILED', 'The scene could not be initialized.', { cause });
         }
-        totalUploadBytes += next.initialUploadBytes;
+        totalUploadBytes += next.value.initialUploadBytes;
         if (generation !== sceneGeneration || state !== 'ready' || gpuErrorCount) {
-          next.dispose();
+          next.value.dispose();
           assertReady();
           throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
         }
         const previous = scene;
         scene = next;
-        previous?.dispose();
+        previous?.value.dispose();
       },
       render(renderOptions) {
         assertReady();
+        const requestedControls = renderOptions ?? defaultRenderOptions;
+        validateRenderOptions(requestedControls);
+        const controls = forceRasterCameraCut && scene?.kind === 'raster'
+          ? { ...requestedControls, cameraCut: true } : requestedControls;
         const timeSeconds = renderOptions?.timeSeconds ?? 0;
         if (!Number.isFinite(timeSeconds)) {
           throw new StrataError('INVALID_OPTIONS', 'timeSeconds must be finite.');
         }
         const started = performance.now();
         const frameId = submittedFrames + 1;
-        const timing = profiler?.begin(frameId, scene ? 'procedural' : 'clear');
+        const passNames = scene?.kind === 'raster' ? scene.value.passNames(controls) : scene ? 'procedural' : 'clear';
+        const timing = profiler?.begin(frameId, passNames);
         try {
           const encoder = device!.createCommandEncoder({ label: 'Strata frame' });
           const view = context!.getCurrentTexture().createView();
@@ -353,8 +387,12 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           let dispatchCalls = 0;
           let triangles = 0;
           let uploadBytes = 0;
-          if (scene) {
-            ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.encode(
+          if (scene?.kind === 'raster') {
+            ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.value.encode(
+              encoder, view, canvas.width, canvas.height, timeSeconds, controls, timing?.timestamps,
+            ));
+          } else if (scene) {
+            ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.value.encode(
               encoder, view, canvas.width, canvas.height, timeSeconds, timing?.timestampWrites,
             ));
           } else {
@@ -373,6 +411,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           totalUploadBytes += uploadBytes;
           if (timing) profiler!.resolve(encoder, timing);
           device!.queue.submit([encoder.finish()]);
+          if (scene?.kind === 'raster') forceRasterCameraCut = false;
           submittedFrames++;
           if (timing) profiler!.submitted(timing);
           const stats = telemetry();
@@ -385,6 +424,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           };
           return metrics;
         } catch (cause) {
+          // Encoding can advance ping-pong histories before a later pass or submission fails.
+          forceRasterCameraCut = true;
           if (timing) profiler!.cancel(timing);
           throw new StrataError('RENDER_FAILED', 'WebGPU frame submission failed.', { cause });
         }

@@ -1,6 +1,8 @@
 import { StrataError } from '../errors.js';
 
 export interface ProceduralSceneOptions {
+  /** Keep the diffuse baseline or select HDR PBR/shadows/temporal rendering. Defaults to diffuse. */
+  renderer?: 'diffuse' | 'raster';
   /** Unsigned 32-bit layout seed. Defaults to 1337. */
   seed?: number;
   /** Number of boxes, excluding the ground. Integer from 0 to 100,000; defaults to 512. */

@@ -1,5 +1,5 @@
 import { createEngine, type Engine } from '@strata-engine/core';
-import { normalizeOptions, summarizeFrames, type BenchmarkOptions, type FrameSample } from './metrics.js';
+import { distribution, normalizeOptions, summarizeFrames, type BenchmarkOptions, type FrameSample } from './metrics.js';
 
 const canvas = document.querySelector<HTMLCanvasElement>('canvas')!;
 const status = document.querySelector<HTMLOutputElement>('output')!;
@@ -8,6 +8,7 @@ const downloadButton = document.querySelector<HTMLButtonElement>('#download')!;
 let engine: Engine | undefined;
 let running = false;
 let lastResult: unknown;
+let lastOptions: BenchmarkOptions | undefined;
 
 async function nextFrame(): Promise<number> {
   return new Promise(resolve => requestAnimationFrame(resolve));
@@ -33,7 +34,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
     const coldStart = performance.now();
     engine = await createEngine({ canvas, profiling: true, powerPreference: 'high-performance' });
     const initializedAt = performance.now();
-    await engine.setScene({ seed: options.seed, instanceCount: options.instanceCount });
+    await engine.setScene({ seed: options.seed, instanceCount: options.instanceCount, renderer: options.renderer });
     const compiledAt = performance.now();
     if (engine.info.adapter.isFallbackAdapter && options.mode !== 'smoke') {
       throw new Error('A software/fallback adapter is only valid for smoke tests, not performance reports.');
@@ -56,6 +57,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
         const sample = samplesById.get(timing.frameId);
         if (!sample) continue;
         sample.gpuMs = (sample.gpuMs ?? 0) + timing.gpuMs;
+        sample.gpuPasses![timing.pass] = timing.gpuMs;
         const values = capturedTimings.get(timing.pass) ?? [];
         values.push(timing.gpuMs);
         capturedTimings.set(timing.pass, values);
@@ -93,7 +95,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
             return;
           }
           const timeSeconds = (timestamp - (measuring ? captureStart : phaseStart)) / 1000;
-          const metrics = engine!.render({ timeSeconds });
+          const metrics = engine!.render({ timeSeconds, temporal: options.temporal, debugView: options.debugView });
           if (measuring) {
             const sample: FrameSample = {
               frameId: metrics.frameId,
@@ -101,6 +103,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
               frameIntervalMs: 0,
               cpuSubmissionMs: metrics.cpuSubmissionMs,
               gpuMs: null,
+              gpuPasses: {},
               drawCalls: metrics.drawCalls,
               dispatchCalls: metrics.dispatchCalls,
               triangles: metrics.triangles,
@@ -137,28 +140,30 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       startedAt,
       completedAt: new Date().toISOString(),
       mode: options.mode,
-      workload: { id: 'procedural-boxes-v1', seed: options.seed, instanceCount: options.instanceCount, cameraPath: 'orbit-20s-v1', renderPath: 'diffuse-raster-v1', externalAssetsUsed: false },
+      workload: { id: options.renderer === 'diffuse' ? 'procedural-boxes-v1' : 'procedural-pbr-boxes-v1', seed: options.seed, instanceCount: options.instanceCount, cameraPath: 'orbit-20s-v1', renderPath: options.renderer === 'diffuse' ? 'diffuse-raster-v1' : 'pbr-shadow-temporal-v1', renderer: options.renderer, temporal: options.renderer === 'raster' && options.temporal, debugView: options.debugView, externalAssetsUsed: false },
+      quality: options.renderer === 'raster' ? { shadowMapSize: 2048, shadowKernel: '3x3-comparison', materialFixture: 'checker-metal-rough-v1', exposure: 1, temporalFilter: 'depth-qualified-bilinear-clamped-v1', temporalHistoryWeight: 0.9, jitterSequenceLength: 8 } : { shading: 'diffuse-directional' },
       resolution: { width: options.width, height: options.height, devicePixelRatio, cssWidth: canvas.clientWidth, cssHeight: canvas.clientHeight, screenWidth: screen.width, screenHeight: screen.height },
       capture: { warmupSeconds: options.warmupSeconds, requestedDurationSeconds: options.durationSeconds, actualDurationMs: captureEnd - captureStart, frameCount: frames.length, visibilityChanges },
       browser: { userAgent: navigator.userAgent, hardwareConcurrency: navigator.hardwareConcurrency, crossOriginIsolated, secureContext: isSecureContext },
       adapter: engine.info.adapter,
       capabilities: { adapterFeatures: engine.info.adapterFeatures, adapterLimits: engine.info.adapterLimits, deviceLimits: engine.info.deviceLimits },
-      profiling: { ...engine.info.profiling, capturedGpuSamples: summary.gpuPassMs.count, droppedGpuSamples: finalTelemetry.droppedGpuSamples - measuredStartTelemetry.droppedGpuSamples, pendingGpuSamples: finalTelemetry.pendingGpuSamples },
+      profiling: { ...engine.info.profiling, capturedGpuSamples: summary.gpuPassMs.count, timedFrameCount: summary.gpuPassMs.count, capturedPassSampleCount: [...capturedTimings.values()].reduce((sum, values) => sum + values.length, 0), droppedGpuSamples: finalTelemetry.droppedGpuSamples - measuredStartTelemetry.droppedGpuSamples, pendingGpuSamples: finalTelemetry.pendingGpuSamples },
       coldStart: { initializeMs: initializedAt - coldStart, sceneSetupMs: compiledAt - initializedAt, uploadBytes: initialTelemetry.totalUploadBytes },
       assetTraffic: { externalAssetsUsed: false, steadyUploadBytes: finalTelemetry.totalUploadBytes - measuredStartTelemetry.totalUploadBytes, documentResourceTransferBytes: entries.reduce((sum, entry) => sum + entry.transferSize, 0), documentResourceDecodedBytes: entries.reduce((sum, entry) => sum + entry.decodedBodySize, 0), note: 'Document resource totals include engine/app loading, exclude worker-internal fetch timing, and may contain cache/cross-origin zero values. They are not model-streaming traffic.' },
       allocations: { ...finalTelemetry, note: 'Explicit app-owned GPU buffers/textures and WASM linear memory. Excludes swapchain, driver allocation, browser memory, and JavaScript heap.' },
       summary,
-      gpuPasses: Object.fromEntries([...capturedTimings].map(([name, values]) => [name, { sampleCount: values.length, totalMs: values.reduce((sum, value) => sum + value, 0) }])),
+      gpuPasses: Object.fromEntries([...capturedTimings].map(([name, values]) => [name, { ...distribution(values), sampleCount: values.length, totalMs: values.reduce((sum, value) => sum + value, 0) }])),
       metadata: options.metadata,
       limitations: [
         'RAF intervals measure browser callback cadence, not scan-out or uncapped GPU throughput.',
         'GPU pass timestamps exclude presentation and may be quantized by the browser.',
-        'This small diffuse scene establishes a baseline; it does not validate the final 60 FPS graphics goal.',
+        'This small procedural scene establishes a rendering baseline; it does not validate the final 60 FPS graphics goal.',
         'No Sketchfab models are loaded, copied, or uploaded by this procedural run.',
       ],
       frames,
     };
     lastResult = result;
+    lastOptions = options;
     downloadButton.disabled = false;
     status.textContent = `Complete · ${summary.meanCallbackCadenceFps?.toFixed(1) ?? 'unavailable'} callback FPS · p95 ${summary.frameIntervalMs.p95?.toFixed(2) ?? 'unavailable'} ms · GPU p95 ${summary.gpuPassMs.p95?.toFixed(3) ?? 'unavailable'} ms`;
     return result;
@@ -173,12 +178,15 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
   }
 }
 
-async function capture(timeSeconds = 0) {
+async function capture(timeSeconds = 0, debugView = lastOptions?.debugView ?? 'final') {
   if (running || !engine) throw new Error('Capture imagery only after a benchmark completes.');
-  engine.render({ timeSeconds });
+  engine.render({ timeSeconds, temporal: lastOptions?.temporal ?? true, debugView, cameraCut: true });
   await nextFrame();
-  engine.render({ timeSeconds });
-  await nextFrame();
+  // Accumulate a fixed number of held-time frames after the single reset.
+  for (let frame = 0; frame < 8; frame++) {
+    engine.render({ timeSeconds: timeSeconds + (debugView === 'motion' ? (frame + 1) / 60 : 0), temporal: lastOptions?.temporal ?? true, debugView });
+    await nextFrame();
+  }
 }
 
 declare global {
@@ -190,7 +198,10 @@ window.strataBenchmark = { ready: true, run, capture, dispose: () => engine?.dis
 startButton.addEventListener('click', () => {
   const resolution = document.querySelector<HTMLSelectElement>('#resolution')!.value;
   const [width, height] = resolution.split('x').map(Number);
-  void run({ width: width!, height: height! }).catch(error => { status.textContent = String(error); });
+  const renderer = document.querySelector<HTMLSelectElement>('#renderer')!.value as BenchmarkOptions['renderer'];
+  const debugView = document.querySelector<HTMLSelectElement>('#debug')!.value as BenchmarkOptions['debugView'];
+  const temporal = document.querySelector<HTMLInputElement>('#temporal')!.checked;
+  void run({ width: width!, height: height!, renderer, debugView, temporal }).catch(error => { status.textContent = String(error); });
 });
 downloadButton.addEventListener('click', () => {
   const url = URL.createObjectURL(new Blob([JSON.stringify(lastResult, null, 2)], { type: 'application/json' }));

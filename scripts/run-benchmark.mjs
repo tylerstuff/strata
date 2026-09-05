@@ -19,7 +19,7 @@ function parseArguments(args) {
     if (name === '--smoke') options.smoke = true;
     else if (name === '--sustained') options.sustained = true;
     else if (name === '--help') options.help = true;
-    else if (numeric.has(name.slice(2)) || ['--output', '--device-label'].includes(name)) {
+    else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view'].includes(name)) {
       const value = args[++index];
       if (!value || value.startsWith('--')) throw new Error(`Missing value for ${name}.`);
       options[name.slice(2)] = numeric.has(name.slice(2)) ? Number(value) : value;
@@ -29,6 +29,13 @@ function parseArguments(args) {
   options.duration ??= options.smoke ? 1 : options.sustained ? 180 : 60;
   options.warmup ??= options.smoke ? 0.25 : 30;
   options.seed ??= 1337;
+  options.renderer ??= 'diffuse';
+  options.temporal ??= 'on';
+  options['debug-view'] ??= 'final';
+  if (!['diffuse', 'raster'].includes(options.renderer) || !['on', 'off'].includes(options.temporal)
+    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'].includes(options['debug-view'])) {
+    throw new Error('Use --renderer diffuse|raster, --temporal on|off and a supported --debug-view.');
+  }
   for (const name of ['duration', 'warmup', 'seed', 'instance-count']) {
     const value = options[name];
     if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error(`--${name} must be a nonnegative finite number.`);
@@ -192,7 +199,7 @@ async function captureEvidence(page, path) {
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
-    console.log('Usage: npm run benchmark -- [--smoke | --sustained] [--duration seconds] [--warmup seconds] [--seed integer] [--instance-count integer] [--output external-directory] [--device-label label]');
+    console.log('Usage: npm run benchmark -- [--smoke | --sustained] [--duration seconds] [--warmup seconds] [--seed integer] [--instance-count integer] [--output external-directory] [--device-label label] [--renderer diffuse|raster] [--temporal on|off] [--debug-view final|direct|shadow|depth|normal|motion|material]');
     console.log('Default: headed Chrome, 720p + 1080p, 30s warmup and 60s capture per resolution. Sustained: 1080p, 30s warmup + 180s capture. Smoke timings are never performance evidence.');
     return;
   }
@@ -259,7 +266,8 @@ async function main() {
       try {
         result = await page.evaluate((runOptions) => globalThis.strataBenchmark.run(runOptions), {
           width, height, warmupSeconds: options.warmup, durationSeconds: options.duration,
-          seed: options.seed, mode, metadata, ...(options['instance-count'] === undefined ? {} : { instanceCount: options['instance-count'] }),
+          seed: options.seed, mode, metadata, renderer: options.renderer, temporal: options.temporal === 'on', debugView: options['debug-view'],
+          ...(options['instance-count'] === undefined ? {} : { instanceCount: options['instance-count'] }),
         });
       } finally {
         clearInterval(interval);
