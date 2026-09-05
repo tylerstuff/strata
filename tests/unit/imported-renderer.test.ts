@@ -80,7 +80,7 @@ describe('imported scene resource and temporal contracts', () => {
       for (const [d] of g.raw.createSampler.mock.calls) if ((d?.maxAnisotropy ?? 1) > 1) {
         expect([d!.magFilter, d!.minFilter, d!.mipmapFilter]).toEqual(['linear', 'linear', 'linear']);
       }
-      expect(geometry.gpuTextureBytes).toBe(352); // Two unchanged 8x4 complete mip chains plus white fallbacks.
+      expect(geometry.gpuTextureBytes).toBe(352 + environmentTextureBytes); // Authored mip chains, white fallbacks and fixed environment textures.
       geometry.dispose();
     });
   it('preflights aggregate color-role texture memory before decoding or allocating', async () => {
