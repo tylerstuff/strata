@@ -7,12 +7,14 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'no
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { prepareGalleryOutput } from './gallery-output.mjs';
+import { superviseChildProcess } from './preview-process-cleanup.mjs';
 
 // No builds or external asset collection. Preparation never launches a browser;
 // the run stage requires its own explicitly granted browser/GPU window.
 const root = await realpath(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 const runner = 'scripts/test-preview-connection-browser.mjs';
 const workflow = 'tests/consumers/preview-connection/browser-workflow.mjs';
+const cleanupHelper = 'scripts/preview-process-cleanup.mjs';
 const execute = promisify(execFile);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
@@ -164,6 +166,8 @@ async function prepare() {
   await copyFile(join(root, workflow), join(frozen.consumerDirectory, 'browser-workflow.mjs'));
   await copyFile(join(root, workflow), join(output, 'browser-workflow.mjs'));
   await copyFile(join(root, runner), join(output, 'runner.mjs'));
+  await copyFile(join(root, cleanupHelper), join(output, 'preview-process-cleanup.mjs'));
+  await copyFile(join(root, cleanupHelper), join(frozen.consumerDirectory, 'preview-process-cleanup.mjs'));
   await writeFile(join(frozen.consumerDirectory, 'package.json'), json({ name: 'strata-preview-connection-browser-consumer', private: true, type: 'module',
     dependencies: Object.fromEntries(Object.entries(frozen.archives).map(([name, archive]) => [`@strata-engine/${name}`, `file:${join(output, archive.path)}`])) }));
   await loggedCommand('install', 'npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], frozen.consumerDirectory, env);
@@ -188,7 +192,8 @@ async function prepare() {
   assert.equal(prepared.stderr, '', 'CPU preparation must have clean stderr'); await noTools(output);
   frozen.inputs = await tree(join(output, 'inputs'));
   frozen.inputManifest = await evidenceFile(join(output, 'input-sha256.json'));
-  frozen.harness = { workflow: await evidenceFile(join(output, 'browser-workflow.mjs')), runner: await evidenceFile(join(output, 'runner.mjs')) };
+  frozen.harness = { workflow: await evidenceFile(join(output, 'browser-workflow.mjs')), runner: await evidenceFile(join(output, 'runner.mjs')),
+    cleanupHelper: await evidenceFile(join(output, 'preview-process-cleanup.mjs')) };
   frozen.installation = await tree(frozen.consumerDirectory, '', true);
   frozen.guards = { rust: await tree(join(temporaryDirectory, 'rust-guards')), preparation: await tree(join(temporaryDirectory, 'prepare-guards')) };
   assert.deepEqual(await sourceIdentity(), frozen.source, 'Source changed during preparation');
@@ -229,6 +234,7 @@ async function verifyFrozen() {
   }
   assert.deepEqual(await evidenceFile(join(output, 'browser-workflow.mjs')), frozen.harness.workflow);
   assert.deepEqual(await evidenceFile(join(output, 'runner.mjs')), frozen.harness.runner);
+  assert.deepEqual(await evidenceFile(join(output, 'preview-process-cleanup.mjs')), frozen.harness.cleanupHelper);
   for (const [name, value] of [['source', frozen.source], ['build', frozen.builds], ['installation', frozen.installation]]) {
     assert.equal(await readFile(join(output, `${name}-sha256.json`), 'utf8'), json(value), `External ${name} manifest changed`);
   }
@@ -245,65 +251,16 @@ async function runBrowser() {
   await verifyFrozen();
   report.status = 'running'; report.runStartedAt = new Date().toISOString();
   await writeReport(output, report);
-  let stdout = '', stderr = '', child, workloadError;
-  report.process = { timeoutMs: 240_000, terminationGraceMs: 5000, timedOut: false, runnerSignal: null, cleanupUnknown: false };
+  let stdout = '', stderr = '', workloadError;
   try {
-    await new Promise((resolveChild, rejectChild) => {
-      let timeout, kill, forced, failure, finished = false;
-      const terminate = signal => {
-        if (!child?.pid) return;
-        try { process.kill(-child.pid, signal); } catch (error) { if (error.code !== 'ESRCH') failure ??= error; }
-      };
-      const finish = (code, signal) => {
-        if (finished) return; finished = true;
-        clearTimeout(timeout); clearTimeout(kill); clearTimeout(forced);
-        process.off('SIGINT', interrupt); process.off('SIGTERM', termination);
-        report.process.exitCode = code; report.process.exitSignal = signal;
-        if (child?.pid) {
-          try {
-            process.kill(-child.pid, 0);
-            report.process.remainingProcessGroup = true;
-            failure ??= new Error('Browser workflow exited with an owned process group still alive');
-          } catch (error) { if (error.code !== 'ESRCH') failure ??= error; }
-        }
-        terminate('SIGKILL');
-        if (failure) rejectChild(failure);
-        else if (code !== 0) rejectChild(new Error(`Browser workflow failed (${code ?? signal})`));
-        else resolveChild();
-      };
-      const stop = error => {
-        failure ??= error;
-        if (kill || finished) return;
-        terminate('SIGTERM');
-        kill = setTimeout(() => {
-          terminate('SIGKILL');
-          forced = setTimeout(() => {
-            report.process.cleanupUnknown = true;
-            child.stdout.destroy(); child.stderr.destroy(); child.unref();
-            finish(null, 'cleanup-deadline');
-          }, 1000);
-        }, 5000);
-      };
-      const interrupted = signal => { report.process.runnerSignal = signal; stop(new Error(`Runner interrupted by ${signal}`)); };
-      const interrupt = () => interrupted('SIGINT'), termination = () => interrupted('SIGTERM');
-      child = spawn(process.execPath, ['browser-workflow.mjs', '--run', output], {
-        cwd: frozen.consumerDirectory, env: environment(frozen), detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      report.process.pid = child.pid ?? null;
-      let logBytes = 0;
-      for (const [stream, field] of [[child.stdout, 'stdout'], [child.stderr, 'stderr']]) {
-        stream.setEncoding('utf8'); stream.on('data', text => {
-          const bytes = Buffer.from(text), remaining = Math.max(0, 8 * 1024 * 1024 - logBytes);
-          const retained = bytes.subarray(0, remaining).toString('utf8'); logBytes += Math.min(bytes.length, remaining);
-          if (field === 'stdout') stdout += retained; else stderr += retained;
-          if (bytes.length > remaining) { report.process.logTruncated = true; stop(new Error('Browser workflow exceeded the 8 MiB log limit')); }
-        });
-      }
-      child.once('error', error => { failure ??= error; finish(null, null); });
-      child.once('close', finish);
-      process.on('SIGINT', interrupt); process.on('SIGTERM', termination);
-      timeout = setTimeout(() => { report.process.timedOut = true; stop(new Error('Browser workflow exceeded its 240000ms deadline')); }, 240_000);
+    const child = spawn(process.execPath, ['browser-workflow.mjs', '--run', output], {
+      cwd: frozen.consumerDirectory, env: environment(frozen), detached: true, stdio: ['ignore', 'pipe', 'pipe'],
     });
+    // This exact supervisor also runs in CPU fixtures with detached Node children.
+    const outcome = await superviseChildProcess(child, { rootCommand: process.execPath,
+      timeoutMs: 240_000, termGraceMs: 5000, killGraceMs: 1000, exitGraceMs: 1000 });
+    stdout = outcome.stdout; stderr = outcome.stderr; report.process = outcome.process;
+    if (outcome.error) throw Object.assign(new Error(outcome.error.message), { name: outcome.error.name });
     assert.equal(stderr, '', 'Successful browser workflow must have clean stderr');
     const result = JSON.parse(await readFile(join(output, 'workflow-report.json'), 'utf8'));
     report.workflow = result;
