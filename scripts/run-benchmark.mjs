@@ -18,6 +18,7 @@ function parseArguments(args) {
   for (let index = 0; index < args.length; index++) {
     const name = args[index];
     if (name === '--smoke') options.smoke = true;
+    else if (name === '--require-ac-performance') options.requireAcPerformance = true;
     else if (name === '--sustained') options.sustained = true;
     else if (name === '--help') options.help = true;
     else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view', '--manifest', '--geometry-mode', '--camera'].includes(name)) {
@@ -160,6 +161,21 @@ async function powerSnapshot() {
   return snapshot;
 }
 
+function powerProfile(snapshot) {
+  return { source: snapshot.source, lowPowerMode: snapshot.lowPowerMode?.[snapshot.source] ?? null };
+}
+
+function checkPower(snapshot, expected, requireAcPerformance) {
+  const profile = powerProfile(snapshot);
+  if (requireAcPerformance && (profile.source !== 'AC Power' || profile.lowPowerMode !== 0)) {
+    throw new Error('This capture requires AC power with the active Low Power Mode profile off. The power probe did not confirm both conditions.');
+  }
+  if (expected && (profile.source !== expected.source || profile.lowPowerMode !== expected.lowPowerMode)) {
+    throw new Error('The active power source or Low Power Mode changed during this session. Repeat all comparison runs under a stable profile.');
+  }
+  return profile;
+}
+
 function isSoftwareAdapter(adapter) {
   return adapter?.isFallbackAdapter === true || /swiftshader|llvmpipe|software rasterizer|software adapter/i.test(JSON.stringify(adapter));
 }
@@ -213,6 +229,7 @@ async function main() {
     console.log('Usage: npm run benchmark -- [--smoke | --sustained] [--duration seconds] [--warmup seconds] [--seed integer] [--instance-count integer] [--output external-directory] [--device-label label] [--renderer diffuse|raster|virtual] [--temporal on|off] [--debug-view view]');
     console.log('Virtual terrain: STRATA_BENCHMARK_ASSET_DIR=/external/cooked/root plus --manifest relative/manifest.json [--geometry-mode streamed|resident-lod|resident-full|mesh-lod] [--pool-mib 8] [--pixel-error 2] [--page-delay-ms 0] [--camera tour|coverage].');
     console.log('Default: headed Chrome, 720p + 1080p, 30s warmup and 60s capture per resolution. Sustained: 1080p, 30s warmup + 180s capture. Smoke timings are never performance evidence.');
+    console.log('--require-ac-performance requires a confirmed macOS AC profile with Low Power Mode off. All measured sessions reject a detected power-profile change.');
     return;
   }
   const softwareGpu = process.env.STRATA_TEST_SOFTWARE_GPU === '1';
@@ -269,10 +286,13 @@ async function main() {
     if (!adapter) throw new Error('The browser has no WebGPU adapter. Performance runs require a supported installed Chrome and hardware driver.');
     if (!options.smoke && isSoftwareAdapter(adapter)) throw new Error('The selected adapter is software/fallback; refusing to record it as hardware performance.');
     const resolutions = options.sustained ? [[1920, 1080]] : [[1280, 720], [1920, 1080]];
+    let sessionPower;
     for (const [width, height] of resolutions) {
       await page.bringToFront();
       if (await page.evaluate(() => document.visibilityState !== 'visible')) throw new Error('Benchmark tab must be visible.');
       const powerAtStart = await powerSnapshot();
+      sessionPower = checkPower(powerAtStart, sessionPower, options.requireAcPerformance);
+      console.log(`Power: ${sessionPower.source ?? 'unavailable'}; active Low Power Mode ${sessionPower.lowPowerMode ?? 'unavailable'}.`);
       const metadata = { host, source, browser: report.browser, powerAtStart, deviceLabel: options['device-label'] ?? null, ...(geometryAsset ? { geometryAsset } : {}) };
       const samples = [{ phase: 'before', ...powerAtStart }];
       let sampling = null;
@@ -302,6 +322,7 @@ async function main() {
       if (result.allocations?.gpuErrorCount > 0) throw new Error(`The runtime reported ${result.allocations.gpuErrorCount} GPU error(s); this capture is invalid.`);
       if (errors.length) throw new Error(`Browser errors: ${errors.join('; ')}`);
       samples.push({ phase: 'after', ...await powerSnapshot() });
+      for (const sample of samples) checkPower(sample, sessionPower, options.requireAcPerformance);
       const captureFilename = `${width}x${height}.png`;
       // The measured window has completed. Capture a known camera time separately.
       await page.evaluate(() => globalThis.strataBenchmark.capture(0));
