@@ -33,6 +33,8 @@ jobs:
       - run: npm run test:benchmark-server
       - run: npm run test:gallery:unit
       - run: npm run build
+      - name: Validate preview lifecycle and packed CPU consumer
+        run: npm run check:preview
       - run: npx playwright install --with-deps chromium
       - name: Install the virtual display and software Vulkan runtime
         run: sudo apt-get update && sudo apt-get install -y xvfb xauth libvulkan1 mesa-vulkan-drivers
@@ -43,6 +45,11 @@ jobs:
           STRATA_TEST_HEADED: '1'
       - name: Validate authored scenes, large-coordinate precision, and scene receipts
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:authored-boxes
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate packed preview revisions, pixels, receipts, and CLI captures
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:preview:browser
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
@@ -142,6 +149,11 @@ jobs:
           STRATA_TEST_HEADED: '1'
       - name: Validate generated progressive transport and public engine integration
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:imported-indirect
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate shared primary records and spatial reconstruction numerics
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:imported-spatial
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'

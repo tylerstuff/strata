@@ -26,7 +26,8 @@ export type StrataErrorCode =
   | 'GPU_TIMING_TIMEOUT'
   | 'GPU_WORK_TIMEOUT'
   | 'GPU_WORK_FAILED'
-  | 'RENDER_FAILED';
+  | 'RENDER_FAILED'
+  | 'PRESENTATION_HDR_FAULT';
 
 /** A runtime failure with a stable code and, when available, its original cause. */
 export class StrataError extends Error {

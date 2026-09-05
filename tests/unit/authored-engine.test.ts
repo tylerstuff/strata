@@ -1,15 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEngine, SceneCommitError, StrataError, type Engine } from '../../packages/core/src/index.js';
 import { initializeCpuRuntime } from '../../packages/core/src/internal/cpu-runtime.js';
+import type { ImportedAsset } from '../../packages/core/src/imported/imported-types.js';
 import { validateAuthoredFrameCamera } from '../../packages/core/src/rendering/authored-box-validation.js';
 import type { AuthoredFrameMetadata, BoxCamera, BoxSceneDescriptor } from '../../packages/core/src/rendering/authored-box-types.js';
 import type { RenderOptions, SceneOptions } from '../../packages/core/src/types.js';
 
 // Mock the optional module itself: lifecycle tests never import the GPU renderer or
 // its coordinate packer, and cannot accidentally allocate a real pipeline.
-const factories = vi.hoisted(() => ({ authored: vi.fn(), diffuse: vi.fn() }));
+const factories = vi.hoisted(() => ({ authored: vi.fn(), diffuse: vi.fn(), imported: vi.fn() }));
 vi.mock('../../packages/core/src/rendering/authored-box-renderer.js', () => ({ AuthoredBoxRenderer: { create: factories.authored } }));
 vi.mock('../../packages/core/src/rendering/scene-renderer.js', () => ({ SceneRenderer: { create: factories.diffuse } }));
+vi.mock('../../packages/core/src/imported/imported-renderer.js', () => ({ ImportedRenderer: { create: factories.imported } }));
 vi.mock('../../packages/core/src/internal/cpu-runtime.js', () => ({ initializeCpuRuntime: vi.fn() }));
 
 function deferred<T>() {
@@ -287,6 +289,47 @@ describe('authored engine commitment and frame lifecycle', () => {
     expect(next.authored!.motion).toEqual({ previousSubmittedFrameId: 2, valid: true, resetReason: null });
     expect(renderer.encode.mock.lastCall![5]?.cameraCut).toBe(false);
     expect(renderer.submitted.mock.calls).toEqual([[1], [2], [3]]);
+  });
+
+  it('keeps a delayed shared-primary fence failure terminal after authored submissions without changing their history', async () => {
+    const imported = { hasIndirect: true, hasSharedPrimary: true, initialUploadBytes: 0, gpuBufferBytes: 0, gpuTextureBytes: 0,
+      validateSize: vi.fn(), passNames: vi.fn(() => ['raster']),
+      encode: vi.fn(() => ({ drawCalls: 1, dispatchCalls: 1, triangles: 1, uploadBytes: 0 })),
+      submitted: vi.fn(), cancelFrame: vi.fn(), dispose: vi.fn(), faultIndirectEpoch: vi.fn(), readIndirectProgress: vi.fn(async () => {}) };
+    factories.imported.mockResolvedValue(imported);
+    const engine = await ready();
+    await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true } });
+    expect(engine.render().frameId).toBe(1);
+    const fence = deferred<void>(); gpu.device.queue.onSubmittedWorkDone.mockReturnValueOnce(fence.promise);
+    const rejected = expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+
+    const committed = await engine.setScene({ renderer: 'authored-boxes', scene: descriptor() });
+    const renderer = created[0]!;
+    const first = engine.render(), second = engine.render({ camera: { ...descriptor().camera, position: [1 / 32, 0, 4] } });
+    expect(first.authored!.motion).toEqual({ previousSubmittedFrameId: null, valid: false, resetReason: 'first-frame' });
+    expect(second.authored!.motion).toEqual({ previousSubmittedFrameId: first.frameId, valid: true, resetReason: null });
+    expect(renderer.submitted.mock.calls).toEqual([[2], [3]]);
+    expect(imported.dispose).toHaveBeenCalledOnce();
+    const before = engine.getTelemetry();
+    const encoded = gpu.device.createCommandEncoder.mock.calls.length;
+
+    fence.reject(new Error('Retired shared-primary work rejected'));
+    await rejected;
+    expect(() => engine.render({ cameraCut: true })).toThrowError(expect.objectContaining({ code: 'GPU_WORK_FAILED' }));
+    expect(() => engine.resize(320, 180)).toThrowError(expect.objectContaining({ code: 'GPU_WORK_FAILED' }));
+    await expect(engine.setScene(null)).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    await expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    expect(gpu.device.createCommandEncoder).toHaveBeenCalledTimes(encoded);
+    expect(gpu.device.queue.submit).toHaveBeenCalledTimes(3);
+    expect(renderer.encode).toHaveBeenCalledTimes(2);
+    expect(renderer.submitted.mock.calls).toEqual([[2], [3]]);
+    expect(renderer.cancelFrame).not.toHaveBeenCalled();
+    expect(imported.faultIndirectEpoch).not.toHaveBeenCalled();
+    expect(imported.readIndirectProgress).not.toHaveBeenCalled();
+    expect(engine.getTelemetry()).toEqual(before);
+    expect(before).toMatchObject({ submittedFrames: 3, gpuErrorCount: 0,
+      scene: { identity: committed, firstSubmittedFrameId: 2, lastSubmittedFrameId: 3 } });
+    expect(second.authored!.motion.previousSubmittedFrameId).toBe(2);
   });
 
   it('keeps interleaved engines independent and preserves a good predecessor through invalid camera validation', async () => {

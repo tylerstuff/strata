@@ -140,6 +140,109 @@ describe('engine lifecycle', () => {
     expect(engine.state).toBe('ready'); expect(engine.getTelemetry().submittedFrames).toBe(3);
   });
 
+  async function sharedPrimaryEngine() {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    let faulted = false;
+    const value = { gpuBufferBytes: 0, gpuTextureBytes: 0, initialUploadBytes: 0, hasIndirect: true, hasSharedPrimary: true,
+      get importedTelemetry() { return { indirect: { progress: { primary: { state: faulted ? 'faulted' : 'queued-complete' } }, sampleCounters: null } }; },
+      validateSize: vi.fn(), passNames: vi.fn(() => ['raster']),
+      encode: vi.fn(() => ({ drawCalls: 1, dispatchCalls: 3, triangles: 1, uploadBytes: 288 })),
+      submitted: vi.fn(), cancelFrame: vi.fn(), dispose: vi.fn(), readIndirectProgress: vi.fn(async () => {}),
+      faultIndirectEpoch: vi.fn((_cause: unknown) => { faulted = true; }) };
+    const create = vi.spyOn(ImportedRenderer, 'create').mockResolvedValue(value as unknown as ImportedRendererType);
+    fixture.canvas.width = 16; fixture.canvas.height = 16;
+    const engine = await ready(); await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true } });
+    const notify = fixture.device.addEventListener.mock.calls.find(([name]) => name === 'uncapturederror')![1] as (event: GPUUncapturedErrorEvent) => void;
+    return { engine, value, create, notify: () => notify({ error: { message: 'Delayed validation error' } } as GPUUncapturedErrorEvent) };
+  }
+
+  it.each([1,2])('faults all %s provisionally submitted frames before publishing a delayed readback', async frames => {
+    const h = await sharedPrimaryEngine();
+    for (let i = 0; i < frames; i++) h.engine.render();
+    expect(h.value.submitted).toHaveBeenCalledTimes(frames);
+    const readback = deferred<void>(); h.value.readIndirectProgress.mockReturnValueOnce(readback.promise);
+    const pending = h.engine.waitForIdle(), rejected = expect(pending).rejects.toMatchObject({ code: 'GPU_VALIDATION_FAILED' });
+    await flushMicrotasks(); expect(h.value.readIndirectProgress).toHaveBeenCalledOnce(); h.notify();
+    expect(h.value.faultIndirectEpoch).toHaveBeenCalledOnce();
+    expect(h.engine.getTelemetry()).toMatchObject({ gpuErrorCount: 1, submittedFrames: frames, imported: { indirect: { progress: { primary: { state: 'faulted' } }, sampleCounters: null } } });
+    readback.resolve(); await rejected;
+    const before = fixture.device.createCommandEncoder.mock.calls.length;
+    expect(() => h.engine.render()).toThrowError(expect.objectContaining({ code: 'GPU_VALIDATION_FAILED' }));
+    expect(() => h.engine.resize(8,8)).toThrowError(expect.objectContaining({ code: 'GPU_VALIDATION_FAILED' }));
+    await expect(h.engine.setScene(null)).rejects.toMatchObject({ code: 'GPU_VALIDATION_FAILED' });
+    await expect(h.engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_VALIDATION_FAILED' });
+    expect(fixture.device.createCommandEncoder).toHaveBeenCalledTimes(before);
+  });
+
+  it('faults the current shared epoch on fence rejection and permits recovery only in a new engine', async () => {
+    const h = await sharedPrimaryEngine(); h.engine.render();
+    fixture.device.queue.onSubmittedWorkDone.mockRejectedValueOnce(Error('Rejected queue work'));
+    await expect(h.engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    expect(h.value.faultIndirectEpoch).toHaveBeenCalledOnce(); expect(h.value.readIndirectProgress).not.toHaveBeenCalled();
+    expect(h.engine.getTelemetry().gpuErrorCount).toBe(0); // Queue failure is not a fabricated validation event.
+    expect(() => h.engine.render()).toThrowError(expect.objectContaining({ code: 'GPU_WORK_FAILED' }));
+    await expect(h.engine.setScene(null)).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    h.engine.dispose(); const fresh = await ready(); expect(() => fresh.render()).not.toThrow();
+  });
+
+  it('does not infer rejection from timeout but faults if that same fence subsequently rejects', async () => {
+    const h = await sharedPrimaryEngine(); h.engine.render(); vi.useFakeTimers();
+    const fence = deferred<void>(); fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(fence.promise);
+    const timed = expect(h.engine.waitForIdle(10)).rejects.toMatchObject({ code: 'GPU_WORK_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(10); await timed;
+    expect(h.value.faultIndirectEpoch).not.toHaveBeenCalled();
+    fence.reject(Error('Later actual rejection')); await flushMicrotasks();
+    expect(h.value.faultIndirectEpoch).toHaveBeenCalledOnce();
+    expect(() => h.engine.render()).toThrowError(expect.objectContaining({ code: 'GPU_WORK_FAILED' }));
+  });
+
+  it.each(['clear', 'direct', 'ordinary'] as const)('retains a shared fence failure after replacement with %s on the same device', async replacement => {
+    const h = await sharedPrimaryEngine(); h.engine.render();
+    const fence = deferred<void>(); fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(fence.promise);
+    const pending = expect(h.engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    const next = { ...h.value, hasSharedPrimary: false, hasIndirect: replacement === 'ordinary',
+      faultIndirectEpoch: vi.fn(), dispose: vi.fn(), readIndirectProgress: vi.fn(async () => {}) };
+    if (replacement === 'clear') await h.engine.setScene(null);
+    else {
+      h.create.mockResolvedValueOnce(next as unknown as ImportedRendererType);
+      await h.engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset,
+        ...(replacement === 'ordinary' ? { indirect: {} } : {}) });
+    }
+    expect(h.value.dispose).toHaveBeenCalledOnce();
+    expect(() => h.engine.render()).not.toThrow(); // Queue return remains provisional.
+    fence.reject(Error('Retired optional work rejected')); await pending;
+    expect(h.value.faultIndirectEpoch).not.toHaveBeenCalled();
+    expect(next.faultIndirectEpoch).not.toHaveBeenCalled();
+    expect(next.readIndirectProgress).not.toHaveBeenCalled();
+    expect(h.engine.getTelemetry().gpuErrorCount).toBe(0);
+    expect(() => h.engine.render()).toThrowError(expect.objectContaining({ code: 'GPU_WORK_FAILED' }));
+    expect(() => h.engine.resize(8, 8)).toThrowError(expect.objectContaining({ code: 'GPU_WORK_FAILED' }));
+    await expect(h.engine.setScene(null)).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    await expect(h.engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+  });
+
+  it('ignores a late rejected shared fence after disposing its engine', async () => {
+    const h = await sharedPrimaryEngine(); h.engine.render();
+    const fence = deferred<void>(); fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(fence.promise);
+    const pending = expect(h.engine.waitForIdle()).rejects.toMatchObject({ code: 'ENGINE_DISPOSED' });
+    h.engine.dispose(); const fresh = await ready();
+    fence.reject(Error('Disposed device work rejected')); await pending;
+    expect(h.value.faultIndirectEpoch).not.toHaveBeenCalled();
+    expect(() => fresh.render()).not.toThrow();
+    await expect(fresh.waitForIdle()).resolves.toBeUndefined();
+  });
+
+  it('ignores disposed-engine callbacks but never assigns current-device errors to a retired scene', async () => {
+    const h = await sharedPrimaryEngine();
+    const next = { ...h.value, faultIndirectEpoch: vi.fn(), dispose: vi.fn() };
+    h.create.mockResolvedValueOnce(next as unknown as ImportedRendererType);
+    await h.engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true } });
+    expect(h.value.dispose).toHaveBeenCalledOnce(); h.notify();
+    expect(h.value.faultIndirectEpoch).not.toHaveBeenCalled(); expect(next.faultIndirectEpoch).toHaveBeenCalledOnce();
+    h.engine.dispose(); const fresh = await ready(); h.notify();
+    expect(fresh.getTelemetry().gpuErrorCount).toBe(0); expect(() => fresh.render()).not.toThrow();
+  });
+
   it('fences submitted GPU work without profiling and does not submit extra frames', async () => {
     const engine = await ready(); const completion = deferred<void>();
     fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(completion.promise);
@@ -161,6 +264,7 @@ describe('engine lifecycle', () => {
     await expect(engine.waitForIdle(0)).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
     fixture.device.queue.onSubmittedWorkDone.mockRejectedValueOnce(new Error('Queue failed'));
     await expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    expect(() => engine.render()).not.toThrow(); // Ordinary-only failure is not a new terminal latch.
     const completion = deferred<void>(); fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(completion.promise);
     const disposed = expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'ENGINE_DISPOSED' });
     engine.dispose(); completion.resolve(); await disposed;
@@ -274,6 +378,43 @@ describe('engine lifecycle', () => {
     engine.resize(100, 100); expect([fixture.canvas.width, fixture.canvas.height]).toEqual([100, 100]);
     await engine.waitForIdle(); expect(value.readIndirectProgress).toHaveBeenCalledOnce();
     engine.dispose();
+  });
+
+  it('rechecks optional capability dimensions at async scene completion before retiring the current scene', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    fixture.canvas.width = 16; fixture.canvas.height = 16;
+    const old = { initialUploadBytes: 0, gpuBufferBytes: 16, gpuTextureBytes: 0, dispose: vi.fn() };
+    const wait = deferred<ImportedRendererType>();
+    const load = vi.spyOn(ImportedRenderer, 'create').mockResolvedValueOnce(old as unknown as ImportedRendererType).mockReturnValueOnce(wait.promise);
+    const engine = await ready(); const receipt = await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset });
+    const pending = engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true, maxPixels: 1048576 } });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
+    await flushMicrotasks(); expect(load).toHaveBeenCalledTimes(2);
+    // Canvas ownership cannot prevent an external DOM resize during worker/GPU creation.
+    fixture.canvas.width = 257; fixture.canvas.height = 256;
+    const candidate = { hasIndirect: true, initialUploadBytes: 0, gpuBufferBytes: 32, gpuTextureBytes: 0,
+      validateSize: vi.fn((width: number, height: number) => { if (width * height > 65536) throw new StrataError('UNSUPPORTED_LIMIT', 'lifetime spatial capability'); }), dispose: vi.fn() };
+    wait.resolve(candidate as unknown as ImportedRendererType); await rejected;
+    expect(candidate.validateSize).toHaveBeenCalledWith(257, 256); expect(candidate.dispose).toHaveBeenCalledOnce();
+    expect(old.dispose).not.toHaveBeenCalled(); expect(engine.getTelemetry().scene?.identity.sceneGeneration).toBe(receipt.sceneGeneration);
+    expect(engine.getTelemetry().allocatedGpuBufferBytes).toBe(16);
+    engine.dispose(); expect(old.dispose).toHaveBeenCalledOnce(); expect(candidate.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('preserves the presentation fault code and permits healthy scene replacement without a GPU error', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const fault = { hasIndirect: true, initialUploadBytes: 0, gpuBufferBytes: 0, gpuTextureBytes: 0, validateSize: vi.fn(),
+      readIndirectProgress: vi.fn(async () => { throw new StrataError('PRESENTATION_HDR_FAULT', 'finite presentation range exceeded'); }), dispose: vi.fn() };
+    const healthy = { ...fault, readIndirectProgress: vi.fn(async () => {}), dispose: vi.fn() };
+    vi.spyOn(ImportedRenderer, 'create').mockResolvedValueOnce(fault as unknown as ImportedRendererType).mockResolvedValueOnce(healthy as unknown as ImportedRendererType);
+    const engine = await ready(); await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true } });
+    await expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'PRESENTATION_HDR_FAULT' });
+    expect(engine.state).toBe('ready'); expect(engine.getTelemetry()).toMatchObject({ gpuErrorCount: 0, lastGpuError: null });
+    const next = await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true } });
+    await expect(engine.waitForIdle()).resolves.toBeUndefined();
+    expect(fault.dispose).toHaveBeenCalledOnce(); expect(healthy.readIndirectProgress).toHaveBeenCalledOnce();
+    expect(engine.getTelemetry().scene?.identity.sceneGeneration).toBe(next.sceneGeneration); expect(engine.state).toBe('ready');
+    engine.dispose(); expect(healthy.dispose).toHaveBeenCalledOnce();
   });
 
   it('keeps a direct-only replacement behind the cancelled worker acknowledgement barrier', async () => {
