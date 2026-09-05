@@ -51,6 +51,7 @@ export class GalleryRuntime {
   #scenePreset: ScenePreset = 'model-only';
   #lightingPreset: LightingPreset = 'studio';
   #debugView: DebugView = 'final';
+  #temporal = true;
   #orbit: GalleryOrbit = normalizeOrbit(initialOrbit, limits);
   #cameraIsFitted = false;
   #animation: GalleryAnimation = freshAnimation();
@@ -196,7 +197,7 @@ export class GalleryRuntime {
   #submit(cameraCut = false): FrameMetrics {
     const engine = this.#healthy();
     const controls = this.#controls();
-    const frame = engine.render({ imported: controls, temporal: true, debugView: this.#debugView, cameraCut, timeSeconds: this.#animation.timeSeconds });
+    const frame = engine.render({ imported: controls, temporal: this.#temporal, debugView: this.#debugView, cameraCut, timeSeconds: this.#animation.timeSeconds });
     this.#lastFrame = frame;
     this.#submittedView = { frameId: frame.frameId, controls: structuredClone(controls) };
     this.#measurements.recordFrame(frame, this.#identity());
@@ -274,6 +275,10 @@ export class GalleryRuntime {
   async setDebugView(id: DebugView) {
     if (!Object.hasOwn(debugViews, id)) throw new Error('Unknown debug view.');
     await this.#change(() => { this.#debugView = id; });
+  }
+  async setTemporal(value: boolean) {
+    if (typeof value !== 'boolean') throw new Error('Temporal anti-aliasing must be a boolean.');
+    await this.#change(() => { this.#temporal = value; }, true);
   }
   async setOrbit(value: Partial<GalleryOrbit>) {
     const next = normalizeOrbit({ ...this.#orbit, ...value }, limits);
@@ -365,7 +370,7 @@ export class GalleryRuntime {
       engineEpoch: this.#epoch, sceneCommit: this.#sceneCommit, viewRevision: this.#viewRevision,
       source: this.#model ? { entryUrl: this.#model.entryUrl, catalogGltfSha256: this.#model.sourceSha256 } : null,
       asset: asset ? { sourceUrl: asset.sourceUrl, bounds: asset.bounds, sourceBounds: asset.sourceBounds, normalization: asset.normalization, stats: asset.stats, warnings: asset.warnings, maxTextureDimension: asset.maxTextureDimension, clips: asset.clips.map(({ id, name, duration }) => ({ id, name, duration })) } : null,
-      settings: { scenePreset: this.#scenePreset, lightingPreset: this.#lightingPreset, debugView: this.#debugView, orbit: this.#orbit, animation: this.#animation, temporal: true, effective: this.#controls() },
+      settings: { scenePreset: this.#scenePreset, lightingPreset: this.#lightingPreset, debugView: this.#debugView, orbit: this.#orbit, animation: this.#animation, temporal: this.#temporal, effective: this.#controls() },
       live: this.#live, busy: this.#busy, viewport: { width: this.#canvas.width, height: this.#canvas.height },
       frame: this.#lastFrame, submittedView: this.#submittedView, measurements: this.#measurements.snapshot(this.#identity()),
       telemetry: this.#engine?.getTelemetry() ?? null, engineInfo: this.#engine?.info ?? null,

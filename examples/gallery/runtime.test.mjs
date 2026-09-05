@@ -259,6 +259,50 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     assert.equal(manual.phase, 'ready');
   });
 
+  test('temporal toggles reset history, advance view identity and match capture state without changing other controls', async () => {
+    loadHook = async url => asset(url, [{ id: 'walk', name: 'Walk', duration: 4 }]);
+    await runtime.selectModel(model());
+    await runtime.setAnimation({ clipId: 'walk', timeSeconds: 1.25, loop: false, playing: false });
+    await runtime.setOrbit({ azimuth: 1.2, distance: 8 });
+    await runtime.setLightingPreset('daylight');
+    await runtime.setScenePreset('ground');
+    const original = runtime.getState();
+    assert.equal(original.settings.temporal, true);
+    assert.equal(engine.frames.at(-1).options.temporal, true);
+    for (const temporal of [false, true]) {
+      const revision = runtime.getState().viewRevision;
+      await runtime.setTemporal(temporal);
+      const changed = runtime.getState();
+      assert.equal(changed.viewRevision, revision + 1);
+      assert.deepEqual(changed.settings, { ...original.settings, temporal });
+      assert.equal(engine.frames.at(-1).options.temporal, temporal);
+      assert.equal(engine.frames.at(-1).options.cameraCut, true);
+      assert.deepEqual(engine.frames.at(-1).options.imported, original.settings.effective);
+      const receipt = await runtime.captureState(2);
+      assert.equal(receipt.state.settings.temporal, temporal);
+      assert.equal(receipt.state.viewRevision, changed.viewRevision);
+      assert.deepEqual(receipt.state.submittedView.controls, original.settings.effective);
+      assert.equal(receipt.state.frame.frameId, engine.frames.at(-1).frameId);
+      assert.ok(engine.frames.slice(-2).every(frame => frame.options.temporal === temporal));
+    }
+  });
+
+  test('temporal preference survives view and model changes; invalid values reject before mutation', async () => {
+    await runtime.selectModel(model());
+    await runtime.setTemporal(false);
+    const before = runtime.getState();
+    for (const value of [undefined, null, 0, 1, 'false', {}, []]) {
+      await assert.rejects(runtime.setTemporal(value), /must be a boolean/);
+      assert.deepEqual(runtime.getState(), before);
+    }
+    const frameCount = engine.frames.length;
+    await runtime.setDebugView('normal');
+    await runtime.setViewport(288, 480);
+    await runtime.selectModel(model('next'));
+    assert.equal(runtime.getState().settings.temporal, false);
+    assert.ok(engine.frames.slice(frameCount).every(frame => frame.options.temporal === false));
+  });
+
   test('a superseded loader resolving late cannot commit, submit or relabel the newer model', async () => {
     const gate = deferred(), older = model('older'), newer = model('newer');
     loadHook = url => url === older.entryUrl ? gate.promise : Promise.resolve(asset(url));

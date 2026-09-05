@@ -14,6 +14,7 @@ const sceneSelect = element<HTMLSelectElement>('scene-preset');
 const lightSelect = element<HTMLSelectElement>('lighting-preset');
 const debugSelect = element<HTMLSelectElement>('debug-view');
 const resolutionSelect = element<HTMLSelectElement>('resolution');
+const temporalToggle = element<HTMLInputElement>('temporal-aa');
 const clipSelect = element<HTMLSelectElement>('animation-clip');
 const timeline = element<HTMLInputElement>('animation-time');
 const loopToggle = element<HTMLInputElement>('animation-loop');
@@ -23,6 +24,7 @@ const events = new AbortController();
 let catalog: GalleryCatalog | null = null;
 let assets: GalleryAsset[] = [];
 let actionError: string | null = null;
+let viewportError: string | null = null;
 let shownModel: string | null = null;
 let shownClipSignature = '';
 let fixedViewport = false;
@@ -111,6 +113,8 @@ function update() {
   sceneSelect.value = state.settings.scenePreset;
   lightSelect.value = state.settings.lightingPreset;
   debugSelect.value = state.settings.debugView;
+  temporalToggle.disabled = !ready;
+  temporalToggle.checked = state.settings.temporal;
   liveButton.textContent = state.live ? 'Pause live view' : 'Resume live view';
   liveButton.setAttribute('aria-pressed', String(state.live));
   for (const button of modelList.querySelectorAll<HTMLButtonElement>('button[data-model-id]')) {
@@ -175,7 +179,7 @@ function update() {
   element('metric-gpu').title = metrics.gpu.frameId === null ? state.engineInfo?.profiling.reason ?? 'No matching GPU samples yet.' : `Measured pass span for frame ${metrics.gpu.frameId}; ${metrics.gpu.passCount} pass samples. Not total frame or presentation time.`;
   const adapter = state.engineInfo?.adapter;
   element('metric-device').textContent = adapter ? [adapter.description || adapter.device || adapter.architecture || adapter.vendor || 'WebGPU adapter', ...(adapter.isFallbackAdapter ? ['software adapter'] : [])].join(' · ') : 'Waiting for runtime';
-  element('operation-status').textContent = actionError ?? (state.busy ? `Preparing ${state.busy}…` : state.phase === 'ready' ? `${state.viewport.width} × ${state.viewport.height} · ${state.frame?.triangles.toLocaleString() ?? '—'} submitted triangles · ${state.telemetry?.gpuErrorCount ?? 0} GPU errors` : state.error?.message ?? catalog?.diagnostics.join(' ') ?? 'Loading catalog…');
+  element('operation-status').textContent = viewportError ?? actionError ?? (state.busy ? `Preparing ${state.busy}…` : state.phase === 'ready' ? `${state.viewport.width} × ${state.viewport.height} · ${state.frame?.triangles.toLocaleString() ?? '—'} submitted triangles · ${state.telemetry?.gpuErrorCount ?? 0} GPU errors` : state.error?.message ?? catalog?.diagnostics.join(' ') ?? 'Loading catalog…');
   updateDisplayStatus();
 }
 
@@ -208,13 +212,22 @@ function updateDisplayStatus() {
   if (output.textContent !== status) output.textContent = status;
 }
 function syncFitViewport() {
-  if (!fixedViewport) {
-    const size = fittedViewport();
-    // Re-submit the desired size even if it matches the current canvas: it may
-    // cancel a different resize queued behind an in-flight settings/capture fence.
-    if (size) runtime.resize(size.width, size.height);
+  const previousError = viewportError;
+  try {
+    if (!fixedViewport) {
+      const size = fittedViewport();
+      // Re-submit the desired size even if it matches the current canvas: it may
+      // cancel a different resize queued behind an in-flight settings/capture fence.
+      if (size) runtime.resize(size.width, size.height);
+    }
+    viewportError = null;
+  } catch (error) {
+    // An impossible fit rejects before changing the healthy camera. Observer
+    // callbacks must report it in the UI, not escape as an uncaught page error.
+    viewportError = error instanceof Error ? error.message : String(error);
   }
-  updateDisplayStatus();
+  if (viewportError !== previousError) update();
+  else updateDisplayStatus();
 }
 
 async function run(action: () => unknown | Promise<unknown>) {
@@ -233,12 +246,14 @@ async function selectModel(id: string) {
 sceneSelect.addEventListener('change', () => run(() => runtime.setScenePreset(sceneSelect.value as ScenePreset)), { signal: events.signal });
 lightSelect.addEventListener('change', () => run(() => runtime.setLightingPreset(lightSelect.value as LightingPreset)), { signal: events.signal });
 debugSelect.addEventListener('change', () => run(() => runtime.setDebugView(debugSelect.value as DebugView)), { signal: events.signal });
+temporalToggle.addEventListener('change', () => run(() => runtime.setTemporal(temporalToggle.checked)), { signal: events.signal });
 resolutionSelect.addEventListener('change', () => run(async () => {
   if (resolutionSelect.value === 'fit') {
     fixedViewport = false;
     element('viewport-wrap').removeAttribute('style');
     const size = fittedViewport();
     if (size) await runtime.setViewport(size.width, size.height);
+    viewportError = null;
   } else {
     const [width, height] = resolutionSelect.value.split('x').map(Number);
     await setViewport(width!, height!);
@@ -306,6 +321,7 @@ async function setViewport(width: number, height: number) {
   fixedViewport = true;
   try {
     const state = await runtime.setViewport(width, height);
+    viewportError = null;
     const style = element('viewport-wrap').style;
     style.boxSizing = 'content-box';
     style.width = `${width}px`; style.maxWidth = '100%'; style.height = 'auto';
@@ -328,6 +344,7 @@ const api = {
   setScenePreset: (id: ScenePreset) => runtime.setScenePreset(id),
   setLightingPreset: (id: LightingPreset) => runtime.setLightingPreset(id),
   setDebugView: (id: DebugView) => runtime.setDebugView(id),
+  setTemporal: (enabled: boolean) => runtime.setTemporal(enabled),
   setOrbit: (orbit: Partial<GalleryOrbit>) => runtime.setOrbit(orbit),
   resetCamera: () => runtime.resetCamera(),
   setAnimation: (animation: Partial<GalleryAnimation>) => runtime.setAnimation(animation),
