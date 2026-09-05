@@ -282,6 +282,17 @@
             "minimum": 0
           }
         },
+        "gpuSpanMs": { "type": ["number", "null"], "minimum": 0 },
+        "gpuPassIntervals": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object", "required": ["startMs", "endMs"], "additionalProperties": false,
+            "properties": {
+              "startMs": { "type": "number", "minimum": 0 },
+              "endMs": { "type": "number", "minimum": 0 }
+            }
+          }
+        },
         "triangleCountSourceFrameId": {
           "type": [
             "integer",
@@ -779,6 +790,7 @@
             "gpuPassMs": {
               "$ref": "#/$defs/distribution"
             },
+            "gpuSpanMs": { "$ref": "#/$defs/distribution" },
             "meanCallbackCadenceFps": {
               "type": [
                 "number",

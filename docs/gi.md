@@ -1,6 +1,6 @@
 # World-space diffuse GI proof
 
-The opt-in `gi` renderer implements a small two-room lighting experiment with software triangle tracing and a fixed irradiance-probe cache. Hardware and software-WebGPU checks demonstrate offscreen color transfer, cache invalidation and finite update budgets. Matched GI-off/on performance evidence is being collected. The room remains dim and probe interpolation has visible artifacts; this does not establish a game's 60 FPS performance or Lumen-equivalent quality.
+The opt-in `gi` renderer implements a small two-room lighting experiment with software triangle tracing and a fixed irradiance-probe cache. Hardware and software-WebGPU checks demonstrate offscreen color transfer, cache invalidation and finite update budgets. The clean hardware evidence below comes from commit `32de6374e7a0aa18823f12a63e4f0c63de29dbd6`. The room remains dim and probe interpolation has visible artifacts; this does not establish a game's 60 FPS performance or Lumen-equivalent quality. Matched GI-off/on frame performance is reported separately in the [M2 GI benchmark](benchmarks/2026-09-05-m2-gi.md).
 
 The experiment depends on the [raster foundation](raster.md), not on streamed virtual geometry. It uses ordinary WebGPU compute, storage buffers and textures. There are no native ray-tracing APIs, screen-space ray traces, screen-space reflections, baked indirect lightmaps, or camera-visible-surface requirements for probe updates.
 
@@ -46,9 +46,9 @@ The selected implementation is a deterministic median-split triangle BVH with at
 
 An analytic oriented-box SDF is retained as a comparison candidate on the exact same box source. It uses at most 128 sphere-tracing steps, a 0.2 mm surface threshold, and a conservative 0.9 step multiplier. Grazing rays can consume the complete budget; the result then remains an explicit exhaustion. This simple candidate has neither a spatial SDF hierarchy nor a baked distance-field volume, and its results do not establish the limits of all SDF methods.
 
-## Observed tracing correctness
+## Observed tracing correctness and cost
 
-The initial 2026-09-05 browser validation used Chrome 152.0.7977.82 on an Apple M2 host; WebGPU reported vendor `apple`, architecture `metal-3`, and a non-fallback adapter. Each door state used 4,096 identical input rays for BVH closest-hit, BVH any-hit, and SDF tracing: 1,024 each of coherent, incoherent, grazing, and axis-aligned/finite-interval rays.
+The clean 2026-09-05 browser validation used Chrome 152.0.7977.82 on an Apple M2 host with 16 GiB system memory; WebGPU reported vendor `apple`, architecture `metal-3`, and a non-fallback adapter. Each door state used 4,096 identical input rays for BVH closest-hit, BVH any-hit, and SDF tracing: 1,024 each of coherent, incoherent, grazing, and axis-aligned/finite-interval rays.
 
 Across 8,192 rays, the BVH closest-hit checks had zero false hits, false misses, exhausted traversals, or distance/normal disagreements under the test tolerances. The distance threshold is `max(0.002 m, referenceDistance × 0.0002)`; the largest observed BVH closest-distance error was below 0.00000162 m. Unambiguous nearby-hit normals require dot product ≥0.98. Any-hit results also agreed on visibility and validated the returned hit's source identity and ray interval; any-hit is not required to return the nearest surface. GPU validation errors were zero.
 
@@ -59,7 +59,17 @@ Across 8,192 rays, the BVH closest-hit checks had zero false hits, false misses,
 | Grazing | 743 | 757 | Seven normal discrepancies with closed door |
 | Axes and finite intervals | 20 | 19 | None |
 
-The SDF recorded no false hit/miss classifications among completed queries in this corpus; exhausted queries are a separate failure category and must not be discarded when comparing reliability. These findings support using the BVH for this thin-wall/door proof. Millisecond comparisons remain pending; no performance ranking is inferred from the correctness counts. The local report is `2026-09-05T01-15-54.071Z-gi-validation/report.json` under `~/Downloads/Strata-Benchmark-Results/` and is not committed.
+The SDF recorded no false hit/miss classifications among completed queries in this corpus; exhausted queries are a separate failure category and must not be discarded when comparing reliability. These findings support using the BVH for this thin-wall/door proof.
+
+A separate isolated run measured each representation over the same 4,096-ray mixed corpus, with three warmup dispatches and 31 timed dispatches per representation and door state. The host was on AC power with low-power mode off; sampled thermal-limit reports were empty and temperature was unavailable. GPU durations cover one compute dispatch, not probe integration, image shading, CPU work, or an elapsed game frame.
+
+| Representation | Open-door p50 / p95 (ms) | Closed-door p50 / p95 (ms) | Representation bytes |
+| --- | ---: | ---: | ---: |
+| BVH closest-hit | 0.654 / 2.267 | 0.671 / 1.781 | 10,864 |
+| BVH any-hit | 0.498 / 1.797 | 0.470 / 0.571 | Same BVH |
+| Analytic box SDF | 0.700 / 2.087 | 0.674 / 0.708 | 672 |
+
+Each representation's byte count includes 144 shared material/light bytes; retaining both for validation uses 11,392 bytes. Median closest-hit costs were similar in this tiny scene, and several p95 values were much higher than their medians. The SDF's smaller storage and individual timing advantages do not compensate for its exhausted grazing queries in this proof. These 31-sample distributions support a bounded implementation choice, not a general BVH/SDF performance ranking. The functional and isolated measurement reports are identified under [Validation evidence and limits](#validation-evidence-and-limits).
 
 ## Probe layout, integration and visibility
 
@@ -69,15 +79,25 @@ Each hit evaluates emission plus shadowed direct Lambertian light. Misses contri
 
 Irradiance uses an 8×8 octahedral tile per probe in a 192×128 `rgba16float` atlas. Visibility stores directional mean distance and mean squared distance in 16×16 tiles in a 384×256 `rg32float` atlas. Both atlases have two copies. Bilinear sampling manually folds out-of-tile taps across octahedral edges into the same probe, preserving edge continuity without allocating physical atlas gutters or reading another probe's texels.
 
-Surface shading combines up to eight neighboring valid probes with trilinear, normal-facing and distance-moment visibility weights. Out-of-grid and old-epoch probes do not contribute; surviving weights are normalized. The current query offsets the surface by 0.12 m along its normal and 0.02 m toward the viewer. Visibility uses a 0.02 m distance allowance, a variance floor, and a cubed visibility probability. These are deliberate approximations with potential thin-wall, corner and low-probe-density artifacts; rendered leakage quality remains to be measured.
+Surface shading combines up to eight neighboring valid probes with trilinear, normal-facing and distance-moment visibility weights. Out-of-grid and old-epoch probes do not contribute; surviving weights are normalized. The current query offsets the surface by 0.12 m along its normal and 0.02 m toward the viewer. Visibility uses a 0.02 m distance allowance, a variance floor, and a cubed visibility probability. These are deliberate approximations with potential thin-wall, corner and low-probe-density artifacts. The tested receiver becomes dark behind the closed door, but that local result does not establish leakage-free interpolation throughout the rooms.
 
-Pass order is probe-atlas preservation copies → `gi-trace` → `gi-update` → `shadow` → `raster` → `gi-shade` → optional `temporal` → `presentation`. GI composition reconstructs world position from raster depth and the inverse current camera transform, then consumes world normals, linear material albedo and direct HDR. A separate composed HDR texture feeds TAA; the original direct HDR and its shadow-visibility alpha remain available for comparison.
+Pass order is probe-atlas preservation copies → `gi-trace` → `gi-update` → `shadow` → `raster` → `gi-shade` → optional `temporal` → `presentation`. Trace, update and composition remain three compute passes. GI composition reconstructs world position from raster depth and the inverse current camera transform, then consumes world normals, linear material albedo and direct HDR. A separate composed HDR texture feeds TAA; the original direct HDR and its shadow-visibility alpha remain available for comparison.
 
 ## Revisions, dark ramp and history
 
 Door, wall-color and light changes increment a world revision and invalidate both cached radiance and visibility through a new probe epoch. Old texels may remain physically present, but their old-epoch probe states exclude them from shading. Until newly updated probes cover a receiver, its indirect light is dark. A probe's first valid sample in the new epoch uses no irradiance history; subsequent samples keep 85% of the previous irradiance and blend 15% of the new estimate. Distance moments update immediately whenever that probe is sampled.
 
 The 85% history weight applies **per probe update**, not per displayed frame. For a probe updated every 12 submitted frames, retaining `0.85^k` of an existing error takes about 15 updates to fall below 10%—roughly 180 submitted frames. At an actual 60 Hz this would be about 3 s; it is an analytical illustration, not measured latency. Full resets bypass old irradiance on each probe's first new-epoch update, but still incur the coverage ramp and subsequent sampling stabilization. The first 12-frame sweep would take 200 ms only if the application actually submits at 60 Hz.
+
+The rendered observation used 240 submitted frames for each red-wall, neutral-wall and reopened-door phase, with default budgets, TAA disabled and a 25-pixel linear-HDR receiver region at 320×180. All three first showed indirect energy at the fifth frame after reset. The following summarizes only the final 24 submissions, two grid sweeps; energy is the sum of linear RGB, not luminance.
+
+| Phase | Tail mean energy | Tail coefficient of variation | First frame remaining within ±20% of that tail mean through frame 240 |
+| --- | ---: | ---: | ---: |
+| Red wall, cold cache | 0.004166 | 2.46% | 199 |
+| Neutral wall, cold cache | 0.004879 | 5.30% | 199 |
+| Reopened door | 0.003755 | 12.42% | 221 |
+
+These are retrospective finite-window measurements, **not convergence times or errors against a ground-truth lighting solution**. The final 24-frame mean can still drift, and the reopened phase remains visibly less stable numerically. A longer observation, independent lighting reference, repeated sampling phases and wider spatial coverage are needed before claiming settled quality. Submitted-frame counts here do not imply a measured display rate.
 
 Camera movement, resize and `cameraCut` reset screen temporal history as appropriate without invalidating world-space GI. A world-state change also resets screen history. Failed submission cancels the pending probe sweep and atlas index; only a successful submit commits their CPU bookkeeping. Continuously moving doors/lights, local dirty-region updates, scrolling grids and prioritized propagation are unsupported. Repeated world changes can repeatedly restart the dark ramp.
 
@@ -95,7 +115,7 @@ Default application-requested GI allocations, in addition to the existing raster
 
 The fixed subtotal is 2,049,472 bytes. Composition adds 7,372,800 bytes at 1280×720 or 16,588,800 bytes at 1920×1080. Probe-buffer allocation is `6,368 + probesPerUpdate × raysPerProbe × 32` bytes; atlas and scene allocation do not change with the ray quota. Retained textures still count while GI is disabled. These estimates exclude browser, driver, canvas, alignment and allocator overhead; they are not total GPU memory usage. The existing raster MRTs, shadow map, TAA, worker/WASM memory and profiling resources remain separate.
 
-Each active update also copies 983,040 bytes between atlas pairs to preserve probes outside its update window. Those copy commands precede the `gi-trace` timestamp. The sum of `gi-trace`, `gi-update` and `gi-shade` therefore measures named passes, not all GI overhead; compare GI-on/off total-frame distributions as well. Normal frames do not wait for GPU readback.
+Each active update also copies 983,040 bytes between atlas pairs to preserve probes outside its update window. Those copy commands precede the `gi-trace` timestamp. Per-pass timestamp intervals can overlap and exclude work outside their boundaries, so their sum is not elapsed GPU frame time or all GI overhead. Use the complete GPU span and matched GI-on/off frame distributions in the [M2 GI benchmark](benchmarks/2026-09-05-m2-gi.md). Normal frames do not wait for GPU readback.
 
 `engine.getTelemetry().gi` and `FrameMetrics.gi` expose the active state, scene controls, world revision/cache epoch, submitted update counts, ray budgets and allocation estimates. Unread GPU-derived values such as `validProbeCount` and `traceFailures` are `null`, not a claimed zero. Browser validation reads explicit diagnostic buffers separately. GPU timestamp samples use the existing bounded asynchronous profiler; missing or quantized samples retain their existing meaning.
 
@@ -111,11 +131,20 @@ Each active update also copies 983,040 bytes between atlas pairs to preserve pro
 
 The GI diagnostic views present the current unfiltered composition, even when the temporal pass remains enabled. They do not display TAA-blended ages, trace normals or atlas values. Atlas views mask invalid and old-epoch tiles to black, matching their exclusion from surface shading; inspect validity/age alongside them. `trace` launches a diagnostic ray per screen pixel and is outside the normal probe-ray budget, so its cost is not representative of final-image GI shading. Existing raster depth, normal, motion, material and shadow views remain available.
 
-## Validation and pending evidence
+## Validation evidence and limits
 
-Run the focused CPU checks with `npx vitest run tests/unit/gi-trace.test.ts tests/unit/gi-probe.test.ts`. Browser checks use `node scripts/test-gi.mjs`; `--measure` additionally requests a local hardware representation microbenchmark and rejects software-GPU/CI measurement mode. Generated reports and captures stay outside Git under `~/Downloads/Strata-Benchmark-Results/`, as described in the [benchmark protocol](benchmark.md).
+Run the focused CPU checks with `npx vitest run tests/unit/gi-trace.test.ts tests/unit/gi-probe.test.ts tests/unit/gi-renderer.test.ts`. Browser checks use `node scripts/test-gi.mjs`; `--measure` requests a local hardware representation microbenchmark and rejects software-GPU/CI measurement mode. Generated reports and captures stay outside Git under `~/Downloads/Strata-Benchmark-Results/`, as described in the [benchmark protocol](benchmark.md).
 
-The completed checks cover source winding and refit, bounded traversal and independent triangle agreement, finite probe budgets, cache epochs, cancelled submissions, complete grid updates, light-off behavior and disposal. The following still require rendered/hardware evidence before issue acceptance: initially offscreen red-wall influence with both histories cold and TAA disabled; closed-door and thin-wall leakage; light/door convergence measured from linear-HDR receiver values; disocclusion/stale-light inspection; and matched GI-off/on 720p/1080p frame distributions with trace/update/shading cost. The rendered test exists but its success is not claimed here.
+The completed checks cover source winding and refit, bounded traversal and independent triangle agreement, finite probe budgets, cache epochs, cancelled submissions, complete grid updates, light-off behavior, camera cuts, resize, GI toggling and disposal. Actual GPU validation reported no errors. The first default probe batch traced exactly 2,048 primary rays, updated 32 probes, and reported zero trace failures or invalid probes. Camera cut and resize checks preserved the world cache epoch; disabling GI produced zero compute dispatches.
+
+The rendered source was completely offscreen before its contribution appeared, with cold probe and screen histories and TAA disabled. The receiver's direct-only RGB was `(0, 0, 0)`. Across the final 24 observations, red-wall indirect RGB averaged `(0.002339, 0.000967, 0.000860)`, compared with neutral-wall `(0.001728, 0.001640, 0.001511)`; their red/green ratios were 2.417 and 1.054. This demonstrates material-dependent offscreen transport. Closing the door produced zero indirect RGB throughout the sampled frames 2–36 after reset, and zero closed/open tail-energy ratio at this receiver. Turning the light off also yielded zero sampled direct and indirect RGB. These are spatially limited functional checks, not a room-wide leakage bound or a complete disocclusion study.
+
+Both reports used the clean source commit above:
+
+- Full functional validation and 14 receiver/overview PNGs: `2026-09-05T01-43-27.206Z-gi-validation/report.json`.
+- Isolated representation timings: `2026-09-05T01-43-55.774Z-gi-validation/report.json`.
+
+The captures show a very dark receiver in the unamplified final image and visible interpolation bands/patches in the overview indirect view. The latter applies a labelled ×20 display gain; it is not the final image or a physical energy adjustment. Improved energy accuracy, spatial continuity and faster stabilization remain quality work. Complete-frame performance is a separate measurement from these readback-heavy functional checks; see the [M2 GI benchmark](benchmarks/2026-09-05-m2-gi.md).
 
 This implementation excludes imported meshes, deforming geometry, transparency, alpha testing, transmissive materials, indirect specular/reflections, multiple diffuse bounces, environment lighting, arbitrary scene extents and automatic probe placement. Passing this restricted fixture will not establish those capabilities.
 

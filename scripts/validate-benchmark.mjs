@@ -64,7 +64,7 @@ function validateGiFrame(run, frame, prior, prefix) {
   ensure(gi.traceFailures === null || gi.traceFailures === 0, `${prefix} records GI traversal failures`);
   if (gi.validProbeCount !== null) ensure(gi.validProbeCount <= Math.min(384, gi.probeUpdatesSinceReset), `${prefix} GI valid-probe count exceeds updated coverage`);
   ensure(frame.triangleCountSourceFrameId === frame.frameId, `${prefix} GI geometry counters have a mismatched source frame`);
-  ensure(frame.drawCalls === (run.workload.temporal ? 4 : 3) && frame.dispatchCalls === (gi.enabled ? 3 : 0)
+  ensure(frame.drawCalls === 3 + Number(run.workload.temporal) && frame.dispatchCalls === (gi.enabled ? 3 : 0)
     && frame.triangles === 265 + Number(run.workload.temporal), `${prefix} GI draw/dispatch/triangle counts do not match the fixture`);
 
   const phase = run.workload.giScenario === 'static' ? 0 : Math.floor((frame.elapsedMs / 1000) % 60 / 10);
@@ -150,6 +150,22 @@ export function validateBenchmarkReport(report) {
         if (run.workload.geometryMode === 'streamed') ensure(geometry.poolBytes <= run.quality.poolBytes, `${prefix} exceeds its configured geometry pool`);
       }
       if (gi) validateGiFrame(run, frame, frames[frameIndex - 1], `${prefix}.frames[${frameIndex}]`);
+      if (frame.gpuSpanMs !== undefined || frame.gpuPassIntervals !== undefined) {
+        ensure(frame.gpuPassIntervals !== undefined && frame.gpuSpanMs !== undefined, `${prefix} GPU span requires pass intervals`);
+        const intervals = Object.entries(frame.gpuPassIntervals);
+        if (frame.gpuMs === null) ensure(frame.gpuSpanMs === null && intervals.length === 0, `${prefix} untimed frame claims a GPU span`);
+        else {
+          const names = Object.keys(frame.gpuPasses ?? {});
+          ensure(frame.gpuSpanMs !== null && intervals.length > 0 && intervals.length === names.length
+            && names.every(name => Object.hasOwn(frame.gpuPassIntervals, name)), `${prefix} GPU span lacks complete pass intervals`);
+          for (const [name, interval] of intervals) {
+            ensure(interval.endMs >= interval.startMs, `${prefix} GPU pass interval is reversed`);
+            close(interval.endMs - interval.startMs, frame.gpuPasses[name], `${prefix} GPU pass interval duration`);
+          }
+          close(Math.min(...intervals.map(([, interval]) => interval.startMs)), 0, `${prefix} GPU interval origin`);
+          close(frame.gpuSpanMs, Math.max(...intervals.map(([, interval]) => interval.endMs)), `${prefix} GPU span envelope`);
+        }
+      }
       if (frame.gpuPasses !== undefined) {
         const entries = Object.entries(frame.gpuPasses);
         if (frame.gpuMs === null) ensure(entries.length === 0, `${prefix} has named timings for an untimed frame`);
@@ -186,6 +202,10 @@ export function validateBenchmarkReport(report) {
     distribution(summary.frameIntervalMs, frames.map(frame => frame.frameIntervalMs), `${prefix}.summary.frameIntervalMs`);
     distribution(summary.cpuSubmissionMs, frames.map(frame => frame.cpuSubmissionMs), `${prefix}.summary.cpuSubmissionMs`);
     distribution(summary.gpuPassMs, gpuValues, `${prefix}.summary.gpuPassMs`);
+    if (summary.gpuSpanMs !== undefined || frames.some(frame => frame.gpuSpanMs !== undefined)) {
+      ensure(summary.gpuSpanMs !== undefined, `${prefix} GPU span summary is missing`);
+      distribution(summary.gpuSpanMs, frames.flatMap(frame => frame.gpuSpanMs == null ? [] : [frame.gpuSpanMs]), `${prefix}.summary.gpuSpanMs`);
+    }
     close(summary.meanCallbackCadenceFps, 1000 / summary.frameIntervalMs.mean, `${prefix} callback cadence`);
     close(summary.targetFrameIntervalMs, 1000 / 60, `${prefix} target frame interval`);
     ensure(summary.framesAbove20Ms === frames.filter(frame => frame.frameIntervalMs > 20).length, `${prefix} slow-frame count is inconsistent`);

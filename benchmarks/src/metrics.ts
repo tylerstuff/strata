@@ -36,6 +36,8 @@ export interface FrameSample {
   cpuSubmissionMs: number;
   gpuMs: number | null;
   gpuPasses?: Record<string, number>;
+  gpuSpanMs?: number | null;
+  gpuPassIntervals?: Record<string, { startMs: number; endMs: number }>;
   drawCalls: number;
   dispatchCalls: number;
   triangles: number;
@@ -53,6 +55,7 @@ export function summarizeFrames(frames: readonly FrameSample[]) {
     frameIntervalMs,
     cpuSubmissionMs: distribution(frames.map(frame => frame.cpuSubmissionMs)),
     gpuPassMs: distribution(frames.flatMap(frame => frame.gpuMs === null ? [] : [frame.gpuMs])),
+    gpuSpanMs: distribution(frames.flatMap(frame => frame.gpuSpanMs == null ? [] : [frame.gpuSpanMs])),
     meanCallbackCadenceFps: frameIntervalMs.mean ? 1000 / frameIntervalMs.mean : null,
     framesAbove20Ms: frames.filter(frame => frame.frameIntervalMs > 20).length,
     targetFrameIntervalMs: 1000 / 60,

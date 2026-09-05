@@ -67,6 +67,10 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
         if (!sample) continue;
         sample.gpuMs = (sample.gpuMs ?? 0) + timing.gpuMs;
         sample.gpuPasses![timing.pass] = timing.gpuMs;
+        if (timing.startOffsetMs !== undefined && timing.endOffsetMs !== undefined) {
+          sample.gpuPassIntervals![timing.pass] = { startMs: timing.startOffsetMs, endMs: timing.endOffsetMs };
+          sample.gpuSpanMs = Math.max(sample.gpuSpanMs ?? 0, timing.endOffsetMs);
+        }
         const values = capturedTimings.get(timing.pass) ?? [];
         values.push(timing.gpuMs);
         capturedTimings.set(timing.pass, values);
@@ -116,6 +120,8 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
               cpuSubmissionMs: metrics.cpuSubmissionMs,
               gpuMs: null,
               gpuPasses: {},
+              gpuSpanMs: null,
+              gpuPassIntervals: {},
               drawCalls: metrics.drawCalls,
               dispatchCalls: metrics.dispatchCalls,
               triangles: metrics.triangles,
@@ -145,7 +151,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       raf = requestAnimationFrame(frame);
     });
     // Readback is drained after timing, never awaited in the frame loop.
-    await engine.flushGpuTimings();
+    await engine.flushGpuTimings(options.mode === 'smoke' ? 30_000 : undefined);
     collectGpu();
     const finalTelemetry = engine.getTelemetry();
     const summary = summarizeFrames(frames);
@@ -198,7 +204,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       metadata: options.metadata,
       limitations: [
         'RAF intervals measure browser callback cadence, not scan-out or uncapped GPU throughput.',
-        'GPU pass timestamps exclude browser composition and display scan-out, and may be quantized by the browser.',
+        'GPU pass intervals may overlap; their sum is not elapsed frame time. GPU span covers the earliest to latest recorded pass boundary, including gaps but excluding earlier copies/uploads, browser composition and scan-out.',
         gi ? 'This flat two-room scene tests one-bounce world-space diffuse GI and discrete changes. It does not validate general scenes or integrated graphics.' : virtual ? 'This static analytic terrain tests geometry streaming; it does not validate arbitrary meshes or the integrated graphics target.' : 'This small procedural scene establishes a rendering baseline; it does not validate the final 60 FPS graphics goal.',
         'No Sketchfab models are loaded, copied, or uploaded by this run.',
         ...(virtual ? ['Triangle and GPU selection counters describe their explicit sourceFrameId, which can lag the submitted frame. Missing counters stay labelled null.'] : []),
@@ -209,7 +215,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
     lastResult = result;
     lastOptions = options;
     downloadButton.disabled = false;
-    status.textContent = `Complete · ${summary.meanCallbackCadenceFps?.toFixed(1) ?? 'unavailable'} callback FPS · p95 ${summary.frameIntervalMs.p95?.toFixed(2) ?? 'unavailable'} ms · GPU p95 ${summary.gpuPassMs.p95?.toFixed(3) ?? 'unavailable'} ms`;
+    status.textContent = `Complete · ${summary.meanCallbackCadenceFps?.toFixed(1) ?? 'unavailable'} callback FPS · p95 ${summary.frameIntervalMs.p95?.toFixed(2) ?? 'unavailable'} ms · GPU span p95 ${summary.gpuSpanMs.p95?.toFixed(3) ?? 'unavailable'} ms`;
     return result;
   } catch (error) {
     engine?.dispose();
@@ -229,7 +235,7 @@ async function capture(timeSeconds = 0, debugView = lastOptions?.debugView ?? 'f
   });
   await nextFrame();
   // Accumulate a fixed number of held-time frames after the single reset.
-  const settleFrames = lastOptions?.renderer === 'gi' && lastOptions.giEnabled ? 240 : 8;
+  const settleFrames = lastOptions?.mode !== 'smoke' && lastOptions?.renderer === 'gi' && lastOptions.giEnabled ? 240 : 8;
   for (let frame = 0; frame < settleFrames; frame++) {
     engine.render({ timeSeconds: timeSeconds + (debugView === 'motion' ? (frame + 1) / 60 : 0), temporal: lastOptions?.temporal ?? true, debugView });
     await nextFrame();

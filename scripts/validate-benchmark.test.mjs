@@ -70,8 +70,8 @@ function giFixture({ enabled = true, temporal = true, probes = 32, rays = 64, dy
       traceRepresentation: 'triangle-bvh-v1', traceGeometryBytes: 11392, cacheBufferBytes: 6368 + probes * rays * 32,
       cacheTextureBytes: 1966080, composeBufferBytes: 96, composeTextureBytes: enabled ? 1280 * 720 * 8 : 0 };
     return { ...base, frameId, elapsedMs: index * (dynamic ? 10000 : 16), frameIntervalMs: dynamic && index < 6 ? 10000 : 16,
-      triangleCountSourceFrameId: frameId, drawCalls: temporal ? 4 : 3, dispatchCalls: enabled ? 3 : 0,
-      triangles: temporal ? 266 : 265, gi, gpuMs: timed ? 0 : null,
+      triangleCountSourceFrameId: frameId, drawCalls: 3 + Number(temporal), dispatchCalls: enabled ? 3 : 0,
+      triangles: 265 + Number(temporal), gi, gpuMs: timed ? 0 : null,
       gpuPasses: timed ? Object.fromEntries(names.map(name => [name, 0])) : {},
       allocatedGpuBufferBytes: gi.traceGeometryBytes + gi.cacheBufferBytes + gi.composeBufferBytes + 65536,
       allocatedGpuTextureBytes: gi.cacheTextureBytes + gi.composeTextureBytes + 16777216 };
@@ -88,7 +88,7 @@ function giFixture({ enabled = true, temporal = true, probes = 32, rays = 64, dy
     cpuSubmissionMs: sampleDistribution(run.frames.map(frame => frame.cpuSubmissionMs)),
     gpuPassMs: sampleDistribution(timed ? run.frames.map(() => 0) : []),
     meanCallbackCadenceFps: 1000 * count / run.capture.actualDurationMs, framesAbove20Ms: intervals.filter(value => value > 20).length,
-    drawCalls: count * (temporal ? 4 : 3), dispatchCalls: count * (enabled ? 3 : 0),
+    drawCalls: count * (3 + Number(temporal)), dispatchCalls: count * (enabled ? 3 : 0),
     maxTrackedGpuBufferBytes: run.frames[0].allocatedGpuBufferBytes, maxTrackedGpuTextureBytes: run.frames[0].allocatedGpuTextureBytes });
   run.gpuPasses = timed ? Object.fromEntries(names.map(name => [name, { ...sampleDistribution(run.frames.map(() => 0)), sampleCount: count, totalMs: 0 }])) : {};
   return report;
@@ -106,6 +106,31 @@ test('valid unavailable GPU timings remain null; quantized zero timings remain v
   run.summary.gpuPassMs = { count: 2, min: 0, mean: 0, p50: 0, p95: 0, p99: 0, max: 0 };
   run.gpuPasses = { procedural: { sampleCount: 2, totalMs: 0 } };
   assert.equal(validateBenchmarkReport(quantized), quantized);
+});
+
+test('validates elapsed GPU envelopes independently of overlapping pass durations', () => {
+  const report = giFixture({ timed: true }); const run = report.runs[0];
+  const names = Object.keys(run.frames[0].gpuPasses);
+  const bounds = [[2, 5], [0, 4], [3, 6], ...names.slice(3).map(() => [6, 6])];
+  for (const frame of run.frames) {
+    frame.gpuPassIntervals = Object.fromEntries(names.map((name, index) => [name, { startMs: bounds[index][0], endMs: bounds[index][1] }]));
+    frame.gpuPasses = Object.fromEntries(names.map((name, index) => [name, bounds[index][1] - bounds[index][0]]));
+    frame.gpuMs = 10; frame.gpuSpanMs = 6;
+  }
+  run.summary.gpuPassMs = sampleDistribution([10, 10]); run.summary.gpuSpanMs = sampleDistribution([6, 6]);
+  run.gpuPasses = Object.fromEntries(names.map(name => {
+    const values = run.frames.map(frame => frame.gpuPasses[name]);
+    return [name, { ...sampleDistribution(values), sampleCount: values.length, totalMs: values.reduce((sum, value) => sum + value, 0) }];
+  }));
+  assert.equal(validateBenchmarkReport(report), report);
+  const wrongSpan = structuredClone(report); wrongSpan.runs[0].frames[0].gpuSpanMs = 10;
+  assert.throws(() => validateBenchmarkReport(wrongSpan), /span envelope/);
+  const incomplete = structuredClone(report); delete incomplete.runs[0].frames[0].gpuPassIntervals[names[0]];
+  assert.throws(() => validateBenchmarkReport(incomplete), /complete pass intervals/);
+  const wrongDuration = structuredClone(report); wrongDuration.runs[0].frames[0].gpuPassIntervals[names[0]].endMs++;
+  assert.throws(() => validateBenchmarkReport(wrongDuration), /interval duration/);
+  const missing = structuredClone(report); delete missing.runs[0].summary.gpuSpanMs;
+  assert.throws(() => validateBenchmarkReport(missing), /span summary/);
 });
 
 test('rejects fabricated GPU zeros, missing required measurements, and inconsistent summaries', () => {
@@ -242,6 +267,8 @@ test('rejects incomplete GI telemetry, fabricated budgets, invalid counters and 
     [run => { run.frames[0].gi.sourceFrameId--; }, /source frame/],
     [run => { run.frames[0].triangleCountSourceFrameId--; }, /geometry counters/],
     [run => { run.frames[0].dispatchCalls--; }, /draw\/dispatch\/triangle/],
+    [run => { run.frames[0].drawCalls--; }, /draw\/dispatch\/triangle/],
+    [run => { run.frames[0].triangles--; }, /draw\/dispatch\/triangle/],
     [run => { run.frames[0].gi.cacheBufferBytes++; }, /allocation estimates/],
     [run => { run.frames[0].gi.composeTextureBytes = 0; }, /allocation estimates/],
     [run => { run.frames[0].allocatedGpuBufferBytes = 1; }, /exceed total/],

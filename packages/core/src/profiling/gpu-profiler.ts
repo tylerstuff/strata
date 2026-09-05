@@ -116,6 +116,7 @@ export class GpuProfiler {
         if (this.disposed) return;
         const values = new BigUint64Array(slot.readBuffer.getMappedRange(0, slot.passCount * 16));
         const frame: GpuTiming[] = [];
+        let origin = values[0]!;
         for (let index = 0; index < slot.passCount; index++) {
           const start = values[index * 2]!;
           const end = values[index * 2 + 1]!;
@@ -123,8 +124,14 @@ export class GpuProfiler {
             this.dropped += slot.passCount;
             return;
           }
-          // WebGPU timestamps are nanoseconds. Quantized zero remains a valid measurement.
-          frame.push({ frameId: slot.frameId, pass: slot.passNames[index]!, gpuMs: Number(end - start) / 1_000_000 });
+          if (start < origin) origin = start;
+        }
+        for (let index = 0; index < slot.passCount; index++) {
+          const start = values[index * 2]!; const end = values[index * 2 + 1]!;
+          // Preserve overlap and gaps. Summing durations is not elapsed frame time.
+          // Subtract uint64 origins before Number conversion to retain nanosecond differences.
+          frame.push({ frameId: slot.frameId, pass: slot.passNames[index]!, gpuMs: Number(end - start) / 1_000_000,
+            startOffsetMs: Number(start - origin) / 1_000_000, endOffsetMs: Number(end - origin) / 1_000_000 });
         }
         // Keep frame groups atomic so queue pressure cannot yield misleading partial sums.
         if (frame.length > this.resultCapacity) {

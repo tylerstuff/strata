@@ -87,6 +87,9 @@ export interface GpuTiming {
   readonly pass: string;
   /** One named pass duration, excluding between-pass gaps and display scanout; may be quantized to zero. */
   readonly gpuMs: number;
+  /** Pass boundaries relative to the earliest recorded boundary in this frame; passes may overlap. */
+  readonly startOffsetMs?: number;
+  readonly endOffsetMs?: number;
 }
 
 export interface EngineTelemetry {
