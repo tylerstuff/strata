@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, realpath, rm, truncate, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, realpath, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -162,6 +162,57 @@ describe('agent-facing CLI', () => {
     expect(await readFile(path, 'utf8')).toBe(original);
     expect((await runCli(['validate', path])).result).toMatchObject({ ok: true, assets: null });
     expect((await runCli(['validate', path, '--assets'])).result).toMatchObject({ ok: true, assets: { checked: 0 } });
+  });
+
+  it('rejects malformed UTF-8 within an otherwise valid batch without changes or lock residue', async () => {
+    const root = await directory();
+    const path = join(root, 'scene.json');
+    const batchPath = join(root, 'invalid-utf8.json');
+    expect((await runCli(['create', path, '--id', 'scene', '--fixture', 'boxes'])).exitCode).toBe(0);
+    const snapshot = await readSceneFile(path);
+    const original = await readFile(path);
+    const entity = { ...snapshot.scene.entities[0]!, name: 'placeholder' };
+    const bytes = Buffer.from(JSON.stringify({ format: 'strata.scene-edit', version: 1, expectedRevision: snapshot.revision, operations: [{ op: 'set-entity', value: entity }] }));
+    const nameOffset = bytes.indexOf('placeholder');
+    expect(nameOffset).toBeGreaterThan(-1);
+    bytes[nameOffset] = 0xff;
+    await writeFile(batchPath, bytes);
+    const beforeFiles = (await readdir(root)).sort();
+
+    const invalid = await runCli(['edit', path, '--batch', batchPath]);
+    expect(invalid.exitCode).toBe(3);
+    expect(invalid.result).toMatchObject({ ok: false, diagnostics: [{ code: 'INVALID_UTF8', path: '', source: batchPath, message: expect.any(String), suggestion: expect.any(String) }] });
+    expect(await readFile(path)).toEqual(original);
+    expect((await readdir(root)).sort()).toEqual(beforeFiles);
+  });
+
+  it('preserves valid multibyte text in a batch name update', async () => {
+    const root = await directory();
+    const path = join(root, 'scene.json');
+    const batchPath = join(root, 'unicode.json');
+    expect((await runCli(['create', path, '--id', 'scene', '--fixture', 'boxes'])).exitCode).toBe(0);
+    const snapshot = await readSceneFile(path);
+    const entity = { ...snapshot.scene.entities[0]!, name: '箱 🧱 café' };
+    await writeFile(batchPath, JSON.stringify({ format: 'strata.scene-edit', version: 1, expectedRevision: snapshot.revision, operations: [{ op: 'set-entity', value: entity }] }), 'utf8');
+    const edited = await runCli(['edit', path, '--batch', batchPath]);
+    expect(edited.exitCode).toBe(0);
+    expect(edited.result).toMatchObject({ ok: true, changed: true });
+    expect((await readSceneFile(path)).scene.entities.find(({ id }) => id === entity.id)?.name).toBe('箱 🧱 café');
+    expect((await readdir(root)).sort()).toEqual(['scene.json', 'unicode.json']);
+  });
+
+  it('rejects an initial UTF-8 byte-order mark under the strict JSON policy', async () => {
+    const root = await directory();
+    const path = join(root, 'scene.json');
+    const batchPath = join(root, 'bom.json');
+    await runCli(['create', path, '--id', 'scene']);
+    const snapshot = await readSceneFile(path);
+    const batch = JSON.stringify({ format: 'strata.scene-edit', version: 1, expectedRevision: snapshot.revision, operations: [] });
+    await writeFile(batchPath, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(batch)]));
+    const rejected = await runCli(['edit', path, '--batch', batchPath]);
+    expect(rejected.exitCode).toBe(3);
+    expect(rejected.result).toMatchObject({ diagnostics: [{ code: 'INVALID_JSON', source: batchPath }] });
+    expect((await readSceneFile(path)).revision).toBe(snapshot.revision);
   });
 
   it('separates filesystem failures from invalid documents', async () => {

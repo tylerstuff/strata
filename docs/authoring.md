@@ -44,7 +44,7 @@ loader or a runtime bundle dependency.
 
 ## Version 1 scene contract
 
-The document uses strict JSON, with no comments, trailing commas, unknown fields
+The document uses strict UTF-8 JSON, with no byte-order mark, invalid UTF-8 bytes, comments, trailing commas, unknown fields
 or implicit coercion. `strata-scene schema scene` returns the JSON Schema inside
 its structured result. Semantic validation also checks finite numbers, duplicate
 IDs, references and quaternion length; the JSON Schema alone is not the complete
@@ -207,6 +207,8 @@ records (`null` for creation or removal). The code API also returns the resultin
 scene. CLI diff/edit output omits that full scene.
 
 Scene files are limited to 16 MiB. The parent directory must already exist.
+Edits retain existing file permission bits, including under a restrictive writer
+umask. New scenes use mode `0600` subject to that umask.
 The file API accepts regular files with one hard link, rejects leaf symlinks and
 resolves parent-directory symlinks to a common path. Edit writers use an adjacent
 `<scene>.strata-lock` and a temporary file followed by atomic rename. Creation

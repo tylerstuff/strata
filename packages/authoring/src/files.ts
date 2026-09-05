@@ -52,7 +52,10 @@ async function readSnapshot(path: string): Promise<SceneSnapshot & { text: strin
       if (bytes > MAX_SCENE_FILE_BYTES) tooLarge();
       chunks.push(chunk.subarray(0, bytesRead));
     }
-    const text = Buffer.concat(chunks, bytes).toString('utf8');
+    let text: string;
+    try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, bytes)); }
+    catch { throw failure('INVALID_UTF8', path, 'Scene file contains invalid UTF-8 bytes.',
+      'Save the scene as valid UTF-8 JSON; invalid bytes cannot be replaced without changing its data.'); }
     const result = parseScene(text, path);
     if (!result.ok) throw new AuthoringError(result.diagnostics);
     return { scene: result.value, revision: sceneRevision(result.value), text, mode: info.mode & 0o777 };
@@ -89,13 +92,16 @@ async function withLock<T>(path: string, action: (target: string) => Promise<T>)
   }
 }
 
-async function writeTemporary(target: string, text: string, mode: number): Promise<string> {
+async function writeTemporary(target: string, text: string, mode: number, preserveMode = false): Promise<string> {
   if (Buffer.byteLength(text, 'utf8') > MAX_SCENE_FILE_BYTES) throw failure('FILE_TOO_LARGE', target,
     `Serialized scene exceeds ${MAX_SCENE_FILE_BYTES} bytes.`, 'Split the authoring data into smaller scene documents.');
   const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
   const handle = await open(temporary, 'wx', mode);
   try {
     await handle.writeFile(text, 'utf8');
+    // open() applies the process umask. An existing scene's permission bits must
+    // survive replacement even when this writer has a more restrictive umask.
+    if (preserveMode) await handle.chmod(mode);
     await handle.sync();
   } catch (error) {
     await unlink(temporary).catch(() => undefined);
@@ -145,7 +151,7 @@ export async function editSceneFile(path: string, batch: SceneBatch): Promise<Ed
     const original = await readSnapshot(target);
     const result = preview(original.scene, batch);
     if (!result.changed) return result;
-    const temporary = await writeTemporary(target, serializeScene(result.scene), original.mode);
+    const temporary = await writeTemporary(target, serializeScene(result.scene), original.mode, true);
     try {
       // Detect even whitespace-only external writes observed during preparation. An unrelated
       // writer ignoring our lock could still race after this check; this is not a filesystem CAS.

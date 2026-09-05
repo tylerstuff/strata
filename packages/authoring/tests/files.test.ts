@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -46,6 +46,32 @@ describe('scene file transactions', () => {
     const result = await editSceneFile(path, move(scene, 0));
     expect(result.changed).toBe(false);
     expect(await readFile(path, 'utf8')).toBe(manual);
+  });
+
+  it('preserves an existing scene permission mode under a restrictive writer umask', async () => {
+    const { scene } = await createSceneFile(path, createProceduralScene());
+    await chmod(path, 0o660);
+    const previous = process.umask(0o077);
+    try {
+      await editSceneFile(path, move(scene, 5));
+      expect((await stat(path)).mode & 0o777).toBe(0o660);
+      const createdPath = join(directory, 'new.json');
+      await createSceneFile(createdPath, createProceduralScene('new-scene'));
+      expect((await stat(createdPath)).mode & 0o777).toBe(0o600);
+    } finally { process.umask(previous); }
+  });
+
+  it('rejects invalid UTF-8 without replacing bytes or leaving a lock, and preserves valid multibyte names', async () => {
+    const scene = createProceduralScene('unicode-scene', 'Valid 日本語 🏡');
+    await createSceneFile(path, scene);
+    expect((await readSceneFile(path)).scene.name).toBe(scene.name);
+    const invalid = Buffer.from(JSON.stringify({ ...scene, name: 'invalid-byte' }));
+    invalid[invalid.indexOf('invalid-byte')] = 0xff;
+    await writeFile(path, invalid);
+    await expect(readSceneFile(path)).rejects.toMatchObject({ diagnostics: [expect.objectContaining({ code: 'INVALID_UTF8' })] });
+    await expect(editSceneFile(path, move(scene, 8))).rejects.toMatchObject({ diagnostics: [expect.objectContaining({ code: 'INVALID_UTF8' })] });
+    expect(await readFile(path)).toEqual(invalid);
+    expect(await readdir(directory)).toEqual(['scene.json']);
   });
 
   it('allows exactly one concurrent writer from the same revision', async () => {

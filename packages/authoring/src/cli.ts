@@ -144,7 +144,16 @@ async function readBatch(path: string) {
       if (bytes > MAX_BATCH_FILE_BYTES) tooLarge();
       chunks.push(chunk.subarray(0, bytesRead));
     }
-    text = Buffer.concat(chunks, bytes).toString('utf8');
+    try {
+      // Preserve an initial BOM so JSON parsing rejects it instead of silently stripping it.
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, bytes));
+    } catch {
+      throw new AuthoringError([{
+        code: 'INVALID_UTF8', path: '', source: path,
+        message: 'Batch file contains invalid UTF-8 bytes.',
+        suggestion: 'Save the batch as valid UTF-8 JSON without a byte-order mark; repair invalid text instead of replacing bytes silently.',
+      }]);
+    }
   } catch (error) {
     if (error instanceof AuthoringError) throw error;
     const code = error instanceof Error && 'code' in error ? String(error.code) : 'UNKNOWN';
