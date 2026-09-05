@@ -73,7 +73,7 @@ Keep the worker same-origin with the page. Applications with a custom asset pipe
 
 Sites with a Content Security Policy must allow their worker and WASM URLs and WebAssembly compilation. No CDN, third-party requests, COOP/COEP headers, shared memory, or native extension is required by default.
 
-TypeScript owns WebGPU and browser orchestration. A module worker instantiates the precompiled Rust module, validates its ABI, and owns its unshared linear memory. The current ABI only establishes lifecycle and diagnostics. Future CPU jobs should cross this boundary in batches using packed transferable buffers, with explicit transfer and ownership; per-entity interop and computational features are deferred. Terminating the worker releases its entire WASM instance and heap. No threaded/shared-memory acceleration mode exists yet.
+TypeScript owns WebGPU and browser orchestration. A module worker instantiates the precompiled Rust module, validates its ABI, and owns its unshared linear memory. CPU ABI and worker protocol version 2 support an internal, cancellable static imported BVH job using coarse batches and copied transferable buffers. Its source restrictions, packed format, ownership and memory estimates are documented in [static tracing preparation](imported-static-bvh.md); this preparation alone does not enable imported GI. Future dense CPU jobs should use the same coarse ownership boundary. Terminating the worker releases its entire WASM instance and heap. No threaded/shared-memory acceleration mode exists yet.
 
 ## Validation
 

@@ -146,7 +146,7 @@ async function checkConsumer(kind, url) {
     for (let cycle = 0; cycle < 3; cycle++) {
       const initialized = await page.evaluate(() => strataTest.start());
       assert.equal(initialized.state, 'ready');
-      assert.equal(initialized.info.cpu.abiVersion, 1);
+      assert.equal(initialized.info.cpu.abiVersion, 2);
       assert.ok(initialized.info.cpu.memoryBytes >= 65_536);
       assert.equal(initialized.workers, 1);
       assert.equal(initialized.crossOriginIsolated, false);
