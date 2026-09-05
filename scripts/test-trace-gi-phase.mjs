@@ -8,12 +8,15 @@ import { promisify } from 'node:util';
 import { deflateSync } from 'node:zlib';
 import { bundleTraceProof, newExternalDirectory, proofHash, traceProofInputs } from './test-trace-updates.mjs';
 import { compareTraceGiPhaseCells } from './trace-gi-phase-comparison.mjs';
+import { createOwnedBrowserLaunch } from './owned-browser-launch.mjs';
+import { createPhaseNetworkObserver, PHASE_NETWORK_LIMITS } from './phase-network-observer.mjs';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const command = promisify(execFile);
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
 const inside = (root, path) => { const p = relative(root, path); return !isAbsolute(p) && p !== '..' && !p.startsWith(`..${sep}`); };
 export const PHASE_SOURCE = 'c91c285489a9befe8ce27d7264dfc56a295d12d5';
+export const PHASE_BROWSER_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 export const PHASE_PLAN_SHA = '590b30bae791b4654c92e9e633a8c4e965d9f8f9af87dd1545459f3bdb5e942d';
 export const PHASE_RUNS = Object.freeze([
   { id: '1-incremental-5399', updater: 'incremental', phaseLabel: 5399 },
@@ -25,6 +28,8 @@ export const PHASE_LIMITS = Object.freeze({ totalMs: 300000, workMs: 280000, cle
   maxArtifactBytes: 32 * 1024 ** 2, maxCellBytes: 256 * 1024 ** 2, maxTotalBytes: 1024 ** 3,
   maxArtifactsPerCell: 4096, maxEventsPerCell: 512, maxEventBytes: 1024 ** 2,
   maxCellEventBytes: 16 * 1024 ** 2, maxPngBytes: 4 * 1024 ** 2,
+  maxLifecycleEvents: 64,
+  network: PHASE_NETWORK_LIMITS,
   byteCapScope: 'Artifact/cell/total byte caps count raw native artifacts; PNG derivatives and event logs have separate explicit caps. Four bounded cell summaries and one combined report repeat metadata, never raw payloads.' });
 export const PHASE_PROBE_OBSERVABLES = Object.freeze({ inspectedProbeCount: 384, finalEpoch: 2,
   validityWords: Object.freeze([0, 1]), requireEveryProbeValid: false, reportInvalidCounts: true,
@@ -129,7 +134,8 @@ async function shaderSources(api) {
 }
 async function runnerGraph() {
   const files = ['scripts/test-trace-gi-phase.mjs', 'scripts/trace-gi-phase-comparison.mjs', 'scripts/test-trace-updates.mjs',
-    'scripts/benchmark-server.mjs', 'scripts/gallery-catalog.mjs', 'package.json', 'package-lock.json'];
+    'scripts/benchmark-server.mjs', 'scripts/gallery-catalog.mjs', 'scripts/owned-browser-launch.mjs',
+    'scripts/phase-network-observer.mjs', 'package.json', 'package-lock.json'];
   return Object.fromEntries(await Promise.all(files.map(async path => [path, proofHash(await readFile(resolve(repository, path)))])));
 }
 export async function preparePhase(args) {
@@ -151,12 +157,13 @@ export async function preparePhase(args) {
     await writeFile(resolve(output, name), bytes, { flag: 'wx' }); artifacts.push({ name, bytes: Buffer.byteLength(bytes), sha256: proofHash(bytes) });
   }
   const runners = await runnerGraph();
+  const browserExecutable = { path: await realpath(PHASE_BROWSER_EXECUTABLE), sha256: proofHash(await readFile(PHASE_BROWSER_EXECUTABLE)) };
   for (const b of [candidate, control, cpu]) for (const [path, sha] of Object.entries(b.modules)) await verifyPhaseFile(resolve(repository, path), { sha256: sha });
   assert.deepEqual(await sourceState(), before, 'Source changed during preparation.');
   const manifest = { schemaVersion: 1, kind: 'strata-issue20-shared-lighting-phase-diagnostic', correctnessOnly: true, performanceEligible: false,
     runnable: !before.status && !args['--allow-dirty-draft'], createdAt: new Date().toISOString(), source: before,
     measuredBase: PHASE_SOURCE, planSha256: PHASE_PLAN_SHA, runs: PHASE_RUNS, limits: PHASE_LIMITS,
-    probeObservables: PHASE_PROBE_OBSERVABLES, assets, runners,
+    probeObservables: PHASE_PROBE_OBSERVABLES, assets, runners, browserExecutable,
     bundles: { incremental: candidate, full: control, cpu }, artifacts,
     shaders: Object.fromEntries(Object.entries(shaders).map(([key, code]) => [key, proofHash(code)])),
     diagnosticShaders: Object.fromEntries(Object.entries(diagnosticShaders).map(([key, code]) => [key, proofHash(code)])) };
@@ -172,6 +179,8 @@ export async function verifyPhase(manifestPath, sha256) {
   assert.equal(manifest.measuredBase, PHASE_SOURCE); assert.equal(manifest.planSha256, PHASE_PLAN_SHA);
   assert.deepEqual(manifest.runs, PHASE_RUNS); assert.deepEqual(manifest.limits, PHASE_LIMITS);
   assert.deepEqual(manifest.probeObservables, PHASE_PROBE_OBSERVABLES);
+  assert.equal(manifest.browserExecutable?.path, await realpath(PHASE_BROWSER_EXECUTABLE));
+  await verifyPhaseFile(PHASE_BROWSER_EXECUTABLE, manifest.browserExecutable);
   assert.deepEqual(await sourceState(), manifest.source, 'Exact clean reviewed source required.'); await verifyRuntimeBase();
   assert.deepEqual(await runnerGraph(), manifest.runners); assertPhaseBundleGraph(manifest.bundles.incremental, manifest.bundles.full);
   for (const file of [...manifest.artifacts, ...Object.values(manifest.bundles).flatMap(b => b.files)]) {
@@ -241,7 +250,8 @@ export async function closePhaseBrowser(browserServer) {
 export function finalizePhaseStatus(report, elapsedMs) {
   if (report.browserErrors.length || report.status !== 'pass' || !report.cleanup.browserExited || !report.cleanup.serverClosed
     || !report.cleanup.deviceDestroyed || !report.cleanup.artifactsDrained || !report.cleanup.frozenInputsVerified
-    || report.cleanup.forcedKill || elapsedMs >= PHASE_LIMITS.totalMs) report.status = 'fail';
+    || !report.cleanup.browserOwnershipVerified || !report.cleanup.browserLaunchSettled
+    || report.network?.admissible !== true || report.cleanup.forcedKill || elapsedMs >= PHASE_LIMITS.totalMs) report.status = 'fail';
   report.observedElapsedMs = elapsedMs; return report.status;
 }
 /** A disk report is a provisional data artifact, never independently a passing run. */
@@ -259,7 +269,7 @@ export async function publishPhaseReport(report, path, started, { now = () => pe
 }
 
 /** Loopback server serves ONLY the reviewed bundles and allowlisted assets, verifying bytes on each request. */
-async function frozenPhaseServer(frozen, failures) {
+async function frozenPhaseServer(frozen, failures, network) {
   const routes = new Map();
   for (const name of ['incremental.mjs', 'full.mjs', 'workload.json', 'shaders.json', 'diagnostic-shaders.json']) {
     const record = [...frozen.manifest.artifacts, ...Object.values(frozen.manifest.bundles).flatMap(b => b.files)].find(a => a.name === name);
@@ -267,6 +277,7 @@ async function frozenPhaseServer(frozen, failures) {
   }
   for (const file of frozen.manifest.assets.files) routes.set(`/external-assets/${file.name}`, { ...file, path: resolve(frozen.manifest.assets.root, file.name) });
   const server = createServer(async (request, response) => {
+    network.server(request, response);
     try {
       assert(/^127\.0\.0\.1(?::\d+)?$/.test(request.headers.host ?? '') && request.method === 'GET', 'Unapproved request host/method.');
       if (request.url === '/proof.html') { response.writeHead(200, { 'Content-Type': 'text/html' }).end('<!doctype html><title>Strata phase diagnostic</title><link rel="icon" href="data:,">'); return; }
@@ -283,22 +294,44 @@ export async function runPhase(args) {
   const output = await newExternalDirectory(args['--output']);
   const report = { kind: 'strata-issue20-shared-lighting-phase-results', correctnessOnly: true, performanceEligible: false,
     startedAt: new Date().toISOString(), manifest: { path: resolve(args['--manifest']), sha256: args['--manifest-sha256'] },
-    status: 'running', browserErrors: [], cells: [], cleanup: {}, limits: PHASE_LIMITS };
-  let browser, browserServer, server, watchdog, stopped = false, acceptingCallbacks = true, activeCell = null, totalBytes = 0, published;
+    status: 'running', browserErrors: [], cells: [], cleanup: {}, lifecycleEvents: [], limits: PHASE_LIMITS };
+  let browser, browserServer, server, watchdog, launchOwner, stopped = false, acceptingCallbacks = true, activeCell = null, totalBytes = 0, published;
+  let lifecycleStage = 'preflight-completed';
+  const network = createPhaseNetworkObserver({ now: () => performance.now() - started,
+    stage: () => ({ stage: lifecycleStage, cellId: activeCell?.id ?? null }),
+    error: message => report.browserErrors.push(`Network evidence: ${message}`) });
+  const stage = (name, archive = true) => {
+    lifecycleStage = name;
+    if (archive) {
+      if (report.lifecycleEvents.length >= PHASE_LIMITS.maxLifecycleEvents) {
+        if (!report.lifecycleOverflow) report.browserErrors.push('Lifecycle evidence cap exceeded.');
+        report.lifecycleOverflow = true; return;
+      }
+      report.lifecycleEvents.push({ stage: name, cellId: activeCell?.id ?? null, elapsedMs: performance.now() - started });
+    }
+  };
   const active = () => { assert(!stopped && performance.now() - started < PHASE_LIMITS.workMs, 'Diagnostic work ended.'); };
   const remainingWork = maximum => Math.max(1, Math.min(maximum, PHASE_LIMITS.workMs - (performance.now() - started)));
   let writes = Promise.resolve();
   const persist = fn => { assert(acceptingCallbacks, 'Diagnostic artifact/event admission is closed.'); writes = writes.then(fn); return writes; };
   const work = async () => {
-    const { chromium } = await import('playwright'); active();
-    server = await frozenPhaseServer(frozen, report.browserErrors);
+    stage('server-creation');
+    server = await frozenPhaseServer(frozen, report.browserErrors, network);
     if (stopped) { await server.close(); throw Error('Timed out during server creation.'); } active();
-    browserServer = await chromium.launchServer({ channel: process.env.STRATA_TEST_BROWSER_CHANNEL ?? 'chromium', headless: process.env.STRATA_TEST_HEADED !== '1',
-      timeout: remainingWork(30000), args: ['--enable-unsafe-webgpu'] });
+    assert.equal(process.env.STRATA_OWNED_BROWSER_EXECUTABLE_PATH, frozen.manifest.browserExecutable.path, 'Supervisor browser executable differs.');
+    assert.equal(process.env.STRATA_OWNED_BROWSER_EXECUTABLE_SHA256, frozen.manifest.browserExecutable.sha256, 'Supervisor browser SHA256 differs.');
+    launchOwner = createOwnedBrowserLaunch({ executablePath: frozen.manifest.browserExecutable.path, temporaryDirectory: process.env.TMPDIR });
+    stage('browser-launch'); let chromium;
+    browserServer = await launchOwner.launch(async () => {
+      ({ chromium } = await import('playwright')); active();
+      return chromium.launchServer({ executablePath: frozen.manifest.browserExecutable.path, headless: process.env.STRATA_TEST_HEADED !== '1',
+        timeout: remainingWork(30000), args: ['--enable-unsafe-webgpu'] });
+    });
     if (stopped) { await browserServer.kill(); throw Error('Timed out during browser launch.'); }
     const child = browserServer.process(); report.browserProcess = { pid: child.pid, spawnedAt: new Date().toISOString() };
     active(); browser = await chromium.connect(browserServer.wsEndpoint(), { timeout: remainingWork(15000) }); active(); report.browser = browser.version();
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 1 });
+    for (const [name, callback] of Object.entries(network.browser)) page.on(name, callback);
     page.setDefaultTimeout(15000); page.setDefaultNavigationTimeout(15000);
     page.on('pageerror', e => report.browserErrors.push(String(e))); page.on('console', m => { if (m.type() === 'error') report.browserErrors.push(m.text()); });
     page.on('requestfailed', r => report.browserErrors.push(`${r.url()}: ${r.failure()?.errorText}`));
@@ -316,13 +349,17 @@ export async function runPhase(args) {
         await writeFile(resolve(output, cellId, name), png, { flag: 'wx' }); cell.pngs.push({ name, bytes: png.length, sha256: proofHash(png), source: artifact.name });
       }
     }));
-    await page.exposeFunction('recordPhaseEvent', (cellId, event) => persist(async () => {
+    await page.exposeFunction('recordPhaseEvent', (cellId, event) => {
+      stage(`cell-${event.type}`, event.type === 'creation' || event.type === 'cell-cleanup');
+      return persist(async () => {
       assert.equal(cellId, activeCell?.id, 'Event belongs to inactive cell.');
       const line = JSON.stringify({ cellId, at: new Date().toISOString(), event }) + '\n', size = Buffer.byteLength(line);
       assert(activeCell.events.length < PHASE_LIMITS.maxEventsPerCell && size <= PHASE_LIMITS.maxEventBytes
         && activeCell.eventBytes + size <= PHASE_LIMITS.maxCellEventBytes, 'Event cap exceeded.');
       activeCell.events.push(event); activeCell.eventBytes += size; await appendFile(resolve(output, 'events.jsonl'), line);
-    }));
+      });
+    });
+    stage('device-creation');
     await page.goto(`${server.url}/proof.html`); active();
     // One hardware device for the invocation; every renderer/cache cell is freshly owned.
     report.deviceResult = await page.evaluate(async () => {
@@ -356,6 +393,7 @@ export async function runPhase(args) {
     });
     for (const run of PHASE_RUNS) {
       active(); activeCell = { ...run, bytes: 0, eventBytes: 0, artifacts: [], pngs: [], events: [] }; report.cells.push(activeCell);
+      stage('cell-start');
       const cell = activeCell;
       const completed = await withPhaseDeadline(() => page.evaluate(async run => {
         const s = globalThis.strataPhaseState;
@@ -387,9 +425,11 @@ export async function runPhase(args) {
   watchdog = setTimeout(() => { stopped = true; report.cleanup.forcedKill = true; void browserServer?.kill().catch(e => report.browserErrors.push(String(e))); },
     Math.max(1, PHASE_LIMITS.totalMs - 1000 - (performance.now() - started)));
   try { await withPhaseDeadline(work, 'Phase diagnostic work', Math.max(1, PHASE_LIMITS.workMs - (performance.now() - started))); }
-  catch (error) { report.status = 'fail'; report.failure = { message: error.message, stack: error.stack, proofDifference: error.proofDifference, proofEvidence: error.proofEvidence }; }
+  catch (error) { stage('work-failed'); report.status = 'fail'; report.failure = { message: error.message, stack: error.stack, proofDifference: error.proofDifference, proofEvidence: error.proofEvidence }; }
   finally {
     stopped = true; acceptingCallbacks = false;
+    // A matched native handle remains available even if observation made launch reject.
+    browserServer ??= launchOwner?.server;
     try {
       if (browser && !report.cleanup.deviceDestroyed) {
         // Failure cleanup is also recorded; cell resources are destroyed by the helper's finally block.
@@ -403,13 +443,19 @@ export async function runPhase(args) {
     try {
       await withPhaseDeadline(async () => {
         const cleanup = await Promise.allSettled([
-          (async () => { if (browserServer) await closePhaseBrowser(browserServer); report.cleanup.browserExited = true; })(),
-          (async () => { if (server) await server.close(); report.cleanup.serverClosed = true; })(),
+          (async () => { stage('browser-close-start'); if (browserServer) {
+            await closePhaseBrowser(browserServer); report.cleanup.browserExited = true;
+          } stage('browser-close-finished'); })(),
+          (async () => { stage('server-close-start'); if (server) await server.close();
+            report.cleanup.serverClosed = true; stage('server-close-finished'); })(),
         ]);
         for (const item of cleanup) if (item.status === 'rejected') { report.status = 'fail'; report.browserErrors.push(String(item.reason)); }
         // Callback admission is closed; drain the complete accepted chain only after browser closure.
-        await writes; report.cleanup.artifactsDrained = true;
-        await verifyPhase(args['--manifest'], args['--manifest-sha256']); report.cleanup.frozenInputsVerified = true;
+        const finalChecks = await Promise.allSettled([
+          writes.then(() => { report.cleanup.artifactsDrained = true; }),
+          verifyPhase(args['--manifest'], args['--manifest-sha256']).then(() => { report.cleanup.frozenInputsVerified = true; }),
+        ]);
+        for (const item of finalChecks) if (item.status === 'rejected') { report.status = 'fail'; report.browserErrors.push(String(item.reason)); }
       }, 'Browser/server/artifact cleanup', PHASE_LIMITS.cleanupMs);
     } catch (error) { report.status = 'fail'; report.browserErrors.push(String(error)); }
     if (browserServer && !report.cleanup.browserExited) {
@@ -419,6 +465,14 @@ export async function runPhase(args) {
         const p = browserServer.process(); report.cleanup.browserExited = p.exitCode !== null || p.signalCode !== null;
       } catch (error) { report.browserErrors.push(String(error)); }
     }
+    report.browserOwnership = { records: launchOwner?.records ?? [], errors: (launchOwner?.errors ?? []).map(String),
+      pending: launchOwner?.pending ?? false, matchedServerPid: launchOwner?.server?.process().pid ?? null,
+      unverifiedSpawns: launchOwner?.unverifiedSpawns ?? [],
+      children: (launchOwner?.children ?? []).map(p => ({ pid: p.pid, exitCode: p.exitCode, signalCode: p.signalCode })) };
+    report.cleanup.browserLaunchSettled = Boolean(launchOwner && !launchOwner.pending);
+    report.cleanup.browserOwnershipVerified = Boolean(launchOwner?.server && launchOwner.children.length === 1 &&
+      launchOwner.errors.length === 0 && launchOwner.unverifiedSpawns.length === 0 && launchOwner.server.process() === launchOwner.children[0]);
+    report.network = network.snapshot(); network.dispose();
     finalizePhaseStatus(report, performance.now() - started);
     report.collectionCleanupCompletedAt = new Date().toISOString(); report.totalRawBytes = totalBytes;
     try { published = await publishPhaseReport(report, resolve(output, 'report.json'), started); }

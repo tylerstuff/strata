@@ -96,12 +96,13 @@ test('native PNG preserves BGRA channel values exactly without exposure, resampl
   assert.throws(() => phaseNativePng(source, 3, 2));
 });
 test('late errors, missing device/browser/server teardown, forced kill and whole deadline cannot pass', () => {
-  const valid = () => ({ status: 'pass', browserErrors: [], cleanup: { deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
+  const valid = () => ({ status: 'pass', browserErrors: [], network: { admissible: true }, cleanup: { browserOwnershipVerified: true, browserLaunchSettled: true, deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
   assert.equal(finalizePhaseStatus(valid(), 1000), 'pass');
   for (const mutation of [r => r.browserErrors.push('late GPU error'), r => { r.cleanup.deviceDestroyed = false; },
     r => { r.cleanup.browserExited = false; }, r => { r.cleanup.serverClosed = false; }, r => { r.cleanup.forcedKill = true; },
     r => { r.cleanup.artifactsDrained = false; }, r => { r.cleanup.frozenInputsVerified = false; },
-    r => { r.status = 'fail'; }]) { const r = valid(); mutation(r); assert.equal(finalizePhaseStatus(r, 1000), 'fail'); }
+    r => { r.cleanup.browserOwnershipVerified = false; }, r => { r.cleanup.browserLaunchSettled = false; },
+    r => { r.network.admissible = false; }, r => { delete r.network; }, r => { r.status = 'fail'; }]) { const r = valid(); mutation(r); assert.equal(finalizePhaseStatus(r, 1000), 'fail'); }
   assert.equal(finalizePhaseStatus(valid(), PHASE_LIMITS.totalMs), 'fail');
 });
 test('cleanup confirms the exact owned child exited, not merely a resolved close promise', async t => {
@@ -132,7 +133,7 @@ test('an operation queued before expiry cannot start after the monotonic deadlin
   await assert.rejects(pending, /deadline/); assert.equal(calls, 0);
 });
 test('disk reports stay provisional and a late completed write cannot return an admitted child success', async () => {
-  const report = () => ({ status: 'pass', browserErrors: [], cleanup: { deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
+  const report = () => ({ status: 'pass', browserErrors: [], network: { admissible: true }, cleanup: { browserOwnershipVerified: true, browserLaunchSettled: true, deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
   let clock = 100, written;
   const runtime = { now: () => clock, write: async (_path, bytes) => { written = JSON.parse(bytes); clock = PHASE_LIMITS.totalMs + 1; } };
   await assert.rejects(publishPhaseReport(report(), '/synthetic-report.json', 0, runtime), /deadline/);
