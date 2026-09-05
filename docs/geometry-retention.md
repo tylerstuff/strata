@@ -106,7 +106,24 @@ deadlock, intermediate, failed-request and input cases. Cache lifecycle tests co
 real validated page payloads, controlled completion and injected upload failures.
 The CPU checkpoint passes all 279 repository unit tests and both TypeScript projects.
 
-Controlled GPU depth/coverage/history witnesses and matched-route measurements are
-required before any default-policy decision. CPU completeness alone is not evidence
+The hardware Chrome 152 check at commit `6da4b8b97eda3ee411a5ac165c77a86969691bc7`
+passes all 47 frames across four real-cache cases on Apple's Metal adapter. A fresh
+certified one-tile source has 8,192 finest triangles, seven levels, one root page,
+five finest pages and three pages for the requested replacement. At a six-page
+pool (393,216 bytes), greedy eviction temporarily selects the 256-triangle root;
+retention keeps the 8,192-triangle complete fine level and explicitly reports the
+blocked target. At nine pages (589,824 bytes), both policies keep the fine level
+through partial replacement uploads and switch only once all three target pages
+are resident. Every depth pixel matches independent ordinary-vertex geometry,
+all 50,176 covered pixels remain covered, and history rejection occurs on topology
+changes rather than on mere desired-LOD changes. These are fixed-demand cases;
+incidental shared-page protection is covered by the independent CPU tests.
+
+Run this witness with `node scripts/test-geometry-retention.mjs`; it is included in
+`npm run test:geometry`. Hardware evidence and all images remain external under
+`~/Downloads/Strata-Benchmark-Results/2026-09-05T06-37-05.716Z-geometry-retention/`.
+Report SHA-256: `88708e7418884bc92d0fd6d18fb24142641f2f9c40e20090c0760a30069564cb`.
+
+Matched-route measurements remain required before any default-policy decision. CPU completeness alone is not evidence
 that the integrated benchmark looks better or reaches 60 FPS. Images and reports
 remain external, and issue #13 stays open.
