@@ -77,14 +77,25 @@ a late cancellation. A hard cleanup timeout reports an unknown outcome and fault
 the connection rather than asserting that no capture was published. Late results
 cannot re-enable admission. `presentedFrameId` remains unobserved.
 
-Protocol bounds are 64 KiB per input line, four MiB per response, eight outstanding
-requests, one mutation, one inspection and 32 small terminal status records. The
-output writer honors backpressure and has a bounded queue. Scene input retains
+Protocol bounds are 64 KiB per input line, four MiB per response including its LF,
+eight outstanding requests, one mutation, one inspection and 32 small terminal
+status records. At most six ordinary requests may remain outstanding; the final
+two slots are reserved for `cancel` and `dispose`. A request occupies its transport
+slot until its response is written. Ordinary-capacity exhaustion stops admission
+and starts bounded shutdown; at most one overflow error is attempted within the
+remaining output budget, rather than producing an unbounded stream of busy errors.
+The output writer honors backpressure and retains at most eight complete response
+buffers and 32 MiB in total, including the currently blocked write. No request is
+accepted solely to create an error beyond those bounds. Scene input retains
 authoring's 16 MiB regular-file limit. Dimensions and frames retain preview's
 existing limits (16,384 per axis, 64 Mi pixels total, one to eight capture frames).
 Default operation/cleanup deadlines are 30 seconds/five seconds; startup overrides
 are bounded to 300 seconds. Unsettled dependencies fault and close admission; a
-cleanup deadline is not proof that every OS resource closed.
+cleanup deadline is not proof that every OS resource closed. Shutdown tracks pending
+request/publication settlement separately from `PreviewSession.dispose()`, which
+awaits driver cleanup alone. The final response drain shares the configured cleanup
+deadline starting at shutdown; expiry stops the transport and records uncertain
+delivery/outcomes without implying rollback.
 
 Input paths must be nonempty project-relative paths without `..`, absolute paths,
 URL schemes, backslashes or control characters. Canonical containment and link
