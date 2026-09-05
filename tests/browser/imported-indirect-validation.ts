@@ -258,7 +258,8 @@ async function radiometricBatch(device: GPUDevice, pipes: Pipelines, options: Ba
     device.queue.submit([encoder.finish()]);
     const [stateBytes, countBytes, diagnosticBytes, output] = await Promise.all([readBuffer(device, c.states), readBuffer(device, c.counts), readBuffer(device, c.queryResults), readTexture(device, c.output, width, height)]);
     const states = new Float32Array(stateBytes), stateWords = new Uint32Array(stateBytes), counters = [...new Uint32Array(countBytes)], diagnostic = new Float32Array(diagnosticBytes);
-    const sum = [0, 0, 0], expectedSum = [0, 0, 0]; let maximumError = 0, sourceHits = 0, primaryMisses = 0, secondarySkyMisses = 0;
+    const sum = [0, 0, 0], expectedSum = [0, 0, 0], directionSum = [0, 0, 0];
+    let maximumError = 0, sourceHits = 0, bounceWallHits = 0, primaryMisses = 0, secondarySkyMisses = 0;
     for (let pixel = 0; pixel < count; pixel++) {
       const s = pixel * 8, d = pixel * 32;
       if (options.visits === 1) {
@@ -270,6 +271,7 @@ async function radiometricBatch(device: GPUDevice, pipes: Pipelines, options: Ba
       const direction = [...diagnostic.slice(d, d + 3)] as unknown as V3, origin = [...diagnostic.slice(d + 4, d + 7)] as unknown as V3;
       near(Math.hypot(...direction), 1, 2e-6, 'Generated primary unit direction'); require(direction[1] > 0, 'Primary hemisphere points into receiver.');
       near(direction[1], Math.sqrt(1 - diagnostic[d + 31]!), 2e-6, 'Primary cosine matches chosen sample probability');
+      direction.forEach((value, axis) => { directionSum[axis]! += value; });
       near(origin[0], 0, 1e-7, 'Primary origin X'); near(origin[2], 0, 1e-7, 'Primary origin Z'); require(origin[1] > 0 && origin[1] < 1e-5, 'Primary geometric offset is not bounded/outward.');
       const hit = hitQuads(options.quads, origin, direction); const incoming = [0, 0, 0];
       if (!hit) {
@@ -277,6 +279,7 @@ async function radiometricBatch(device: GPUDevice, pipes: Pipelines, options: Ba
         for (let channel = 0; channel < 3; channel++) incoming[channel] = options.environment?.[channel] ?? 0;
       } else {
         sourceHits++; require(diagnostic[d + 3] === 1, 'GPU secondary miss disagrees with independent plane hit.');
+        if (hit.quad.name === 'bounce-wall') bounceWallHits++;
         const gpuPoint = [...diagnostic.slice(d + 8, d + 11)] as unknown as V3, secondaryOrigin = [...diagnostic.slice(d + 16, d + 19)] as unknown as V3;
         hit.point.forEach((value, axis) => near(gpuPoint[axis]!, value, 3e-6, 'Secondary geometric point'));
         const normal = dot(hit.quad.normal, direction) > 0 ? hit.quad.normal.map(v => -v) as unknown as V3 : hit.quad.normal;
@@ -304,7 +307,19 @@ async function radiometricBatch(device: GPUDevice, pipes: Pipelines, options: Ba
     require(counters[0] === count, 'Attempt count differs from explicit point queries.');
     require(counters[2] === (options.visits === 1 ? count : 0) && counters[3] === 0 && counters[1] === (options.visits === 1 ? 0 : count), 'GPU completion/failure accounting differs.');
     const mean = sum.map(value => value / count), referenceMean = expectedSum.map(value => value / count);
-    return { name: options.name, queryCount: count, counters, mean, sameRayReferenceMean: referenceMean, maximumSameRayError: maximumError, sourceHits, primaryMisses, secondarySkyMisses,
+    const meanDirection = directionSum.map(value => value / count);
+    // Frozen before any GPU result: broad, deterministic distribution sanity,
+    // not confidence intervals. These prevent a collapsed all-miss sampler from
+    // passing otherwise-exact same-ray arithmetic without exercising a bounce.
+    if (options.visits !== 1) [0, 2 / 3, 0].forEach((value, axis) => near(meanDirection[axis]!, value, 0.03, 'Cosine hemisphere distribution sanity'));
+    let expectedHitProbability: number | undefined;
+    if (options.name === 'offscreen-colored-wall' || options.name === 'aperture') {
+      const wall = options.name === 'aperture' ? importedIndirectFixture.apertureWall : importedIndirectFixture.wall;
+      expectedHitProbability = wallCosineProbability({ ...wall, yMin: wall.yMin - diagnostic[5]!, yMax: wall.yMax - diagnostic[5]! });
+      near(bounceWallHits / count, expectedHitProbability, 0.02, 'Finite wall hit-fraction sanity');
+      require(bounceWallHits > 0 && mean[0]! > 0, 'Colored offscreen source was not sampled.');
+    }
+    return { name: options.name, queryCount: count, counters, mean, sameRayReferenceMean: referenceMean, maximumSameRayError: maximumError, sourceHits, bounceWallHits, primaryMisses, secondarySkyMisses, meanDirection, expectedHitProbability,
       closedForm: options.name === 'offscreen-colored-wall' ? directWallBounceReference().mean : options.name === 'empty-constant-environment' ? [1, 2, 4] : undefined,
       closedFormGate: 'Same-ray agreement is authoritative; deterministic hash sequence is not assigned an IID confidence guarantee.' };
   } finally { c.resources.dispose(); }
@@ -463,12 +478,15 @@ export async function validateImportedIndirect() {
       { name: 'closed-black-enclosure', quads: createBlackEnclosureReferenceQuads(), light: false, environment: [2, 4, 8] as V3 },
       { name: 'exhausted-not-sky', quads: createIndirectReferenceQuads({ opening: 'aperture' }), visits: 1, environment: [2, 4, 8] as V3 },
     ] satisfies BatchOptions[]) batches.push(await radiometricBatch(device, pipes, options));
+    const open = batches.find(batch => batch.name === 'offscreen-colored-wall')!, aperture = batches.find(batch => batch.name === 'aperture')!, closed = batches.find(batch => batch.name === 'closed-opening')!;
+    require(open.mean[0]! > aperture.mean[0]! && aperture.mean[0]! > 0 && closed.mean.every(value => value === 0), 'Open/aperture/closed source visibility did not change indirect energy.');
     const lifecycle = await effectLifecycle(device, pipes); await bounded(device.queue.onSubmittedWorkDone(), 'Final diagnostic fence');
     for (let i = 0; i < 3; i++) { const error = await bounded(device.popErrorScope(), 'Diagnostic error scope'); if (error) errors.push(error.message); }
     require(errors.length === 0, errors.join('\n'));
     return { status: 'passed', performanceEvidence: false, adapter: { vendor: adapter.info.vendor, architecture: adapter.info.architecture, device: adapter.info.device, description: adapter.info.description, isFallbackAdapter: adapter.info.isFallbackAdapter },
       trace, environment, batches, lifecycle, errors,
       tolerances: { sameRayLinearRadiance: 5e-5, composedHalfFloat: 0.002, materialSrgb: 0.0003, emissionSrgb: 0.003, geometryPoint: 3e-6, unitDirection: 2e-6 },
+      distributionSanity: { frozenBeforeGpu: true, interpretation: 'Broad deterministic non-vacuity bands, not IID confidence bounds.', meanDirectionAbsoluteBand: 0.03, wallHitProbabilityAbsoluteBand: 0.02 },
       limitations: ['Generated static one-material OPAQUE geometry only. No imported assets, performance, all-scene, or visual-quality claim.',
         'Radiometric batches use singular matrices to map every synthetic pixel to the same explicit point; they test unchanged production estimator WGSL, not camera reconstruction.',
         'The separate effect case uses a valid orthographic camera and exact synthetic raster depth. It does not replace end-to-end imported raster validation.',
