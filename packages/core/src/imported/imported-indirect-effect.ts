@@ -3,11 +3,11 @@ import type { RasterGiProvider } from '../rendering/gi-provider.js';
 import type { CameraFrame } from '../rendering/raster-math.js';
 import type { RasterControls, RasterOutputs, RasterTimestamps } from '../rendering/raster-types.js';
 import { importedIndirectShader } from './imported-indirect-shader.js';
+import { normalizeImportedIndirectOptions, validateImportedIndirectSize } from './imported-indirect-options.js';
 import type { ImportedIndirectCreateOptions, ImportedIndirectEnvironment, ImportedIndirectLighting, ImportedIndirectMaterial,
   ImportedIndirectOptions, ImportedIndirectProgress, ImportedIndirectReadback, ImportedIndirectSource } from './imported-indirect-types.js';
 
 const uniformBytes = 288, diagnosticBytes = 16, pixelBytes = 32;
-const defaults: Required<ImportedIndirectOptions> = { maxPixels: 262144, pixelBatch: 4096, maxSamples: 64, maxVisits: 4096, seed: 1337 };
 function fail(message: string): never { throw new StrataError('INVALID_OPTIONS', `Imported indirect: ${message}`); }
 function aborted(signal?: AbortSignal): void { if (signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Imported indirect creation was cancelled.'); }
 function scalar(value: unknown, min: number, max: number, name: string): number {
@@ -16,14 +16,6 @@ function scalar(value: unknown, min: number, max: number, name: string): number 
 function vector(value: unknown, length: number, min: number, max: number, name: string): number[] {
   if (!Array.isArray(value) || value.length !== length) fail(`${name} needs ${length} components.`);
   return Array.from(value, component => scalar(component, min, max, name));
-}
-function settings(input: ImportedIndirectOptions = {}, current = defaults): Required<ImportedIndirectOptions> {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) fail('options must be an object.');
-  const next = { ...current, ...input };
-  for (const [key, min, max] of [['maxPixels', 1, 1048576], ['pixelBatch', 1, 65536], ['maxSamples', 1, 1024], ['maxVisits', 1, 524287], ['seed', 0, 0xffffffff]] as const) {
-    scalar(next[key], min, max, key); if (!Number.isInteger(next[key])) fail(`${key} must be an integer.`);
-  }
-  return next;
 }
 function lighting(input: ImportedIndirectLighting): ImportedIndirectLighting {
   if (!input || typeof input !== 'object') fail('lighting must be an object.');
@@ -95,7 +87,7 @@ export class ImportedIndirectEffect implements RasterGiProvider {
     private light: ImportedIndirectLighting, private env: ImportedIndirectEnvironment, private limits: Required<ImportedIndirectOptions>) {}
   static async create(device: GPUDevice, input: ImportedIndirectCreateOptions): Promise<ImportedIndirectEffect> {
     if (!input) fail('creation options are required.'); aborted(input.signal);
-    const limits = settings(input.options), light = lighting(input.lighting), env = environment(input.environment), m = input.material;
+    const limits = normalizeImportedIndirectOptions(input.options), light = lighting(input.lighting), env = environment(input.environment), m = input.material;
     if (!m || !m.baseColorTexture || !m.baseSampler || !m.metallicRoughnessTexture || !m.metallicRoughnessSampler || !m.emissiveTexture || !m.emissiveSampler || typeof m.doubleSided !== 'boolean') fail('borrowed material bindings and boolean doubleSided are required.');
     const material: ImportedIndirectMaterial = { ...m, baseColorFactor: vector(m.baseColorFactor, 4, 0, 1, 'base color') as [number, number, number, number], metallicFactor: scalar(m.metallicFactor, 0, 1, 'metallic factor'),
       emissiveFactor: vector(m.emissiveFactor, 3, 0, 1, 'emissive factor') as [number, number, number], emissiveStrength: scalar(m.emissiveStrength, 0, 1e6, 'emissive strength') };
@@ -138,17 +130,18 @@ export class ImportedIndirectEffect implements RasterGiProvider {
     this.idle(); const nextLight = lighting(value), nextEnvironment = env === undefined ? this.env : environment(env);
     if (JSON.stringify([nextLight, nextEnvironment]) !== JSON.stringify([this.light, this.env])) { this.light = nextLight; this.env = nextEnvironment; this.dirty = true; }
   }
-  updateSettings(value: ImportedIndirectOptions): void { this.idle(); const next = settings(value, this.limits); if (JSON.stringify(next) !== JSON.stringify(this.limits)) { this.limits = next; this.dirty = true; } }
+  updateSettings(value: ImportedIndirectOptions): void {
+    this.idle();
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail('options must be an object.');
+    const next = normalizeImportedIndirectOptions({ ...this.limits, ...value });
+    if (JSON.stringify(next) !== JSON.stringify(this.limits)) { this.limits = next; this.dirty = true; }
+  }
   setEnabled(value: boolean): void { this.idle(); if (typeof value !== 'boolean') fail('enabled must be boolean.'); if (value !== this.enabled) { this.enabled = value; this.dirty = true; } }
   reset(): void { this.idle(); this.dirty = true; }
   /** Pure size preflight: safe before host resize/activation, with no allocation or state change. */
   validateSize(width: number, height: number): void {
     this.live();
-    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > this.device.limits.maxTextureDimension2D || height > this.device.limits.maxTextureDimension2D) throw new StrataError('INVALID_SIZE', 'Imported indirect dimensions must fit GPU texture limits.');
-    const pixels = width * height;
-    if (pixels > this.limits.maxPixels) throw new StrataError('UNSUPPORTED_LIMIT', `Imported indirect preview exceeds maxPixels=${this.limits.maxPixels}; choose a smaller explicit preview resolution.`);
-    if (pixels * pixelBytes > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize)) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported indirect pixel state exceeds GPU storage limits.');
-    if (Math.ceil(width / 8) > this.device.limits.maxComputeWorkgroupsPerDimension || Math.ceil(height / 8) > this.device.limits.maxComputeWorkgroupsPerDimension || Math.ceil(Math.min(pixels, this.limits.pixelBatch) / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported indirect dispatch exceeds GPU workgroup limits.');
+    validateImportedIndirectSize(this.device.limits, width, height, this.limits);
   }
   prepare(encoder: GPUCommandEncoder, camera: CameraFrame, width: number, height: number, _time: number, _timestamps: RasterTimestamps) {
     this.idle(); if (!this.active) fail('cannot prepare a disabled effect.'); this.validateSize(width, height);

@@ -28,6 +28,8 @@ Origin offsets depend on original positions, triangle extent and representable f
 
 The first preview uses full-resolution per-pixel accumulation with bounded batches; it does not upsample lighting across surface boundaries. Defaults are 262,144 pixels, 4,096 scheduled pixel updates per frame, 64 samples per pixel and 4,096 node visits per query. These are workload bounds, not timing guarantees. The integration can explicitly choose a 640×360 or 320×180 preview. It must preflight `maxPixels` before activation; an oversized resize rejects before changing resources. CPU progress describes submitted scheduling, while GPU readback reports attempted, completed, exhausted and invalid samples. Frame count is not a convergence measurement.
 
+The shader-free `imported-indirect-options` module exports `normalizeImportedIndirectOptions()` and `validateImportedIndirectSize(device.limits, width, height, normalizedOptions)`. Call these before CPU preparation or material allocation. The effect's `validateSize()` delegates to the same check, so activation and later resizes share one set of limits.
+
 Each pixel's accumulator occupies 32 bytes, the composed HDR target 8 bytes, and uniforms/counters 304 bytes, in addition to exact source/BVH GPU buffers and an optional readback buffer. Borrowed material textures are accounted by their owner. Allocation telemetry excludes driver and browser overhead.
 
 ## Validation boundary
