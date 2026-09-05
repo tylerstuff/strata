@@ -1,5 +1,6 @@
 import { ImportedRenderer } from '../../packages/core/src/imported/imported-renderer.js';
 import { loadGltf } from '../../packages/core/src/imported/gltf-loader.js';
+import { validateImportedEnvironment } from './imported-environment-validation.js';
 import type { ImportedAsset, ImportedControls, ImportedImage, ImportedMaterial, ImportedPrimitive, ImportedVec3 } from '../../packages/core/src/imported/imported-types.js';
 import type { RasterOutputs } from '../../packages/core/src/rendering/raster-types.js';
 
@@ -140,6 +141,25 @@ export async function validateImportedRendering() {
     near(unlitDark.samples[0]!.hdr.slice(0, 3), baseExpected, 0.001, 'Unlit output is texture times base factor times linear vertex color');
     near(unlitBright.samples[0]!.hdr.slice(0, 3), baseExpected, 0.001, 'Unlit output ignores lighting, AO, normal maps and emission');
     cases.push({ name: 'unlit-invariance', dark: unlitDark, bright: unlitBright });
+
+    const environmentLight = { ...controls.lighting!, environment: { preset: 'studio' as const, intensity: 1 } };
+    const authoredEnvironment = await render(unlitAsset, { ...controls, lighting: environmentLight });
+    near(authoredEnvironment.samples[0]!.hdr.slice(0, 3), baseExpected, .001, 'Authored unlit ignores distant environment illumination');
+    const relitDark = await render(unlitAsset, { ...controls, shading: 'relit' });
+    near(relitDark.samples[0]!.hdr.slice(0, 3), [0, 0, 0], .0001, 'Relit unlit ignores emission and respects darkness');
+    const relit = await render(unlitAsset, { ...controls, shading: 'relit', lighting: { ...controls.lighting!, intensity: 2 } });
+    const relitExpected = baseExpected.map(value => ((1 - .04) * value / Math.PI + .04 / (4 * Math.PI * .65 ** 4)) * 2);
+    near(relit.samples[0]!.hdr.slice(0, 3), relitExpected, .003, 'Relit matte dielectric follows independent direct GGX');
+    near(relit.samples[0]!.normal, [0, 0, 1, .65], .001, 'Relit uses the geometric normal and explicit roughness');
+    near([relit.samples[0]!.material[3]!], [0], .0001, 'Relit uses nonmetallic dielectric');
+    require(unlitAsset.materials[0]!.unlit === true && unlitAsset.materials[0]!.metallicFactor === 1, 'Relighting must not mutate caller-owned material data.');
+    const pbrInvariantAsset = asset([quad()], [material({ baseColorFactor: [.3, .5, .7, 1], roughnessFactor: .5, metallicFactor: .8 })]);
+    const pbrAuthored = await render(pbrInvariantAsset, { ...controls, lighting: environmentLight });
+    const pbrRelit = await render(pbrInvariantAsset, { ...controls, shading: 'relit', lighting: environmentLight });
+    near(pbrAuthored.samples[0]!.hdr, pbrRelit.samples[0]!.hdr, 0, 'Relit mode leaves source PBR unchanged');
+    require(pbrAuthored.samples[0]!.hdr.slice(0, 3).some(value => value > .01), 'Distant environment must illuminate a metal without direct light.');
+    cases.push({ name: 'authored-relit-environment', authoredEnvironment, relitDark, relit, pbrAuthored, pbrRelit });
+    cases.push({ name: 'environment-numeric', ...await validateImportedEnvironment(device) });
 
     const pbrBase = [0.25, 0.5, 0.75] as const; const metallic = 0.4; const roughness = 0.5;
     const pbr = await render(asset([quad()], [material({ baseColorFactor: [...pbrBase, 1], metallicFactor: metallic, roughnessFactor: roughness })]),

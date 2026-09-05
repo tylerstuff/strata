@@ -5,8 +5,10 @@ import type { CameraFrame } from '../rendering/raster-math.js';
 import type { ImportedAsset, ImportedBounds, ImportedControls, ImportedMaterial, ImportedSampler, ImportedTelemetry, ImportedTexture, ImportedVec3 } from './imported-types.js';
 import { createImportedPoseEvaluator } from './imported-animation.js';
 import { importedMipmapShader, importedShader } from './imported-shaders.js';
+import { createEnvironmentResources, environmentTextureBytes, environmentUniform, environmentUniformBytes, snapshotEnvironment } from './imported-environment.js';
+import { estimateImportedTextureAllocation } from './imported-texture-plan.js';
+export { importedTextureExtent } from './imported-texture-plan.js';
 
-const textureBudget = 512 * 1024 * 1024;
 const geometryBudget = 256 * 1024 * 1024;
 const materialBytes = 64;
 const lightBytes = 48;
@@ -21,7 +23,7 @@ export const importedDefaults = {
   lighting: { directionToLight: [0.35, 0.8, 0.4] as ImportedVec3, color: [1, .95, .875] as ImportedVec3, intensity: 4, ambient: [.06, .06, .06] as ImportedVec3 },
   presentation: 'model-only' as const, background: [.02, .035, .055] as ImportedVec3,
 };
-type Settings = { camera: NonNullable<ImportedControls['camera']>; lighting: NonNullable<ImportedControls['lighting']>; presentation: 'model-only' | 'ground'; background: ImportedVec3 };
+type Settings = { camera: NonNullable<ImportedControls['camera']>; lighting: NonNullable<ImportedControls['lighting']>; presentation: 'model-only' | 'ground'; background: ImportedVec3; shading?: 'authored' | 'relit' };
 function fail(message: string): never { throw new StrataError('INVALID_OPTIONS', `Invalid imported scene: ${message}`); }
 function checkSignal(signal?: AbortSignal): void { if (signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Imported scene creation was cancelled.'); }
 function vector(value: unknown, label: string, maximum: number, minimum = -maximum): asserts value is ImportedVec3 {
@@ -47,17 +49,13 @@ function snapshot(controls: ImportedControls, current: Settings): Settings {
   if (!Number.isFinite(lighting.intensity) || lighting.intensity < 0 || lighting.intensity > 64) fail('light intensity must be in [0, 64].');
   const background = controls.background === undefined ? current.background : controls.background; vector(background, 'background', 64, 0);
   const presentation = controls.presentation === undefined ? current.presentation : controls.presentation; if (presentation !== 'model-only' && presentation !== 'ground') fail('unknown presentation.');
+  const shading = controls.shading === undefined ? current.shading ?? 'authored' : controls.shading;
+  if (shading !== 'authored' && shading !== 'relit') fail('shading must be authored or relit.');
+  const environment = snapshotEnvironment(lighting.environment);
   return { camera: { eye: [...camera.eye], target: [...camera.target], verticalFov: camera.verticalFov },
-    lighting: { directionToLight: controls.lighting === undefined ? [...lighting.directionToLight] : normalize(lighting.directionToLight), color: [...lighting.color], intensity: lighting.intensity, ambient: [...lighting.ambient] }, presentation, background: [...background] };
+    lighting: { directionToLight: controls.lighting === undefined ? [...lighting.directionToLight] : normalize(lighting.directionToLight), color: [...lighting.color], intensity: lighting.intensity, ambient: [...lighting.ambient], environment }, presentation, background: [...background], shading };
 }
 
-export function importedTextureExtent(width: number, height: number, edge: number): { width: number; height: number; mipLevels: number; bytes: number } {
-  if (![width, height, edge].every(v => Number.isSafeInteger(v) && v > 0) || width > 16384 || height > 16384 || edge > 16384) fail('image dimensions/texture cap must be positive integers up to 16384.');
-  const scale = Math.min(1, edge / Math.max(width, height)); const w = Math.max(1, Math.floor(width * scale)), h = Math.max(1, Math.floor(height * scale));
-  const mipLevels = Math.floor(Math.log2(Math.max(w, h))) + 1; let bytes = 0;
-  for (let level = 0; level < mipLevels; level++) bytes += Math.max(1, w >> level) * Math.max(1, h >> level) * 4;
-  return { width: w, height: h, mipLevels, bytes };
-}
 function samplerDescriptor(s: ImportedSampler): GPUSamplerDescriptor {
   if (!s || typeof s !== 'object' || Array.isArray(s)) fail('texture sampler must be an object.');
   const wrap = (v: number): GPUAddressMode => { if (v === 33071) return 'clamp-to-edge'; if (v === 33648) return 'mirror-repeat'; if (v === 10497) return 'repeat'; return fail('unsupported texture wrapping.'); };
@@ -110,6 +108,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   readonly providers: readonly RasterGeometryProvider[];
   private settings: Settings = snapshot({ lighting: importedDefaults.lighting }, importedDefaults);
   private lightDirty = false;
+  private environmentDirty = false;
   private disposed = false;
   private current: CameraFrame | undefined;
   private light: Float32Array<ArrayBuffer> = new Float32Array(16);
@@ -121,7 +120,8 @@ export class ImportedGeometry implements RasterGeometryGroup {
   private readonly summary: Pick<ImportedTelemetry, 'sourceUrl' | 'triangles' | 'primitives' | 'warnings'>;
   private constructor(private readonly device: GPUDevice, asset: ImportedAsset, private readonly owned: Owned,
     private readonly materials: readonly Material[], private readonly meshes: readonly Mesh[], private readonly lightBuffer: GPUBuffer,
-    readonly textureRecords: ImportedTelemetry['textures'], private readonly evaluator: ReturnType<typeof createImportedPoseEvaluator>, private readonly palettes: readonly Palette[]) {
+    readonly textureRecords: ImportedTelemetry['textures'], private readonly evaluator: ReturnType<typeof createImportedPoseEvaluator>, private readonly palettes: readonly Palette[],
+    private readonly environment: ReturnType<typeof createEnvironmentResources>) {
     this.summary = { sourceUrl: asset.sourceUrl, triangles: asset.stats.triangles, primitives: asset.primitives.length, warnings: [...asset.warnings] };
     const batches: ImportedBatch[] = [];
     for (const mode of ['static', 'rigid', 'skin'] as const) for (const doubleSided of [false, true]) {
@@ -138,7 +138,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (!Number.isSafeInteger(asset.maxTextureDimension) || asset.maxTextureDimension < 1 || asset.maxTextureDimension > 16384) fail('invalid texture edge cap.');
     vector(asset.bounds.min, 'bounds min', 1024); vector(asset.bounds.max, 'bounds max', 1024);
     if (asset.bounds.min.some((v, i) => v > asset.bounds.max[i]!)) fail('bounds are inverted.');
-    if (device.limits.maxSampledTexturesPerShaderStage < 6 || device.limits.maxSamplersPerShaderStage < 6 || device.limits.maxBindGroups < 2) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported PBR needs six sampled textures/samplers and two bind groups.');
+    if (device.limits.maxSampledTexturesPerShaderStage < 8 || device.limits.maxSamplersPerShaderStage < 7 || device.limits.maxBindGroups < 2) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported PBR/environment needs eight sampled textures, seven samplers and two bind groups.');
     const evaluator = createImportedPoseEvaluator(asset);
     const initialPose = evaluator.evaluate();
     const initialPalettes = [initialPose.nodeMatrices, ...initialPose.skinMatrices];
@@ -146,25 +146,25 @@ export class ImportedGeometry implements RasterGeometryGroup {
     for (const data of initialPalettes) if (data.byteLength > device.limits.maxStorageBufferBindingSize || data.byteLength > device.limits.maxBufferSize) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported animation palette exceeds device storage limits.');
     const owned: Owned = { buffers: [], textures: [], bufferBytes: 0, textureBytes: 0, initialUploadBytes: 0 };
     const textureRecords: { image: number; sourceWidth: number; sourceHeight: number; uploadWidth: number; uploadHeight: number; colorSpace: 'srgb' | 'linear'; mipLevels: number; gpuBytes: number }[] = [];
-    const textureRequests = new Map<string, { image: number; srgb: boolean; extent: ReturnType<typeof importedTextureExtent> }>();
+    const texturePlan = estimateImportedTextureAllocation(asset, { maxTextureDimension: asset.maxTextureDimension,
+      maxTextureDimension2D: Math.min(16384, device.limits.maxTextureDimension2D) });
+    const textureRequests = new Map(texturePlan.textures.map(record => [ `${record.image}/${record.colorSpace === 'srgb'}`, {
+      image: record.image, srgb: record.colorSpace === 'srgb', extent: { width: record.uploadWidth, height: record.uploadHeight, mipLevels: record.mipLevels, bytes: record.gpuBytes },
+    } ]));
     const definitions = [...asset.materials, groundMaterial];
     const roles = (m: ImportedMaterial) => [m.baseColorTexture, m.metallicRoughnessTexture, m.normalTexture, m.occlusionTexture, m.emissiveTexture];
-    let plannedTextureBytes = 8; // Shared one-pixel sRGB and linear white fallbacks.
     for (const material of definitions) {
       validateMaterial(material);
-      for (const [role, ref] of roles(material).entries()) {
+      for (const ref of roles(material)) {
         if (ref === undefined) continue;
         if (!ref || typeof ref !== 'object' || Array.isArray(ref)) fail('material texture reference must be an object.');
         if (!Number.isSafeInteger(ref.image) || ref.image < 0 || ref.image >= asset.images.length) fail('material references an absent image.');
         samplerDescriptor(ref.sampler);
-        const srgb = role === 0 || role === 4, key = `${ref.image}/${srgb}`; if (textureRequests.has(key)) continue;
         const image = asset.images[ref.image]!;
         if (!image || !['image/png', 'image/jpeg'].includes(image.mimeType) || !(image.bytes instanceof Uint8Array) || !image.bytes.byteLength) fail('referenced image must contain encoded PNG or JPEG bytes.');
-        const extent = importedTextureExtent(image.width, image.height, Math.min(asset.maxTextureDimension, device.limits.maxTextureDimension2D));
-        plannedTextureBytes += extent.bytes; textureRequests.set(key, { image: ref.image, srgb, extent });
       }
     }
-    if (plannedTextureBytes > textureBudget) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported texture role copies and mip chains exceed the 512 MiB budget; lower maxTextureDimension.');
+    if (!texturePlan.fitsBudget) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported texture role copies, mip chains and fixed environment textures exceed the 512 MiB budget; lower maxTextureDimension.');
     let geometryBytes = 0;
     for (const primitive of asset.primitives) {
       if (!(primitive.vertices instanceof Float32Array) || primitive.vertices.length === 0 || primitive.vertices.length % 16
@@ -267,7 +267,13 @@ export class ImportedGeometry implements RasterGeometryGroup {
       const lightData = new Float32Array(lightBytes / 4); const defaults = snapshot({ lighting: importedDefaults.lighting }, importedDefaults);
       lightData.set(defaults.lighting.directionToLight); lightData.set(defaults.lighting.color.map(v => v * defaults.lighting.intensity), 4); lightData.set(defaults.lighting.ambient, 8);
       const lightBuffer = buffer('Strata imported directional light and explicit fill', lightData, 0x40);
-      return new ImportedGeometry(device, asset, owned, materials, meshes, lightBuffer, textureRecords, evaluator, palettes);
+      checkSignal(signal);
+      const environment = createEnvironmentResources(device);
+      owned.textures.push(environment.cube, environment.dfg); owned.buffers.push(environment.uniform);
+      owned.textureBytes += environmentTextureBytes; owned.bufferBytes += environmentUniformBytes;
+      owned.initialUploadBytes += environmentTextureBytes + environmentUniformBytes;
+      checkSignal(signal);
+      return new ImportedGeometry(device, asset, owned, materials, meshes, lightBuffer, textureRecords, evaluator, palettes, environment);
     } catch (cause) { for (const resource of [...owned.buffers, ...owned.textures]) resource.destroy(); throw cause; }
   }
   get background(): ImportedVec3 { return this.settings.background; }
@@ -277,7 +283,8 @@ export class ImportedGeometry implements RasterGeometryGroup {
   get gpuTextureBytes(): number { return this.disposed ? 0 : this.owned.textureBytes; }
   get initialUploadBytes(): number { return this.owned.initialUploadBytes; }
   get telemetry(): ImportedTelemetry { return { ...this.summary,
-    animation: this.pendingAnimation, bounds: this.visibleBounds, textures: this.textureRecords }; }
+    animation: this.pendingAnimation, bounds: this.visibleBounds, textures: this.textureRecords,
+    shading: this.settings.shading ?? 'authored', environment: snapshotEnvironment(this.settings.lighting.environment) }; }
   update(controls: ImportedControls = {}): boolean {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
     const next = snapshot(controls, this.settings);
@@ -292,7 +299,9 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const animationCut = this.committedAnimation !== undefined && pose.clipId !== this.committedAnimation.clipId;
     this.pendingAnimation = { clipId: pose.clipId, timeSeconds: pose.timeSeconds, loop: pose.loop }; this.animation = { ...animation };
     const changedLighting = JSON.stringify(next.lighting) !== JSON.stringify(this.settings.lighting);
-    const cut = changedLighting || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
+    const changedShading = next.shading !== this.settings.shading;
+    const cut = changedLighting || changedShading || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
+    this.environmentDirty ||= changedShading || JSON.stringify(next.lighting.environment) !== JSON.stringify(this.settings.lighting.environment);
     this.settings = next; this.lightDirty ||= changedLighting;
     this.visibleBounds = fit.bounds; this.light = fit.matrix; return cut || animationCut;
   }
@@ -326,6 +335,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
       const data = new Float32Array(lightBytes / 4); data.set(this.settings.lighting.directionToLight); data.set(this.settings.lighting.color.map(v => v * this.settings.lighting.intensity), 4); data.set(this.settings.lighting.ambient, 8);
       this.device.queue.writeBuffer(this.lightBuffer, 0, data); this.lightDirty = false; uploadBytes += lightBytes;
     }
+    if (this.environmentDirty) {
+      this.device.queue.writeBuffer(this.environment.uniform, 0, environmentUniform(snapshotEnvironment(this.settings.lighting.environment), this.settings.shading ?? 'authored'));
+      this.environmentDirty = false; uploadBytes += environmentUniformBytes;
+    }
     if (this.meshes.some(mesh => mesh.mode !== 'static')) for (const palette of this.palettes) {
       if (!palette.data.length) continue;
       this.device.queue.writeBuffer(palette.current, 0, palette.data);
@@ -356,7 +369,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
   materialBindings(pipeline: GPURenderPipeline, shadow: boolean): readonly GPUBindGroup[] {
     return this.materials.map(m => this.device.createBindGroup({ label: 'Strata imported material bindings', layout: pipeline.getBindGroupLayout(1), entries: shadow ? [
       { binding: 0, resource: { buffer: m.buffer } }, { binding: 1, resource: m.textures[0]!.createView() }, { binding: 2, resource: m.samplers[0]! },
-    ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } }] }));
+    ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } },
+      { binding: 12, resource: this.environment.cube.createView({ dimension: 'cube-array', arrayLayerCount: 12 }) },
+      { binding: 13, resource: this.environment.dfg.createView() }, { binding: 14, resource: this.environment.sampler },
+      { binding: 15, resource: { buffer: this.environment.uniform } }] }));
   }
   selectedMeshes(doubleSided: boolean, mode: DeformationMode): readonly Mesh[] { return this.meshes.filter(mesh => mesh.mode === mode && this.materials[mesh.material]!.doubleSided === doubleSided && (!mesh.ground || this.settings.presentation === 'ground')); }
   dispose(): void { if (this.disposed) return; this.disposed = true; for (const resource of [...this.owned.buffers, ...this.owned.textures]) resource.destroy(); this.current = undefined; }

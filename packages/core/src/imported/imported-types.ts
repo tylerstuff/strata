@@ -1,4 +1,4 @@
-/** Optional glTF inspection path. No virtual geometry, imported GI or reflection participation. */
+/** Optional glTF inspection path. No virtual geometry, imported GI or scene-traced reflection participation. */
 export type ImportedVec3 = readonly [number, number, number];
 export type ImportedVec4 = readonly [number, number, number, number];
 export interface ImportedBounds { readonly min: ImportedVec3; readonly max: ImportedVec3; }
@@ -122,7 +122,17 @@ export interface ImportedSceneOptions {
   readonly asset: ImportedAsset;
   readonly signal?: AbortSignal;
 }
+/** Generated distant incident radiance. It has no scene visibility, GI, local reflections or interior occlusion. */
+export interface ImportedEnvironment {
+  readonly preset: 'studio' | 'sky';
+  /** Scene-linear radiance multiplier, 0–64. Zero disables illumination without releasing retained resources. */
+  readonly intensity: number;
+  /** Positive yaw rotates the environment around world +Y; default zero. */
+  readonly rotationRadians?: number;
+}
 export interface ImportedControls {
+  /** Authored is the default. Relit changes only unlit materials to geometric-normal matte dielectric (roughness .65). */
+  readonly shading?: 'authored' | 'relit';
   /** verticalFov is in radians. Camera motion retains reprojection history. */
   readonly camera?: { readonly eye: ImportedVec3; readonly target: ImportedVec3; readonly verticalFov: number };
   readonly lighting?: {
@@ -131,6 +141,8 @@ export interface ImportedControls {
     readonly intensity: number;
     /** Linear diffuse fill, modulated only by material AO. No world visibility, GI or image-based lighting. */
     readonly ambient: ImportedVec3;
+    /** Optional distant lighting; omitted/null means off when replacing lighting. Omit lighting itself to retain all light settings. */
+    readonly environment?: ImportedEnvironment | null;
   };
   readonly presentation?: 'model-only' | 'ground';
   readonly background?: ImportedVec3;
@@ -145,6 +157,8 @@ export interface ImportedTelemetry {
   readonly primitives: number;
   readonly warnings: readonly string[];
   readonly animation: { readonly clipId: string | null; readonly timeSeconds: number; readonly loop: boolean };
+  readonly shading: 'authored' | 'relit';
+  readonly environment: Required<ImportedEnvironment> | null;
   readonly textures: readonly {
     readonly image: number; readonly sourceWidth: number; readonly sourceHeight: number;
     readonly uploadWidth: number; readonly uploadHeight: number;

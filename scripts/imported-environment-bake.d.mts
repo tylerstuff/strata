@@ -1,0 +1,17 @@
+import type { Buffer } from 'node:buffer';
+export const cubeSize: number, lutSize: number, mipLevels: number, minimumRoughness: number, minimumNoV: number, prefilterSamples: number, dfgSamples: number;
+export const presets: readonly string[];
+type Direction = readonly number[];
+type Radiance = (direction: Direction) => readonly number[];
+export function unit(direction: Direction): number[];
+export function cubeDirection(face: number, u: number, v: number): number[];
+export function radiance(preset: string, direction: Direction): number[];
+export function shBasis(direction: Direction): number[];
+export function solidAngle(x: number, y: number, size: number): number;
+export function bakeDiffuse(source: Radiance, size?: number): number[][];
+export function evaluateDiffuse(coefficients: readonly (readonly number[])[], normal: Direction): number[];
+export function prefilter(source: Radiance, normal: Direction, roughness: number, count?: number): number[];
+export function dfg(noV: number, roughness: number, count?: number): number[];
+export function half(value: number): number;
+export function bakeCube(source: Radiance, size?: number, levels?: number, count?: number): Buffer;
+export function bakeDfg(size?: number, count?: number): Buffer;
