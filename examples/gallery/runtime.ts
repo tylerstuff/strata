@@ -1,7 +1,7 @@
 import { createEngine, type Engine, type FrameMetrics, type RenderOptions } from '@strata-engine/core';
 import { loadGltf } from '@strata-engine/core/gltf';
 import type { GalleryAsset } from './catalog.js';
-import { normalizeOrbit, orbitEye, type GalleryOrbit } from './orbit.js';
+import { fitOrbitToBounds, normalizeOrbit, orbitEye, type GalleryOrbit } from './orbit.js';
 import { GalleryMeasurements } from './state.js';
 
 type PreparedAsset = Awaited<ReturnType<typeof loadGltf>>;
@@ -25,6 +25,7 @@ export interface GalleryAnimation {
 }
 
 const limits = { minimumDistance: 0.15, maximumDistance: 50 };
+const verticalFov = .84;
 const initialOrbit: GalleryOrbit = { azimuth: 0.55, elevation: 0.24, distance: 4.5, target: [0, 1, 0] };
 const freshAnimation = (): GalleryAnimation => ({ clipId: null, timeSeconds: 0, loop: true, playing: false });
 
@@ -51,7 +52,7 @@ export class GalleryRuntime {
   #lightingPreset: LightingPreset = 'studio';
   #debugView: DebugView = 'final';
   #orbit: GalleryOrbit = normalizeOrbit(initialOrbit, limits);
-  #resetOrbit: GalleryOrbit = this.#orbit;
+  #cameraIsFitted = false;
   #animation: GalleryAnimation = freshAnimation();
   #live = false;
   #busy: 'settings' | 'capture' | null = null;
@@ -152,12 +153,13 @@ export class GalleryRuntime {
       this.#sceneCommit = commit === undefined ? null : commit;
       const idle = asset.clips.find(clip => /^(?:idle|f_idle|idle01)$/i.test(clip.name.trim()));
       this.#animation = idle ? { clipId: idle.id, timeSeconds: 0, loop: true, playing: true } : freshAnimation();
-      const target = asset.bounds.min.map((value, axis) => (value + asset.bounds.max[axis]!) / 2) as [number, number, number];
-      const radius = Math.hypot(...asset.bounds.max.map((value, axis) => (value - asset.bounds.min[axis]!) / 2));
-      this.#resetOrbit = normalizeOrbit({ ...initialOrbit, target, distance: Math.max(2, radius / Math.sin(0.42)) }, limits);
-      this.#orbit = this.#resetOrbit;
-      this.#viewRevision += 1;
+      // Fit the new rest bounds after applying the actual pending drawing-buffer
+      // dimensions. A previous model's fit/manual state must not affect this load.
+      this.#cameraIsFitted = false;
       this.#applySize();
+      this.#orbit = this.#fitCamera(this.#canvas.width, this.#canvas.height);
+      this.#cameraIsFitted = true;
+      this.#viewRevision += 1;
       this.#submit(true);
       await this.#settleFrames(this.#healthy(), load.signal);
       if (load.signal.aborted || request !== this.#request) throw load.signal.reason ?? stopped('Model load was superseded.');
@@ -185,7 +187,7 @@ export class GalleryRuntime {
   #controls(): ImportedControls {
     const light = lightingPresets[this.#lightingPreset];
     return {
-      camera: { eye: orbitEye(this.#orbit), target: this.#orbit.target, verticalFov: 0.84 },
+      camera: { eye: orbitEye(this.#orbit), target: this.#orbit.target, verticalFov },
       lighting: { directionToLight: light.directionToLight, color: light.color, intensity: light.intensity, ambient: light.ambient },
       presentation: this.#scenePreset, background: light.background,
       animation: { clipId: this.#animation.clipId, timeSeconds: this.#animation.timeSeconds, loop: this.#animation.loop },
@@ -275,9 +277,16 @@ export class GalleryRuntime {
   }
   async setOrbit(value: Partial<GalleryOrbit>) {
     const next = normalizeOrbit({ ...this.#orbit, ...value }, limits);
-    await this.#change(() => { this.#orbit = next; });
+    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = false; });
   }
-  async resetCamera() { await this.#change(() => { this.#orbit = this.#resetOrbit; }); }
+  async resetCamera() {
+    const engine = this.#ready();
+    const [width, height] = this.#pendingSize?.map(value => Math.min(engine.info.maxTextureDimension2D, value))
+      ?? [this.#canvas.width, this.#canvas.height];
+    // Reject an impossible fit before mutating an otherwise healthy ready view.
+    const next = this.#fitCamera(width!, height!);
+    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = true; });
+  }
   async setAnimation(value: Partial<GalleryAnimation>) {
     const next = { ...this.#animation, ...value };
     if (typeof next.loop !== 'boolean' || typeof next.playing !== 'boolean' || !Number.isFinite(next.timeSeconds) || next.timeSeconds < 0) throw new Error('Animation requires nonnegative finite time and boolean playback settings.');
@@ -290,23 +299,34 @@ export class GalleryRuntime {
 
   resize(width: number, height: number) {
     if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) throw new Error('Viewport dimensions must be positive integers.');
-    this.#pendingSize = this.#canvas.width === width && this.#canvas.height === height ? null : [width, height];
+    const max = this.#engine?.info.maxTextureDimension2D ?? Infinity;
+    width = Math.min(max, width); height = Math.min(max, height);
+    if (this.#canvas.width === width && this.#canvas.height === height) { this.#pendingSize = null; return; }
+    if (this.#cameraIsFitted && this.#asset) this.#fitCamera(width, height);
+    this.#pendingSize = [width, height];
     if (!this.#busy && this.#phase === 'ready') {
       try { this.#applySize(); this.#submit(true); this.#changed(); } catch (error) { this.#fault(error); }
     }
   }
   async setViewport(width: number, height: number) {
     if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > this.#healthy().info.maxTextureDimension2D || height > this.#healthy().info.maxTextureDimension2D) throw new Error('Viewport dimensions exceed the supported physical pixel range.');
+    if (this.#cameraIsFitted && this.#asset) this.#fitCamera(width, height);
     await this.#change(() => { this.#pendingSize = [width, height]; });
     return this.getState();
+  }
+  #fitCamera(width: number, height: number): GalleryOrbit {
+    if (!this.#asset) throw new Error('A loaded model is required to fit the camera.');
+    return fitOrbitToBounds(this.#asset.bounds, initialOrbit, width / height, verticalFov, limits);
   }
   #applySize() {
     if (!this.#pendingSize || !this.#engine) return;
     const max = this.#engine.info.maxTextureDimension2D;
     const [width, height] = this.#pendingSize.map(value => Math.min(max, value)) as [number, number];
-    this.#pendingSize = null;
-    if (this.#canvas.width === width && this.#canvas.height === height) return;
+    if (this.#canvas.width === width && this.#canvas.height === height) { this.#pendingSize = null; return; }
+    const fitted = this.#cameraIsFitted && this.#asset ? this.#fitCamera(width, height) : null;
     this.#engine.resize(width, height);
+    this.#pendingSize = null;
+    if (fitted) this.#orbit = fitted;
     this.#viewRevision += 1;
   }
 

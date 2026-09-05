@@ -63,6 +63,24 @@ function asset(sourceUrl, clips = []) {
   };
 }
 
+function assertFrameFits(frame, bounds) {
+  const { eye, target, verticalFov } = frame.options.imported.camera;
+  const unit = vector => { const length = Math.hypot(...vector); return vector.map(value => value / length); };
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a.reduce((sum, value, axis) => sum + value * b[axis], 0);
+  const back = unit(eye.map((value, axis) => value - target[axis]));
+  const right = unit(cross(Math.abs(back[1]) > .999 ? [0, 0, 1] : [0, 1, 0], back));
+  const up = cross(back, right);
+  for (let corner = 0; corner < 8; corner++) {
+    const fromEye = eye.map((value, axis) => (((corner >> axis) & 1) ? bounds.max[axis] : bounds.min[axis]) - value);
+    const depth = -dot(fromEye, back);
+    const x = dot(fromEye, right) / depth / Math.tan(verticalFov / 2) / (frame.width / frame.height);
+    const y = dot(fromEye, up) / depth / Math.tan(verticalFov / 2);
+    assert.ok(depth >= .03 - 1e-12 && Math.abs(x) <= .85 + 1e-12 && Math.abs(y) <= .85 + 1e-12,
+      `Bounds corner ${corner} must fit the actual submitted ${frame.width}x${frame.height} camera: ${x}, ${y}, depth ${depth}`);
+  }
+}
+
 class FakeEngine {
   state = 'ready';
   info = { maxTextureDimension2D: 4096, profiling: { enabled: true, gpuTimestampAvailable: false, reason: 'CPU fake engine' } };
@@ -170,6 +188,75 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     assert.equal(loadCalls[0].url, original.entryUrl);
     assert.equal(engine.frames[0].sourceUrl, original.entryUrl);
     assert.equal(state.phase, 'ready');
+  });
+
+  test('first model frame fits the portrait viewport queued while its loader is pending', async () => {
+    const gate = deferred(); loadHook = () => gate.promise;
+    const loading = runtime.selectModel(model());
+    runtime.resize(288, 480);
+    gate.resolve(asset(model().entryUrl));
+    await loading;
+    assert.equal(engine.frames.length, 1);
+    assert.deepEqual([engine.frames[0].width, engine.frames[0].height], [288, 480]);
+    assertFrameFits(engine.frames[0], engine.scene.bounds);
+    assert.ok(Math.abs(runtime.getState().settings.orbit.azimuth - .55) < 1e-12);
+    assert.equal(runtime.getState().settings.orbit.elevation, .24);
+  });
+
+  test('resizing refits a fitted camera, preserves a manual camera, and Reset fits the current aspect', async () => {
+    await runtime.selectModel(model());
+    const square = runtime.getState().settings.orbit;
+    runtime.resize(288, 480);
+    const portrait = runtime.getState().settings.orbit;
+    assert.ok(portrait.distance > square.distance);
+    assertFrameFits(engine.frames.at(-1), engine.scene.bounds);
+    const manual = { azimuth: 1.2, elevation: -.2, distance: 9, target: [1, 2, 3] };
+    await runtime.setOrbit(manual);
+    const appliedManual = runtime.getState().settings.orbit;
+    runtime.resize(960, 480);
+    assert.deepEqual(runtime.getState().settings.orbit, appliedManual);
+    await runtime.resetCamera();
+    const reset = runtime.getState().settings.orbit;
+    assert.equal(reset.azimuth, square.azimuth); assert.equal(reset.elevation, square.elevation);
+    assert.deepEqual(reset.target, square.target);
+    assert.ok(reset.distance < portrait.distance);
+    assertFrameFits(engine.frames.at(-1), engine.scene.bounds);
+    runtime.resize(288, 480);
+    assert.deepEqual(runtime.getState().settings.orbit, portrait, 'Reset restores automatic fitting on subsequent resize');
+    assertFrameFits(engine.frames.at(-1), engine.scene.bounds);
+  });
+
+  test('same-size resize submits nothing and cancels a queued resize during capture', async () => {
+    await runtime.selectModel(model());
+    const before = runtime.getState();
+    runtime.resize(512, 512);
+    assert.deepEqual(runtime.getState(), before);
+    const gate = engine.holdFence();
+    const capture = runtime.captureState(2);
+    await gate.entered.promise;
+    const submitted = engine.frames.length, fences = engine.fenceCalls;
+    runtime.resize(288, 480);
+    runtime.resize(512, 512);
+    gate.done.resolve();
+    const result = await capture;
+    assert.deepEqual(result.state.viewport, { width: 512, height: 512 });
+    assert.equal(engine.frames.length, submitted);
+    assert.equal(engine.fenceCalls, fences, 'Canceled resize does not require another submission or fence');
+    assert.deepEqual(engine.resizeCalls, []);
+    assert.ok(engine.frames.every(frame => frame.width === 512 && frame.height === 512));
+  });
+
+  test('an impossible fit rejects viewport or Reset input without faulting a healthy manual view', async () => {
+    await runtime.selectModel(model());
+    const fitted = runtime.getState();
+    await assert.rejects(runtime.setViewport(1, 4096), /maximum camera distance/);
+    assert.deepEqual(runtime.getState(), fitted);
+    await runtime.setOrbit({ distance: 9 });
+    await runtime.setViewport(1, 4096);
+    const manual = runtime.getState();
+    await assert.rejects(runtime.resetCamera(), /maximum camera distance/);
+    assert.deepEqual(runtime.getState(), manual);
+    assert.equal(manual.phase, 'ready');
   });
 
   test('a superseded loader resolving late cannot commit, submit or relabel the newer model', async () => {
@@ -304,19 +391,20 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
         : operation === 'settings' ? runtime.setLightingPreset('daylight') : runtime.captureState(2);
       let settled = false; pending.then(() => { settled = true; }, () => { settled = true; });
       await first.entered.promise;
-      runtime.resize(800, 450);
+      runtime.resize(288, 480);
       assert.deepEqual([canvas.width, canvas.height], [512, 512]);
       const second = engine.holdFence();
       first.done.resolve();
       await second.entered.promise;
       assert.equal(settled, false, 'Resize submission still needs its own GPU fence');
-      assert.deepEqual(engine.resizeCalls.at(-1), [800, 450]);
-      assert.deepEqual([engine.frames.at(-1).width, engine.frames.at(-1).height], [800, 450]);
+      assert.deepEqual(engine.resizeCalls.at(-1), [288, 480]);
+      assert.deepEqual([engine.frames.at(-1).width, engine.frames.at(-1).height], [288, 480]);
+      assertFrameFits(engine.frames.at(-1), engine.scene.bounds);
       second.done.resolve();
       const result = await pending;
       const state = operation === 'capture' ? result.state : runtime.getState();
       assert.equal(state.phase, 'ready'); assert.equal(state.busy, null);
-      assert.deepEqual(state.viewport, { width: 800, height: 450 });
+      assert.deepEqual(state.viewport, { width: 288, height: 480 });
       assert.equal(state.frame.frameId, engine.frames.at(-1).frameId);
       assert.equal(state.submittedView.frameId, state.frame.frameId);
     });

@@ -210,7 +210,9 @@ function updateDisplayStatus() {
 function syncFitViewport() {
   if (!fixedViewport) {
     const size = fittedViewport();
-    if (size && (size.width !== canvas.width || size.height !== canvas.height)) runtime.resize(size.width, size.height);
+    // Re-submit the desired size even if it matches the current canvas: it may
+    // cancel a different resize queued behind an in-flight settings/capture fence.
+    if (size) runtime.resize(size.width, size.height);
   }
   updateDisplayStatus();
 }
