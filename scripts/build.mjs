@@ -32,4 +32,15 @@ await build({
   logLevel: 'info',
 });
 run(process.execPath, ['node_modules/typescript/bin/tsc', '-p', 'packages/core/tsconfig.build.json']);
+await build({
+  absWorkingDir: root,
+  entryPoints: ['benchmarks/src/main.ts'],
+  outfile: 'benchmarks/browser/app.js',
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  target: 'es2022',
+  external: ['@strata-engine/core'],
+  sourcemap: true,
+});
 console.log('Built the ESM package, declarations, module worker, and precompiled WASM.');

@@ -17,6 +17,10 @@ export type StrataErrorCode =
   | 'ENGINE_DISPOSED'
   | 'INVALID_SIZE'
   | 'INVALID_OPTIONS'
+  | 'SCENE_LOAD_FAILED'
+  | 'SCENE_LOAD_SUPERSEDED'
+  | 'GPU_VALIDATION_FAILED'
+  | 'GPU_TIMING_TIMEOUT'
   | 'RENDER_FAILED';
 
 /** A runtime failure with a stable code and, when available, its original cause. */
