@@ -152,7 +152,9 @@ describe('incremental trace source/reference equivalence', () => {
       expect(safe).toBeGreaterThanOrEqual(updateOracleGates.minNonBoundary); expect(terrainHits).toBeGreaterThanOrEqual(48); expect(mirrorHits).toBeGreaterThanOrEqual(16); previous = actuals;
     }
     expect(changedRigidHits).toBeGreaterThan(24); updater.dispose();
-  });
+  // The independent 512-ray scan over 2,204 triangles in eight states can exceed
+  // Vitest's 5-second default on shared CI hosts. Keep the corpus and gates fixed.
+  }, 30_000);
   it('cross-checks fixed targeted cube/door/mirror rays with analytic local-box slabs, including the yawed door', () => {
     const rays = updateRayCorpus(createIntegratedScene(), createIntegratedScene);
     let yawedDoorHits = 0;
