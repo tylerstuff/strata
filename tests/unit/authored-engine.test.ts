@@ -76,7 +76,7 @@ describe('authored engine commitment and frame lifecycle', () => {
   beforeEach(() => {
     vi.resetAllMocks(); created.length = 0; gpu = gpuFixture();
     vi.stubGlobal('navigator', { gpu: gpu.gpu });
-    vi.mocked(initializeCpuRuntime).mockResolvedValue({ info: { abiVersion: 1, memoryBytes: 65536 }, dispose: vi.fn() });
+    vi.mocked(initializeCpuRuntime).mockResolvedValue({ info: { abiVersion: 2, memoryBytes: 65536 }, buildStaticBvh: vi.fn(), waitForStaticBvhIdle: vi.fn(), dispose: vi.fn() });
     factories.authored.mockImplementation(async (_device, _format, scene: BoxSceneDescriptor) => {
       const value = sceneMock(scene); created.push(value); return value;
     });

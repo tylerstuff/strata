@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEngine, StrataError, type Engine } from '../../packages/core/src/index.js';
-import { initializeCpuRuntime } from '../../packages/core/src/internal/cpu-runtime.js';
+import { initializeCpuRuntime, type CpuRuntime } from '../../packages/core/src/internal/cpu-runtime.js';
 import type { IntegratedRenderer as IntegratedRendererType } from '../../packages/core/src/integrated/integrated-renderer.js';
 import type { ImportedRenderer as ImportedRendererType } from '../../packages/core/src/imported/imported-renderer.js';
 import type { ImportedAsset } from '../../packages/core/src/imported/imported-types.js';
@@ -65,13 +65,13 @@ function gpuFixture() {
 
 describe('engine lifecycle', () => {
   let fixture: ReturnType<typeof gpuFixture>;
-  let cpu: { info: { abiVersion: number; memoryBytes: number }; dispose: ReturnType<typeof vi.fn<() => void>> };
+  let cpu: { info: { abiVersion: number; memoryBytes: number }; buildStaticBvh: CpuRuntime['buildStaticBvh']; waitForStaticBvhIdle: CpuRuntime['waitForStaticBvhIdle']; dispose: ReturnType<typeof vi.fn<() => void>> };
   const engines: Engine[] = [];
 
   beforeEach(() => {
     vi.resetAllMocks();
     fixture = gpuFixture();
-    cpu = { info: { abiVersion: 1, memoryBytes: 65536 }, dispose: vi.fn() };
+    cpu = { info: { abiVersion: 2, memoryBytes: 65536 }, buildStaticBvh: vi.fn(), waitForStaticBvhIdle: vi.fn(), dispose: vi.fn() };
     vi.mocked(initializeCpuRuntime).mockResolvedValue(cpu);
     vi.stubGlobal('navigator', { gpu: fixture.gpu });
   });
@@ -93,7 +93,7 @@ describe('engine lifecycle', () => {
     expect(engine.state).toBe('ready');
     expect(engine.info).toMatchObject({
       format: 'bgra8unorm', features: ['timestamp-query'], maxTextureDimension2D: 4096,
-      cpu: { abiVersion: 1, memoryBytes: 65536 },
+      cpu: { abiVersion: 2, memoryBytes: 65536 },
     });
     expect(Object.isFrozen(engine.info.cpu)).toBe(true);
     expect(fixture.context.configure).toHaveBeenCalledWith({

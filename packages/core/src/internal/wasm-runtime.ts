@@ -7,6 +7,17 @@ interface RuntimeExports extends WebAssembly.Exports {
   strata_runtime_initialize: () => number;
   strata_runtime_dispose: () => number;
   strata_runtime_is_initialized: () => number;
+  strata_bvh_begin: (vertexCount: number, triangleCount: number, maxWorkingBytes: number) => number;
+  strata_bvh_positions_ptr: () => number;
+  strata_bvh_indices_ptr: () => number;
+  strata_bvh_step: (workUnits: number) => number;
+  strata_bvh_nodes_ptr: () => number;
+  strata_bvh_triangles_ptr: () => number;
+  strata_bvh_node_count: () => number;
+  strata_bvh_max_depth: () => number;
+  strata_bvh_work_units: () => number;
+  strata_bvh_working_bytes: () => number;
+  strata_bvh_dispose: () => void;
 }
 
 export interface WasmRuntime {
@@ -33,6 +44,17 @@ export async function loadWasmRuntime(url: URL | string): Promise<WasmRuntime> {
       'strata_runtime_initialize',
       'strata_runtime_dispose',
       'strata_runtime_is_initialized',
+      'strata_bvh_begin',
+      'strata_bvh_positions_ptr',
+      'strata_bvh_indices_ptr',
+      'strata_bvh_step',
+      'strata_bvh_nodes_ptr',
+      'strata_bvh_triangles_ptr',
+      'strata_bvh_node_count',
+      'strata_bvh_max_depth',
+      'strata_bvh_work_units',
+      'strata_bvh_working_bytes',
+      'strata_bvh_dispose',
     ]) {
       if (typeof exports[name] !== 'function') throw new Error(`Missing WASM export: ${name}`);
     }

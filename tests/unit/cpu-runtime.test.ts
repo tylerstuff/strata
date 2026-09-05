@@ -18,7 +18,7 @@ class MockWorker extends EventTarget {
   }
 }
 
-const ready = { type: 'ready', info: { abiVersion: 1, memoryBytes: 65_536 } };
+const ready = { type: 'ready', info: { abiVersion: 2, memoryBytes: 65_536 } };
 
 function currentWorker(): MockWorker {
   const worker = MockWorker.instances.at(-1);
@@ -44,7 +44,7 @@ describe('CPU worker client lifecycle', () => {
     const worker = currentWorker();
     expect(String(worker.url)).toMatch(/\/worker\.js$/);
     expect(worker.options).toEqual({ type: 'module' });
-    expect(worker.postMessage).toHaveBeenCalledWith({ type: 'initialize', protocolVersion: 1 });
+    expect(worker.postMessage).toHaveBeenCalledWith({ type: 'initialize', protocolVersion: 2 });
     worker.message(ready);
     const runtime = await pending;
     expect(runtime.info).toEqual(ready.info);
@@ -61,7 +61,7 @@ describe('CPU worker client lifecycle', () => {
     expect(worker.url).toBe('/assets/cpu.js');
     expect(worker.postMessage).toHaveBeenCalledWith({
       type: 'initialize',
-      protocolVersion: 1,
+      protocolVersion: 2,
       wasmUrl: 'https://example.test/game/engine.wasm',
     });
     worker.message(ready);
@@ -142,8 +142,8 @@ describe('CPU worker client lifecycle', () => {
 
   it.each([
     undefined,
-    { type: 'ready', info: { abiVersion: 2, memoryBytes: 65_536 } },
-    { type: 'ready', info: { abiVersion: 1, memoryBytes: -1 } },
+    { type: 'ready', info: { abiVersion: 1, memoryBytes: 65_536 } },
+    { type: 'ready', info: { abiVersion: 2, memoryBytes: -1 } },
     { type: 'error', code: 'unknown', message: 'bad protocol' },
   ])('rejects invalid worker responses and releases the worker', async (response) => {
     const pending = initializeCpuRuntime();
@@ -192,7 +192,7 @@ describe('WASM asset loading', () => {
     })));
     const first = await loadWasmRuntime('https://example.test/strata_runtime.wasm');
     const second = await loadWasmRuntime('https://example.test/strata_runtime.wasm');
-    expect(first.info.abiVersion).toBe(1);
+    expect(first.info.abiVersion).toBe(2);
     expect(first.info.memoryBytes).toBe(first.exports.memory.buffer.byteLength);
     expect(first.info.memoryBytes).toBeGreaterThan(0);
     expect(first.exports.memory).not.toBe(second.exports.memory);
