@@ -53,6 +53,16 @@ room's walls. See the
 [imported material lighting guide](imported-lighting.md) for the authored/relit
 policy and the precise lighting approximation.
 
+Camera exposure compensation changes the preview's displayed brightness. The number control
+uses exposure stops (EV), with a default of 0 and an **EV 0** reset. Each +1 EV
+doubles the presentation multiplier; −1 EV halves it. The multiplier is `2 ** EV`,
+applied during presentation of final and tone-mapped radiance views; raw debug
+views are unchanged. This is a brightness offset, not calibrated camera EV100.
+Use the final view for indirect on/off comparisons. Scene-linear GI and temporal AA accumulation stay
+unchanged, as do lighting, environment, source materials, sampling and resolution.
+Exposure is retained when a model or scene is recreated, including texture-cap
+and progressive-mode changes.
+
 Clip selection, play/pause and timeline scrubbing are enabled only for animation
 reported as supported by the runtime. A catalog clip count does not establish
 runtime support. Unsupported animation or materials, texture resizing and other
@@ -202,6 +212,7 @@ await gallery.setTemporal(true);
 await gallery.setLightingPreset('daylight');
 await gallery.setShading('authored');
 await gallery.setEnvironment({ preset: 'studio', intensity: 0.5, rotationRadians: 0 });
+await gallery.setExposureEV(1);
 const clips = gallery.getState().asset.clips;
 if (clips.length === 0) throw new Error('The runtime exposes no playable clips.');
 await gallery.setAnimation({
@@ -223,6 +234,15 @@ records `shading`, `environment`, the requested `textureCap` and the applied
 selected/effective caps, device limitation and any budget fallback. Effective
 render controls are available under `settings.effective`, where
 `lighting.environment` is null when the environment is off.
+
+`setExposureEV(number)` asynchronously sets camera exposure while the gallery is
+ready and idle. It accepts finite values from −16 to 16, inclusive. Invalid input
+rejects before changing the ready view or its settings. Call `setExposureEV(0)` to
+reset it. `getState().settings.exposureEV` and each capture's
+`state.settings.exposureEV` record the selected value, while
+`state.submittedView.exposureEV` records the exact submitted value; keep it with the image when
+comparing captures. A changed exposure does not reset scene-linear GI or temporal
+AA history.
 
 The control surface also exposes `getCatalog`, `setScenePreset`, `setDebugView`,
 `setOrbit`, `resetCamera`, `renderFrames` and `dispose`. Orbit angles are radians.
@@ -274,3 +294,4 @@ preparation alone does not establish rendered house lighting. Follow
 [issue #15](https://github.com/tylerstuff/strata/issues/15) and the
 [progressive validation boundary](imported-progressive-gi.md#validation-boundary)
 for that evidence; no new GPU or performance result is claimed here.
+Camera exposure is not a validated fix for the failed house-lighting witness.

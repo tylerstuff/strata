@@ -21,6 +21,8 @@ const environmentSelect = element<HTMLSelectElement>('environment-preset');
 const environmentIntensity = element<HTMLInputElement>('environment-intensity');
 const environmentRotation = element<HTMLInputElement>('environment-rotation');
 const textureSelect = element<HTMLSelectElement>('texture-cap');
+const exposureInput = element<HTMLInputElement>('exposure-ev');
+const exposureReset = element<HTMLButtonElement>('reset-exposure');
 const progressiveButton = element<HTMLButtonElement>('progressive-mode');
 const indirectToggle = element<HTMLInputElement>('indirect-enabled');
 const clipSelect = element<HTMLSelectElement>('animation-clip');
@@ -142,6 +144,9 @@ function update() {
   // Preserve an in-progress numeric edit during live telemetry updates.
   if (document.activeElement !== environmentIntensity) environmentIntensity.value = String(environment.intensity);
   if (document.activeElement !== environmentRotation) environmentRotation.value = String(Number((environment.rotationRadians * 180 / Math.PI).toFixed(2)));
+  exposureInput.disabled = !ready;
+  exposureReset.disabled = !ready || state.settings.exposureEV === 0;
+  if (document.activeElement !== exposureInput) exposureInput.value = String(state.settings.exposureEV);
   element('quality-status').textContent = [
     state.settings.shading === 'relit' ? 'Unlit materials use a matte interpretation; source PBR materials retain their settings.' : 'Source-authored materials. Unlit materials ignore lighting.',
     environment.preset === 'off' ? 'Environment off.' : environment.intensity === 0 ? 'Environment intensity is zero.' : progressive ? state.settings.indirectEnabled ? 'The incident environment supplies visibility-tested diffuse transport.' : 'The incident environment is retained but inactive in this direct reference.' : 'The distant environment adds illumination without scene occlusion.',
@@ -326,6 +331,13 @@ environmentSelect.addEventListener('change', () => run(() => runtime.setEnvironm
 environmentIntensity.addEventListener('change', () => run(() => runtime.setEnvironment({ intensity: environmentIntensity.valueAsNumber })), { signal: events.signal });
 environmentRotation.addEventListener('change', () => run(() => runtime.setEnvironment({ rotationRadians: environmentRotation.valueAsNumber * Math.PI / 180 })), { signal: events.signal });
 for (const input of [environmentIntensity, environmentRotation]) input.addEventListener('blur', update, { signal: events.signal });
+exposureInput.addEventListener('change', async () => {
+  await run(() => runtime.setExposureEV(exposureInput.valueAsNumber));
+  // Reconcile a rejected edit with the retained setting even while focused.
+  exposureInput.value = String(runtime.getState().settings.exposureEV);
+}, { signal: events.signal });
+exposureInput.addEventListener('blur', update, { signal: events.signal });
+exposureReset.addEventListener('click', () => run(() => runtime.setExposureEV(0)), { signal: events.signal });
 textureSelect.addEventListener('change', () => run(() => runtime.setTextureCap(Number(textureSelect.value) as GalleryTextureCap)), { signal: events.signal });
 progressiveButton.addEventListener('click', () => run(() => setSceneMode(runtime.getState().settings.sceneMode === 'progressive' ? 'ordinary' : 'progressive')), { signal: events.signal });
 indirectToggle.addEventListener('change', () => run(() => runtime.setIndirectEnabled(indirectToggle.checked)), { signal: events.signal });
@@ -435,6 +447,7 @@ const api = {
   setTemporal: (enabled: boolean) => runtime.setTemporal(enabled),
   setShading: (value: GalleryShading) => runtime.setShading(value),
   setEnvironment: (value: Partial<GalleryEnvironment>) => runtime.setEnvironment(value),
+  setExposureEV: (value: number) => runtime.setExposureEV(value),
   setTextureCap: (value: GalleryTextureCap) => runtime.setTextureCap(value),
   setSceneMode,
   setIndirectEnabled: (enabled: boolean) => runtime.setIndirectEnabled(enabled),

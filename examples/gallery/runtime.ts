@@ -73,6 +73,7 @@ export class GalleryRuntime {
   #lightingPreset: LightingPreset = 'studio';
   #debugView: DebugView = 'final';
   #temporal = true;
+  #exposureEV = 0;
   #sceneMode: GallerySceneMode = 'ordinary';
   #pendingSceneMode: GallerySceneMode | null = null;
   #indirectEnabled = true;
@@ -91,7 +92,7 @@ export class GalleryRuntime {
   #lastTimestamp: number | null = null;
   #lastUiTimestamp = 0;
   #lastFrame: FrameMetrics | null = null;
-  #submittedView: { frameId: number; controls: ImportedControls } | null = null;
+  #submittedView: { frameId: number; controls: ImportedControls; exposureEV: number } | null = null;
   #load: AbortController | null = null;
   #initialization = new AbortController();
   #request = 0;
@@ -274,9 +275,9 @@ export class GalleryRuntime {
   #submit(cameraCut = false): FrameMetrics {
     const engine = this.#healthy();
     const controls = this.#controls();
-    const frame = engine.render({ imported: controls, temporal: this.#effectiveTemporal(), debugView: this.#debugView, cameraCut, timeSeconds: this.#animation.timeSeconds });
+    const frame = engine.render({ imported: controls, temporal: this.#effectiveTemporal(), debugView: this.#debugView, cameraCut, timeSeconds: this.#animation.timeSeconds, exposureEV: this.#exposureEV });
     this.#lastFrame = frame;
-    this.#submittedView = { frameId: frame.frameId, controls: structuredClone(controls) };
+    this.#submittedView = { frameId: frame.frameId, controls: structuredClone(controls), exposureEV: this.#exposureEV };
     this.#measurements.recordFrame(frame, this.#identity());
     this.#measurements.recordGpuTimings(engine.drainGpuTimings());
     return frame;
@@ -388,6 +389,11 @@ export class GalleryRuntime {
     if (typeof value !== 'boolean') throw new Error('Temporal anti-aliasing must be a boolean.');
     if (this.#sceneMode === 'progressive' && value) throw new Error('Progressive lighting requires temporal anti-aliasing off; return to ordinary mode to enable it.');
     await this.#change(() => { this.#temporal = value; }, true);
+  }
+  async setExposureEV(value: number) {
+    if (!Number.isFinite(value) || value < -16 || value > 16) throw new Error('Exposure EV must be a finite number from -16 to 16.');
+    // Exposure changes presentation only; preserve scene-linear TAA/GI history.
+    await this.#change(() => { this.#exposureEV = value; }, false);
   }
   async setShading(value: GalleryShading) {
     if (value !== 'authored' && value !== 'relit') throw new Error('Shading must be authored or relit.');
@@ -631,7 +637,7 @@ export class GalleryRuntime {
       source: this.#model ? { entryUrl: this.#model.entryUrl, catalogGltfSha256: this.#model.sourceSha256 } : null,
       asset: asset ? { sourceUrl: asset.sourceUrl, bounds: asset.bounds, sourceBounds: asset.sourceBounds, normalization: asset.normalization, stats: asset.stats, warnings: asset.warnings, maxTextureDimension: asset.maxTextureDimension, clips: asset.clips.map(({ id, name, duration }) => ({ id, name, duration })) } : null,
       settings: { scenePreset: this.#scenePreset, lightingPreset: this.#lightingPreset, debugView: this.#debugView, orbit: this.#orbit, animation: this.#animation, temporal: this.#effectiveTemporal(), temporalRequested: this.#temporal,
-        sceneMode: this.#sceneMode, indirectEnabled: this.#indirectEnabled,
+        sceneMode: this.#sceneMode, indirectEnabled: this.#indirectEnabled, exposureEV: this.#exposureEV,
         shading: this.#shading, environment: this.#environment, textureCap: this.#textureCap, textureDecision: this.#textureDecision, effective: this.#controls() },
       live: this.#live, busy: this.#busy, viewport: { width: this.#canvas.width, height: this.#canvas.height },
       frame: this.#lastFrame, submittedView: this.#submittedView, measurements: this.#measurements.snapshot(this.#identity()),

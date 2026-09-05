@@ -102,6 +102,15 @@
             </div>
             <p id="quality-status" class="quality-note">Source-authored materials. Environment off.</p>
 
+            <div class="exposure-controls" aria-label="Camera brightness">
+              <div class="control-field">
+                <label for="exposure-ev">Exposure compensation (EV)</label>
+                <input id="exposure-ev" type="number" min="-16" max="16" step="0.25" value="0" aria-describedby="exposure-guidance" disabled />
+              </div>
+              <button id="reset-exposure" class="button button-secondary" type="button" disabled>Reset to EV 0</button>
+            </div>
+            <p id="exposure-guidance" class="quality-note">Positive EV brightens the image; negative EV darkens it. Each +1 EV doubles the exposure. EV 0 is the default. Use Final view to compare brightness.</p>
+
             <details class="progressive-panel">
               <summary>Static progressive diffuse preview <span id="progressive-mode-label">· off</span></summary>
               <p class="progressive-note">Accumulates diffuse lighting while the view stays still. For static models with one used lit, opaque material.</p>
