@@ -12,18 +12,32 @@ import type { ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry } 
 
 export type { IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode } from './integrated/integrated-types.js';
 import type { IntegratedSceneOptions, IntegratedTelemetry } from './integrated/integrated-types.js';
+import type { AuthoredBoxSceneOptions, AuthoredFrameMetadata, BoxCamera } from './rendering/authored-box-types.js';
+export type { AuthoredBoxSceneOptions, AuthoredFrameMetadata, BoxCamera, BoxSceneDescriptor, AuthoredBox, BoxVec3, BoxQuaternion } from './rendering/authored-box-types.js';
 
 export type { ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip } from './imported/imported-types.js';
 import type { ImportedSceneOptions, ImportedControls, ImportedTelemetry } from './imported/imported-types.js';
 
-export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions | ReflectionSceneOptions | IntegratedSceneOptions | ImportedSceneOptions;
+export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions | ReflectionSceneOptions | IntegratedSceneOptions | AuthoredBoxSceneOptions | ImportedSceneOptions;
 
-export interface RenderOptions extends RasterControls {
+export interface RenderOptions extends Omit<RasterControls, 'debugView'> {
+  debugView?: RasterControls['debugView'] | 'base-color';
+  /** Complete per-frame camera override, supported only by authored-boxes. */
+  camera?: BoxCamera;
   /** Deterministic scene time, independent of wall-clock scheduling. */
   timeSeconds?: number;
   gi?: GiControls;
   reflections?: ReflectionControls;
   imported?: ImportedControls;
+}
+
+/** Immutable engine-local commitment identity, not a content hash or presentation receipt. */
+export interface SceneCommitReceipt {
+  readonly sceneGeneration: number;
+  readonly renderer: 'clear' | 'diffuse' | 'raster' | 'virtual' | 'gi' | 'reflections' | 'integrated' | 'authored-boxes' | 'imported';
+  readonly sceneId: string | null;
+  /** Opaque caller correlation, never verified against an authoring document by Core. */
+  readonly sourceRevision: string | null;
 }
 
 export interface CreateEngineOptions {
@@ -78,6 +92,9 @@ export interface EngineInfo {
 /** Work submitted by Strata, not total browser/device memory or presented FPS. */
 export interface FrameMetrics {
   readonly frameId: number;
+  /** Exact identity used by this successfully queued submission. */
+  readonly scene: SceneCommitReceipt;
+  readonly authored?: AuthoredFrameMetadata;
   readonly cpuSubmissionMs: number;
   readonly drawCalls: number;
   readonly dispatchCalls: number;
@@ -107,6 +124,11 @@ export interface GpuTiming {
 }
 
 export interface EngineTelemetry {
+  readonly scene: {
+    readonly identity: SceneCommitReceipt;
+    readonly firstSubmittedFrameId: number | null;
+    readonly lastSubmittedFrameId: number | null;
+  };
   readonly submittedFrames: number;
   readonly totalUploadBytes: number;
   readonly allocatedGpuBufferBytes: number;
@@ -131,8 +153,8 @@ export interface Engine {
   readonly info: EngineInfo;
   /** Set drawing-buffer dimensions in physical pixels, leaving CSS size unchanged. */
   resize(width: number, height: number): void;
-  /** Replace the deterministic benchmark scene, or return to the clear-only baseline. */
-  setScene(options: SceneOptions | null): Promise<void>;
+  /** Atomically commit a scene or clear state. The receipt does not imply a submitted frame. */
+  setScene(options: SceneOptions | null): Promise<SceneCommitReceipt>;
   /** Submit a frame; the host owns scheduling. timeSeconds is deterministic scene time. */
   render(options?: RenderOptions): FrameMetrics;
   getTelemetry(): EngineTelemetry;

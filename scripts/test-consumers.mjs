@@ -14,6 +14,7 @@ const softwareGpu = process.env.STRATA_TEST_SOFTWARE_GPU === '1';
 const artifactSuffix = softwareGpu ? '-software' : '';
 const giModuleMarker = 'Strata one-bounce software probe trace';
 const reflectionModuleMarker = 'Strata bounded software reflections';
+const authoredModuleMarker = 'Strata authored root boxes direct PBR';
 const integratedModuleMarker = 'Integrated scenes require cooked terrain/proxy URLs';
 const importedModuleMarker = 'Strata imported directional light and explicit fill';
 const gltfModuleMarker = 'glTF source/decoded data exceeds maxSourceBytes.';
@@ -172,6 +173,7 @@ async function checkConsumer(kind, url) {
     const defaultModules = await loadedModules();
     assert.equal(defaultModules.some(module => module.source.includes(importedModuleMarker)), false, `${kind}: default consumer fetched imported rendering`);
     assert.equal(defaultModules.some(module => module.source.includes(gltfModuleMarker)), false, `${kind}: default consumer fetched glTF parsing`);
+    assert.equal(defaultModules.some(module => module.source.includes(authoredModuleMarker)), false, `${kind}: default consumer fetched authored rendering`);
     assert.equal(defaultModules.some(module => module.source.includes(integratedModuleMarker)), false, `${kind}: default consumer fetched integrated geometry`);
     assert.equal(defaultModules.some(module => module.source.includes(giModuleMarker)), false,
       `${kind}: the default consumer eagerly fetched GI implementation code`);
@@ -249,6 +251,24 @@ async function checkConsumer(kind, url) {
     assert.equal(integrated.telemetry.integrated.collisionRepresentation, 'none');
     assert.ok((await loadedModules()).some(module => module.source.includes(integratedModuleMarker)),
       `${kind}: integrated scene did not load its optional implementation`);
+    const authored = await page.evaluate(() => strataTest.exerciseScene({ renderer: 'authored-boxes', scene: {
+      format: 'strata.runtime-boxes', version: 1, coordinateSystem: 'strata-world-v1',
+      sceneId: 'packed-box', sourceRevision: 'opaque-caller-revision',
+      boxes: [{ id: 'box', dimensions: [1, 1, 1],
+        transform: { position: [1000000.01, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+        material: { baseColor: [0.8, 0.2, 0.1, 1], metallic: 0, roughness: 0.5 } }],
+      camera: { position: [1000000.01, 0, 3], rotation: [0, 0, 0, 1],
+        projection: { kind: 'perspective', verticalFovRadians: 1, near: 0.1, far: 32 } },
+      light: { directionToLight: [0, 0, 1], radiance: [2, 2, 2] }, background: [0, 0, 0],
+    } }, { debugView: 'base-color' }));
+    assert.equal(authored.metrics.drawCalls, 1); assert.equal(authored.metrics.triangles, 12);
+    assert.equal(authored.telemetry.gpuErrorCount, 0, authored.telemetry.lastGpuError ?? undefined);
+    assert.equal(authored.metrics.scene.renderer, 'authored-boxes');
+    assert.equal(authored.metrics.scene.sourceRevision, 'opaque-caller-revision');
+    assert.deepEqual(authored.metrics.scene, authored.telemetry.scene.identity);
+    assert.equal(authored.telemetry.scene.lastSubmittedFrameId, authored.metrics.frameId);
+    assert.deepEqual(authored.metrics.authored.origin, [1000000.01, 0, 3]);
+    assert.ok((await loadedModules()).some(module => module.source.includes(authoredModuleMarker)), `${kind}: authored renderer did not load`);
     const cleared = await page.evaluate(() => strataTest.exerciseScene(null));
     assert.equal(cleared.metrics.dispatchCalls, 0);
     assert.equal(cleared.telemetry.allocatedGpuBufferBytes, 0);
@@ -351,6 +371,9 @@ try {
 
   // The bundler runs against the isolated archive installation, never workspace sources.
   run(process.execPath, [join(root, 'node_modules', 'vite', 'bin', 'vite.js'), 'build'], vite);
+  if (process.argv.includes('--cpu-only')) {
+    console.log('Packed CPU and Vite-build checks complete; browser checks explicitly skipped.');
+  } else {
   const plainServer = await serveConsumer(plain);
   servers.push(plainServer);
   const viteServer = await serveConsumer(join(vite, 'dist'));
@@ -384,6 +407,7 @@ try {
   }
   console.log('Unsupported browser: actionable error and no worker allocation passed');
   await writeFile(join(artifacts, `environment${artifactSuffix}.json`), `${JSON.stringify(results, null, 2)}\n`);
+  }
 } finally {
   await browser?.close();
   for (const server of servers) await server.close();

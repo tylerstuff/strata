@@ -1,6 +1,10 @@
-import { StrataError } from './errors.js';
+import { SceneCommitError, StrataError } from './errors.js';
 import { initializeCpuRuntime } from './internal/cpu-runtime.js';
 import { GpuProfiler } from './profiling/gpu-profiler.js';
+import { validateAuthoredBoxScene, validateAuthoredFrameCamera } from './rendering/authored-box-validation.js';
+import type { AuthoredBoxRenderer } from './rendering/authored-box-renderer.js';
+import type { AuthoredFrameMetadata, BoxSceneDescriptor } from './rendering/authored-box-types.js';
+import type { RasterControls } from './rendering/raster-types.js';
 import type { SceneRenderer } from './rendering/scene-renderer.js';
 import type { RasterRenderer } from './rendering/raster-renderer.js';
 import type { VirtualRenderer } from './geometry/virtual-renderer.js';
@@ -8,14 +12,14 @@ import type { IntegratedRenderer } from './integrated/integrated-renderer.js';
 import type { ReflectionRenderer } from './reflections/reflection-renderer.js';
 import type { ImportedRenderer } from './imported/imported-renderer.js';
 import type { GiRenderer } from './gi/gi-renderer.js';
-import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics, RenderOptions } from './types.js';
+import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics, RenderOptions, SceneCommitReceipt } from './types.js';
 
-type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer } | { kind: 'gi'; value: GiRenderer } | { kind: 'reflections'; value: ReflectionRenderer } | { kind: 'integrated'; value: IntegratedRenderer } | { kind: 'imported'; value: ImportedRenderer };
+type OwnedScene = { kind: 'authored-boxes'; value: AuthoredBoxRenderer; descriptor: BoxSceneDescriptor } | { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer } | { kind: 'gi'; value: GiRenderer } | { kind: 'reflections'; value: ReflectionRenderer } | { kind: 'integrated'; value: IntegratedRenderer } | { kind: 'imported'; value: ImportedRenderer };
 
 // Module evaluation is intentionally safe without navigator, document or Worker.
 const ownedCanvases = new WeakSet<HTMLCanvasElement>();
 const defaultTimeoutMs = 30_000;
-const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility', 'reflections', 'reflection-source'] as const;
+const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility', 'reflections', 'reflection-source', 'base-color'] as const;
 const defaultRenderOptions: RenderOptions = Object.freeze({});
 
 function validateRenderOptions(options: RenderOptions): void {
@@ -112,6 +116,18 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   let cpu: Awaited<ReturnType<typeof initializeCpuRuntime>> | undefined;
   let scene: OwnedScene | undefined;
   let sceneGeneration = 0;
+  let committedScene: SceneCommitReceipt = Object.freeze({ sceneGeneration: 0, renderer: 'clear', sceneId: null, sourceRevision: null });
+  let firstSubmittedFrameId: number | null = null;
+  let lastSubmittedFrameId: number | null = null;
+  // A throwing disposer does not transfer resource ownership back to the caller.
+  const retiredScenes = new Set<OwnedScene>();
+  function retireScene(previous: OwnedScene | undefined): unknown {
+    if (!previous) return undefined;
+    try { previous.value.dispose(); retiredScenes.delete(previous); }
+    catch (cause) { retiredScenes.add(previous); return { cause }; }
+    return undefined;
+  }
+
   let pendingSceneAbort: AbortController | undefined;
   let profiler: GpuProfiler | undefined;
   let submittedFrames = 0;
@@ -140,7 +156,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     const ownedDevice = device;
     device = undefined;
     try { ownedDevice?.removeEventListener('uncapturederror', handleGpuError); } catch { /* Continue cleanup. */ }
-    try { ownedScene?.value.dispose(); } catch { /* Continue releasing profiler/device resources. */ }
+    retireScene(ownedScene);
+    for (const retired of [...retiredScenes]) retireScene(retired);
+    retiredScenes.clear(); // The owned device is destroyed below even if disposal failed.
+
     try { profiler?.dispose(); } catch { /* Continue releasing the canvas and worker. */ }
     if (contextConfigured) {
       contextConfigured = false;
@@ -310,8 +329,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     function telemetry(): EngineTelemetry {
       return {
         submittedFrames, totalUploadBytes,
-        allocatedGpuBufferBytes: device ? (scene?.value.gpuBufferBytes ?? 0) + (profiler?.allocatedBufferBytes ?? 0) : 0,
-        allocatedGpuTextureBytes: scene?.value.gpuTextureBytes ?? 0,
+        scene: { identity: committedScene, firstSubmittedFrameId, lastSubmittedFrameId },
+        allocatedGpuBufferBytes: device ? (scene?.value.gpuBufferBytes ?? 0) + [...retiredScenes].reduce((sum, item) => sum + item.value.gpuBufferBytes, 0) + (profiler?.allocatedBufferBytes ?? 0) : 0,
+        allocatedGpuTextureBytes: device ? (scene?.value.gpuTextureBytes ?? 0) + [...retiredScenes].reduce((sum, item) => sum + item.value.gpuTextureBytes, 0) : 0,
         wasmMemoryBytes: cpu?.info.memoryBytes ?? 0,
         pendingGpuSamples: profiler?.pendingSamples ?? 0,
         droppedGpuSamples: profiler?.droppedSamples ?? 0,
@@ -336,88 +356,135 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       async setScene(sceneOptions) {
         assertReady();
         if (sceneOptions !== null && (!sceneOptions || typeof sceneOptions !== 'object' || Array.isArray(sceneOptions)
-          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual', 'gi', 'reflections', 'integrated', 'imported'].includes(sceneOptions.renderer)))) {
-          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse, raster, virtual, gi, reflections, integrated or imported, or null to clear.');
+          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual', 'gi', 'reflections', 'integrated', 'authored-boxes', 'imported'].includes(sceneOptions.renderer)))) {
+          throw new StrataError('INVALID_OPTIONS', 'Use a supported scene renderer, or null to clear.');
         }
-        if ((sceneOptions?.renderer === 'virtual' || sceneOptions?.renderer === 'integrated' || sceneOptions?.renderer === 'imported') && sceneOptions.signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
+        // Validate and take ownership of authored JSON before an asynchronous phase
+        // or superseding an already valid pending request.
+        const snapshot = sceneOptions === null ? null : sceneOptions.renderer === 'authored-boxes'
+          ? { ...sceneOptions, scene: validateAuthoredBoxScene(sceneOptions.scene) } : { ...sceneOptions };
+        const userSignal = snapshot?.renderer === 'virtual' || snapshot?.renderer === 'integrated' || snapshot?.renderer === 'authored-boxes' || snapshot?.renderer === 'imported'
+          ? snapshot.signal : undefined;
+        if (userSignal !== undefined && (!userSignal || typeof userSignal.aborted !== 'boolean'
+          || typeof userSignal.addEventListener !== 'function' || typeof userSignal.removeEventListener !== 'function')) {
+          throw new StrataError('INVALID_OPTIONS', 'signal must be an AbortSignal.');
+        }
+        if (userSignal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
+        if (snapshot?.renderer === 'virtual' || snapshot?.renderer === 'integrated') snapshot.manifestUrl = String(snapshot.manifestUrl);
+        if (snapshot?.renderer === 'integrated') snapshot.traceProxyUrl = String(snapshot.traceProxyUrl);
+        if (!Number.isSafeInteger(sceneGeneration + 1)) throw new StrataError('SCENE_LOAD_FAILED', 'Scene generation capacity exhausted.');
         const generation = ++sceneGeneration;
         pendingSceneAbort?.abort();
         pendingSceneAbort = undefined;
-        if (sceneOptions === null) {
-          scene?.value.dispose();
-          scene = undefined;
-          return;
+        function commit(next: OwnedScene | undefined): SceneCommitReceipt {
+          const previous = scene;
+          scene = next;
+          const receipt: SceneCommitReceipt = Object.freeze({ sceneGeneration: generation, renderer: next?.kind ?? 'clear',
+            sceneId: next?.kind === 'authored-boxes' ? next.descriptor.sceneId : null,
+            sourceRevision: next?.kind === 'authored-boxes' ? next.descriptor.sourceRevision : null });
+          committedScene = receipt;
+          firstSubmittedFrameId = lastSubmittedFrameId = null;
+          const failure = retireScene(previous) as { cause: unknown } | undefined;
+          if (failure) throw new SceneCommitError(receipt, failure.cause);
+          return receipt;
         }
-        const snapshot = { ...sceneOptions };
+        if (snapshot === null) return commit(undefined);
         const requestAbort = new AbortController();
         pendingSceneAbort = requestAbort;
-        const userSignal = snapshot.renderer === 'virtual' || snapshot.renderer === 'integrated' || snapshot.renderer === 'imported' ? snapshot.signal : undefined;
         const abortRequest = () => requestAbort.abort(userSignal?.reason);
-        userSignal?.addEventListener('abort', abortRequest, { once: true });
-        if (snapshot.renderer === 'virtual' || snapshot.renderer === 'integrated') snapshot.manifestUrl = String(snapshot.manifestUrl);
-        if (snapshot.renderer === 'integrated') snapshot.traceProxyUrl = String(snapshot.traceProxyUrl);
         const ownedDevice = device!;
         const assertCurrentRequest = (): void => {
           assertReady();
-          if (generation !== sceneGeneration) {
-            throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
-          }
+          if (generation !== sceneGeneration) throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
+          if (requestAbort.signal.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.', { cause: requestAbort.signal.reason });
         };
-        let next: OwnedScene;
-        try {
-          if (snapshot.renderer === 'imported') {
+        let rejectAbort!: (reason: unknown) => void;
+        const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+        const onRequestAbort = () => {
+          try { assertCurrentRequest(); } catch (cause) { rejectAbort(cause); }
+        };
+        requestAbort.signal.addEventListener('abort', onRequestAbort, { once: true });
+        userSignal?.addEventListener('abort', abortRequest, { once: true });
+        if (userSignal?.aborted) abortRequest();
+        async function build(): Promise<OwnedScene> {
+          if (snapshot!.renderer === 'authored-boxes') {
+            const { AuthoredBoxRenderer } = await import('./rendering/authored-box-renderer.js');
+            assertCurrentRequest();
+            return { kind: 'authored-boxes', descriptor: snapshot!.scene, value: await AuthoredBoxRenderer.create(ownedDevice, format, snapshot!.scene) };
+          } else if (snapshot!.renderer === 'imported') {
             const { ImportedRenderer } = await import('./imported/imported-renderer.js');
             assertCurrentRequest();
-            next = { kind: 'imported', value: await ImportedRenderer.create(ownedDevice, format, { ...snapshot, signal: requestAbort.signal }) };
-          } else if (snapshot.renderer === 'integrated') {
+            return { kind: 'imported', value: await ImportedRenderer.create(ownedDevice, format, { ...snapshot!, signal: requestAbort.signal }) };
+          } else if (snapshot!.renderer === 'integrated') {
             const { IntegratedRenderer } = await import('./integrated/integrated-renderer.js');
             assertCurrentRequest();
-            next = { kind: 'integrated', value: await IntegratedRenderer.create(ownedDevice, format, { ...snapshot, signal: requestAbort.signal }) };
-          } else if (snapshot.renderer === 'virtual') {
+            return { kind: 'integrated', value: await IntegratedRenderer.create(ownedDevice, format, { ...snapshot!, signal: requestAbort.signal }) };
+          } else if (snapshot!.renderer === 'virtual') {
             const { VirtualRenderer } = await import('./geometry/virtual-renderer.js');
             assertCurrentRequest();
-            next = { kind: 'virtual', value: await VirtualRenderer.create(ownedDevice, format, { ...snapshot, signal: requestAbort.signal }) };
-          } else if (snapshot.renderer === 'reflections') {
+            return { kind: 'virtual', value: await VirtualRenderer.create(ownedDevice, format, { ...snapshot!, signal: requestAbort.signal }) };
+          } else if (snapshot!.renderer === 'reflections') {
             const { ReflectionRenderer } = await import('./reflections/reflection-renderer.js');
             assertCurrentRequest();
-            next = { kind: 'reflections', value: await ReflectionRenderer.create(ownedDevice, format, snapshot) };
-          } else if (snapshot.renderer === 'gi') {
+            return { kind: 'reflections', value: await ReflectionRenderer.create(ownedDevice, format, snapshot!) };
+          } else if (snapshot!.renderer === 'gi') {
             const { GiRenderer } = await import('./gi/gi-renderer.js');
             assertCurrentRequest();
-            next = { kind: 'gi', value: await GiRenderer.create(ownedDevice, format, snapshot) };
-          } else if (snapshot.renderer === 'raster') {
+            return { kind: 'gi', value: await GiRenderer.create(ownedDevice, format, snapshot!) };
+          } else if (snapshot!.renderer === 'raster') {
             const { RasterRenderer } = await import('./rendering/raster-renderer.js');
             assertCurrentRequest();
-            next = { kind: 'raster', value: await RasterRenderer.create(ownedDevice, format, snapshot) };
-          } else {
-            const { SceneRenderer } = await import('./rendering/scene-renderer.js');
-            assertCurrentRequest();
-            next = { kind: 'diffuse', value: await SceneRenderer.create(ownedDevice, format, snapshot) };
+            return { kind: 'raster', value: await RasterRenderer.create(ownedDevice, format, snapshot!) };
           }
-        } catch (cause) {
+          const { SceneRenderer } = await import('./rendering/scene-renderer.js');
           assertCurrentRequest();
-          if (requestAbort.signal.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.', { cause });
+          return { kind: 'diffuse', value: await SceneRenderer.create(ownedDevice, format, snapshot!) };
+        }
+        let candidate: OwnedScene | undefined;
+        try {
+          const operation = build().then((next) => {
+            totalUploadBytes += next.value.initialUploadBytes;
+            try { assertCurrentRequest(); } catch (cause) { retireScene(next); throw cause; }
+            candidate = next;
+            return next;
+          });
+          const next = await Promise.race([operation, aborted]);
+          assertCurrentRequest();
+          candidate = undefined; // commit takes ownership, including a retirement failure.
+          return commit(next);
+        } catch (cause) {
+          retireScene(candidate);
+          if (cause instanceof SceneCommitError) throw cause;
+          assertCurrentRequest();
           if (cause instanceof StrataError) throw cause;
           throw new StrataError('SCENE_LOAD_FAILED', 'The scene could not be initialized.', { cause });
         } finally {
+          requestAbort.signal.removeEventListener('abort', onRequestAbort);
           userSignal?.removeEventListener('abort', abortRequest);
           if (pendingSceneAbort === requestAbort) pendingSceneAbort = undefined;
         }
-        totalUploadBytes += next.value.initialUploadBytes;
-        if (generation !== sceneGeneration || state !== 'ready' || gpuErrorCount || requestAbort.signal.aborted) {
-          next.value.dispose();
-          assertReady();
-          if (generation === sceneGeneration && requestAbort.signal.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
-          throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
-        }
-        const previous = scene;
-        scene = next;
-        previous?.value.dispose();
       },
       render(renderOptions) {
         assertReady();
         const requestedControls = renderOptions ?? defaultRenderOptions;
         validateRenderOptions(requestedControls);
+        if (requestedControls.imported !== undefined && scene?.kind !== 'imported') {
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Imported controls require an imported scene.');
+        }
+        if (scene?.kind === 'imported' && (requestedControls.gi !== undefined || requestedControls.reflections !== undefined
+          || (requestedControls.debugView !== undefined && !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'].includes(requestedControls.debugView)))) {
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Imported scenes support raster diagnostics without GI or traced reflections.');
+        }
+        if (scene?.kind === 'authored-boxes') {
+          if (requestedControls.temporal === true || requestedControls.gi !== undefined || requestedControls.reflections !== undefined
+            || (requestedControls.debugView !== undefined && requestedControls.debugView !== 'final' && requestedControls.debugView !== 'base-color')) {
+            throw new StrataError('UNSUPPORTED_FEATURE', 'Authored boxes support final/base-color views with temporal disabled.');
+          }
+        } else if (requestedControls.camera !== undefined || requestedControls.debugView === 'base-color') {
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Camera overrides and base-color are supported only by authored boxes.');
+        }
+        const effectiveCamera = scene?.kind === 'authored-boxes'
+          ? validateAuthoredFrameCamera(scene.descriptor, requestedControls.camera === undefined ? scene.descriptor.camera : requestedControls.camera, canvas.width, canvas.height) : undefined;
         const controls = forceRasterCameraCut && scene && scene.kind !== 'diffuse'
           ? { ...requestedControls, cameraCut: true } : requestedControls;
         const timeSeconds = renderOptions?.timeSeconds ?? 0;
@@ -426,7 +493,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         }
         const started = performance.now();
         const frameId = submittedFrames + 1;
-        const passNames = scene && scene.kind !== 'diffuse' ? scene.value.passNames(controls) : scene ? 'procedural' : 'clear';
+        const frameScene = committedScene;
+        const passNames = scene?.kind === 'authored-boxes' ? scene.value.passNames()
+          : scene && scene.kind !== 'diffuse' ? scene.value.passNames(controls as RasterControls) : scene ? 'procedural' : 'clear';
         const timing = profiler?.begin(frameId, passNames);
         try {
           const encoder = device!.createCommandEncoder({ label: 'Strata frame' });
@@ -436,9 +505,15 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           let triangles = 0;
           let uploadBytes = 0;
           let skippedGpuPasses: readonly string[] | undefined;
-          if (scene && scene.kind !== 'diffuse') {
+          let authored: AuthoredFrameMetadata | undefined;
+          if (scene?.kind === 'authored-boxes') {
+            ({ drawCalls, dispatchCalls, triangles, uploadBytes, authored } = scene.value.encode(
+              encoder, view, canvas.width, canvas.height, timeSeconds,
+              { camera: effectiveCamera!, debugView: (requestedControls.debugView ?? 'final') as 'final' | 'base-color', temporal: false }, timing?.timestamps,
+            ));
+          } else if (scene && scene.kind !== 'diffuse') {
             ({ drawCalls, dispatchCalls, triangles, uploadBytes, skippedGpuPasses } = scene.value.encode(
-              encoder, view, canvas.width, canvas.height, timeSeconds, controls, timing?.timestamps,
+              encoder, view, canvas.width, canvas.height, timeSeconds, controls as RasterControls, timing?.timestamps,
             ));
           } else if (scene) {
             ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.value.encode(
@@ -462,11 +537,13 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           device!.queue.submit([encoder.finish()]);
           if (scene && scene.kind !== 'diffuse') forceRasterCameraCut = false;
           submittedFrames++;
+          firstSubmittedFrameId ??= frameId;
+          lastSubmittedFrameId = frameId;
           if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated' || scene?.kind === 'imported') scene.value.submitted(frameId);
           if (timing) profiler!.submitted(timing);
           const stats = telemetry();
           const metrics: FrameMetrics = {
-            frameId, cpuSubmissionMs: performance.now() - started,
+            frameId, scene: frameScene, ...(authored ? { authored } : {}), cpuSubmissionMs: performance.now() - started,
             drawCalls, dispatchCalls, triangles, uploadBytes,
             allocatedGpuBufferBytes: stats.allocatedGpuBufferBytes,
             allocatedGpuTextureBytes: stats.allocatedGpuTextureBytes,

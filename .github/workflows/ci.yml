@@ -40,6 +40,11 @@ jobs:
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
+      - name: Validate authored scenes, large-coordinate precision, and scene receipts
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:authored-boxes
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
       - name: Validate the procedural benchmark on software WebGPU
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke
         env:
@@ -62,6 +67,11 @@ jobs:
           STRATA_TEST_HEADED: '1'
       - name: Validate world-space tracing, probe cache, and rendered GI
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:gi
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate finite probe sampling volume
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:probe-volume
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'

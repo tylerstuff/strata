@@ -1,6 +1,6 @@
 import { loadGltf, type LoadGltfOptions } from '@strata-engine/core/gltf';
-import { createEngine, StrataError } from '@strata-engine/core';
-import type { ReflectionMode, ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode } from '@strata-engine/core';
+import { createEngine, StrataError, SceneCommitError, validateAuthoredBoxScene, validateBoxCamera, validateAuthoredFrameCamera } from '@strata-engine/core';
+import type { BoxSceneDescriptor, BoxCamera, SceneCommitReceipt, SceneOptions, AuthoredFrameMetadata, AuthoredBoxSceneOptions, ReflectionMode, ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode } from '@strata-engine/core';
 
 const canvas = document.createElement('canvas');
 const options: Parameters<typeof createEngine>[0] = {
@@ -58,10 +58,30 @@ async function lifecycle() {
       animation: { clipId: imported.clips[0]?.id ?? null, timeSeconds: 0.5, loop: false }, presentation: 'ground' } });
     const importedTime: number | undefined = importedFrame.imported?.animation.timeSeconds;
     void importedTime;
+    const camera: BoxCamera = { position: [0, 0, 3], rotation: [0, 0, 0, 1],
+      projection: { kind: 'perspective', verticalFovRadians: 1, near: 0.1, far: 32 } };
+    const boxes: BoxSceneDescriptor = validateAuthoredBoxScene({
+      format: 'strata.runtime-boxes', version: 1, coordinateSystem: 'strata-world-v1',
+      sceneId: 'packed-example', sourceRevision: null, boxes: [], camera,
+      light: { directionToLight: [0, 1, 0], radiance: [1, 1, 1] }, background: [0, 0, 0],
+    });
+    const authoredOptions: AuthoredBoxSceneOptions = { renderer: 'authored-boxes', scene: boxes };
+    const genericScene: SceneOptions = authoredOptions;
+    const load: Promise<SceneCommitReceipt> = engine.setScene(genericScene);
+    const receipt: SceneCommitReceipt = await load;
+    const authoredFrame = engine.render({ camera: validateBoxCamera(camera), temporal: false, debugView: 'base-color' });
+    const metadata: AuthoredFrameMetadata | undefined = authoredFrame.authored;
+    const submittedScene: SceneCommitReceipt = authoredFrame.scene;
+    const last: number | null = engine.getTelemetry().scene.lastSubmittedFrameId;
+    const checkedCamera: BoxCamera = validateAuthoredFrameCamera(boxes, camera, 640, 360);
+    // @ts-expect-error setScene returns a receipt even through generic SceneOptions.
+    const oldVoidWrapper: Promise<void> = engine.setScene(genericScene);
+    void receipt; void metadata; void submittedScene; void last; void checkedCamera; void oldVoidWrapper;
     await engine.waitForIdle();
     engine.dispose();
     return { abiVersion, memoryBytes, format, state };
   } catch (error) {
+    if (error instanceof SceneCommitError) { const committed: SceneCommitReceipt = error.committedScene; void committed; }
     if (error instanceof StrataError) return error.code;
     throw error;
   }
