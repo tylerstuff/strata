@@ -5,6 +5,8 @@ export interface VirtualSceneOptions {
   renderer: 'virtual';
   manifestUrl: string | URL;
   geometryMode?: GeometryMode;
+  /** Opt-in complete-fallback retention experiment. Only valid with streamed geometry. */
+  residencyPolicy?: 'greedy' | 'retain-fallback';
   /** Fixed page-pool bytes INCLUDING pinned coarse pages. Streamed default: 8 MiB. */
   poolBytes?: number;
   pixelError?: number;

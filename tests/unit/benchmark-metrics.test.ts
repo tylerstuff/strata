@@ -49,6 +49,12 @@ describe('benchmark measurements', () => {
     const options = { renderer: 'virtual', manifestUrl: '/external-assets/terrain/manifest.json' } as const;
     expect(normalizeOptions(options).poolBytes).toBe(8 * 1024 ** 2);
     expect(normalizeOptions({ ...options, geometryMode: 'mesh-lod' }).geometryMode).toBe('mesh-lod');
+    expect(normalizeOptions(options).residencyPolicy).toBe('greedy');
+    expect(normalizeOptions({ ...options, residencyPolicy: 'retain-fallback' }).residencyPolicy).toBe('retain-fallback');
+    for (const geometryMode of ['mesh-lod', 'resident-lod', 'resident-full'] as const) {
+      expect(() => normalizeOptions({ ...options, geometryMode, residencyPolicy: 'retain-fallback' })).toThrow(/streamed/);
+    }
+    expect(() => normalizeOptions({ renderer: 'raster', residencyPolicy: 'retain-fallback' })).toThrow(/streamed/);
     expect(() => normalizeOptions({ ...options, pixelError: 0 })).toThrow();
     expect(() => normalizeOptions({ ...options, pageLoadDelayMs: Infinity })).toThrow();
     expect(() => normalizeOptions({ ...options, poolBytes: 1 })).toThrow();

@@ -2,6 +2,8 @@ import { StrataError } from '../errors.js';
 import { validateGeometryPage } from './format.js';
 import type { GeometryCluster, GeometryManifest, GeometryPage } from './format.js';
 import type { GeometryMode } from './virtual-types.js';
+import { planRetainedResidency } from './retained-residency.js';
+import type { RetainedResidencyPlan } from './retained-residency.js';
 
 export interface GeometryPageDemand { readonly tileId: number; readonly lod: number; readonly priority: number }
 export interface GeometryPageMapping { readonly pageId: number; readonly slot: number }
@@ -12,6 +14,8 @@ export interface GeometryPageUpdate {
 }
 export interface GeometryPageCacheOptions {
   geometryMode?: GeometryMode;
+  /** Experimental fixed-demand fallback retention; the default planner remains greedy. */
+  residencyPolicy?: 'greedy' | 'retain-fallback';
   poolBytes?: number;
   maxConcurrentRequests?: number;
   uploadBudgetBytes?: number;
@@ -38,6 +42,7 @@ interface Request {
 interface Failure { attempts: number; retryAt: number; terminal: boolean }
 interface Settings {
   readonly mode: GeometryMode;
+  readonly residencyPolicy: 'greedy' | 'retain-fallback';
   readonly capacityPages: number;
   readonly concurrent: number;
   readonly uploadPages: number;
@@ -60,6 +65,9 @@ function integer(value: number, minimum: number, maximum: number, name: string):
 function settings(device: GPUDevice, manifest: GeometryManifest, options: GeometryPageCacheOptions): Settings {
   const mode = options.geometryMode ?? 'streamed';
   if (!['streamed', 'resident-lod', 'resident-full'].includes(mode)) throw new StrataError('INVALID_OPTIONS', 'Unknown geometry residency mode.');
+  const residencyPolicy = options.residencyPolicy ?? 'greedy';
+  if (!['greedy', 'retain-fallback'].includes(residencyPolicy)) throw new StrataError('INVALID_OPTIONS', 'Unknown geometry residency policy.');
+  if (residencyPolicy !== 'greedy' && mode !== 'streamed') throw new StrataError('INVALID_OPTIONS', 'Fallback retention applies only to streamed geometry.');
   const pageBytes = manifest.pageBytes;
   const requestedBytes = integer(options.poolBytes ?? 8 * 1024 * 1024, pageBytes, Number.MAX_SAFE_INTEGER, 'poolBytes');
   const capacityPages = mode === 'streamed' ? Math.min(manifest.pages.length, Math.floor(requestedBytes / pageBytes)) : manifest.pages.length;
@@ -76,7 +84,7 @@ function settings(device: GPUDevice, manifest: GeometryManifest, options: Geomet
   }
   const concurrent = integer(options.maxConcurrentRequests ?? 4, 1, 32, 'maxConcurrentRequests');
   return {
-    mode, capacityPages, concurrent,
+    mode, residencyPolicy, capacityPages, concurrent,
     uploadPages: Math.floor(integer(options.uploadBudgetBytes ?? 4 * pageBytes, pageBytes, Number.MAX_SAFE_INTEGER, 'uploadBudgetBytes') / pageBytes),
     reservedPages: Math.floor(integer(options.maxCompletedBytes ?? concurrent * pageBytes, pageBytes, Number.MAX_SAFE_INTEGER, 'maxCompletedBytes') / pageBytes),
     delayMs: integer(options.pageLoadDelayMs ?? 0, 0, 120_000, 'pageLoadDelayMs'),
@@ -114,6 +122,7 @@ export class GeometryPageCache {
   private wanted: Set<number>;
   private pageOrder: number[];
   private plannedLods = new Map<number, number>();
+  private retainedPlan: RetainedResidencyPlan | undefined;
   private preloading = true;
   private disposed = false;
   private epoch = 0;
@@ -183,6 +192,14 @@ export class GeometryPageCache {
       stagingBudgetBytes: this.settings.reservedPages * this.manifest.pageBytes,
       failedPages: [...this.failures.values()].filter(failure => failure.terminal).length,
       demandedTiles: this.demands.length, selectedDemandTiles: this.plannedLods.size,
+      residencyPolicy: this.settings.residencyPolicy,
+      retainedFallbackTiles: this.retainedPlan?.selectedLods.size ?? 0,
+      retainedProtectedPages: this.retainedPlan?.protectedPageIds.size ?? 0,
+      retainedTargetTile: this.retainedPlan?.target?.tileId ?? null,
+      retainedTargetLod: this.retainedPlan?.target?.lod ?? null,
+      retainedBlockedDemands: this.retainedPlan?.blockedDemands.length ?? 0,
+      retainedDeferredDemands: this.retainedPlan?.deferredDemandCount ?? 0,
+      retainedUnsatisfiedDemands: this.retainedPlan?.unsatisfiedDemandCount ?? 0,
       lastFailure: this.lastFailure,
     };
   }
@@ -214,6 +231,20 @@ export class GeometryPageCache {
 
   private replan(): void {
     if (this.preloading || this.settings.mode !== 'streamed' || this.disposed) return;
+    if (this.settings.residencyPolicy === 'retain-fallback') {
+      const plan = planRetainedResidency(this.manifest, {
+        demands: this.demands, residentPageIds: new Set(this.lastUsed.keys()),
+        terminalFailedPageIds: new Set([...this.failures].filter(([, failure]) => failure.terminal).map(([id]) => id)),
+        capacityPages: this.settings.capacityPages,
+      });
+      this.retainedPlan = plan;
+      this.wanted = new Set(plan.wantedPageIds);
+      this.pageOrder = [...plan.pageOrder];
+      this.plannedLods = new Map(plan.selectedLods);
+      if (plan.target) this.plannedLods.set(plan.target.tileId, plan.target.lod);
+      this.cancelUnwanted();
+      return;
+    }
     const wanted = new Set(this.roots);
     const order = [...this.roots];
     const planned = new Map<number, number>();
@@ -232,11 +263,15 @@ export class GeometryPageCache {
     this.wanted = wanted;
     this.pageOrder = order;
     this.plannedLods = planned;
+    this.cancelUnwanted();
+  }
+
+  private cancelUnwanted(): void {
     for (const pageId of this.completed.keys()) {
-      if (!wanted.has(pageId)) { this.completed.delete(pageId); this.counts.discardedCompletions++; }
+      if (!this.wanted.has(pageId)) { this.completed.delete(pageId); this.counts.discardedCompletions++; }
     }
     for (const request of this.pending.values()) {
-      if (!wanted.has(request.pageId) && !request.cancelled && !request.finished) {
+      if (!this.wanted.has(request.pageId) && !request.cancelled && !request.finished) {
         request.cancelled = true;
         this.counts.requestsCancelled++;
         request.controller.abort();
@@ -247,12 +282,19 @@ export class GeometryPageCache {
   /** Synchronous frame boundary: commit pool uploads and mapping changes before GPU encoding. */
   update(): GeometryPageUpdate {
     this.assertLive();
+    if (this.settings.residencyPolicy === 'retain-fallback') this.replan();
     this.frame++;
     for (const pageId of this.wanted) if (this.mapping[pageId] !== -1) this.lastUsed.set(pageId, this.frame);
     const uploaded: GeometryPageMapping[] = [];
     const evicted: GeometryPageMapping[] = [];
     for (const pageId of this.pageOrder) {
       if (uploaded.length >= this.settings.uploadPages) break;
+      // A shared page uploaded earlier in this batch may have completed a more
+      // preferred LOD. Protect its entire dependency group before any eviction.
+      if (this.settings.residencyPolicy === 'retain-fallback') {
+        this.replan();
+        if (!this.wanted.has(pageId)) continue;
+      }
       const bytes = this.completed.get(pageId);
       if (!bytes) continue;
       let slot = this.slots.indexOf(-1);
@@ -277,6 +319,7 @@ export class GeometryPageCache {
       this.completed.delete(pageId);
       uploaded.push({ pageId, slot });
       this.counts.uploadedPages++; this.counts.uploadedBytes += bytes.byteLength;
+      if (this.settings.residencyPolicy === 'retain-fallback') this.replan();
     }
     this.pump();
     return { uploaded, evicted, uploadBytes: uploaded.length * this.manifest.pageBytes };
@@ -379,6 +422,7 @@ export class GeometryPageCache {
       request.cancelled = true; request.controller.abort();
     }
     this.pending.clear(); this.completed.clear(); this.lastUsed.clear();
+    this.retainedPlan = undefined;
     this.mapping.fill(-1); this.slots.fill(-1); this.wanted.clear(); this.pageOrder = [];
     this.buffer.destroy();
     this.notify();

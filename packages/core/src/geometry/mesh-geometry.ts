@@ -121,6 +121,9 @@ export class MeshGeometry implements RasterGeometryProvider {
   }
 
   static async create(device: GPUDevice, manifest: GeometryManifest, manifestUrl: URL, options: VirtualSceneOptions, renderOptions?: TerrainRenderOptions): Promise<MeshGeometry> {
+    if (options.residencyPolicy !== undefined && options.residencyPolicy !== 'greedy') {
+      throw new StrataError('INVALID_OPTIONS', 'Fallback retention applies only to streamed geometry.');
+    }
     const pixelError = options.pixelError ?? 2; const concurrency = options.maxConcurrentRequests ?? 4;
     const delay = options.pageLoadDelayMs ?? 0; const cameraMode = options.cameraMode ?? 'tour';
     if (!Number.isFinite(pixelError) || pixelError <= 0 || pixelError > 1000 || !Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32
