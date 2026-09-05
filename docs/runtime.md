@@ -51,6 +51,8 @@ The application owns the canvas element, its CSS layout, and its animation/resiz
 
 Initialization failures release partially created resources. A device request that resolves after cancellation is destroyed when it arrives. Aborting the initialization signal after successful creation does not dispose a running engine; call `dispose()` explicitly.
 
+`render({ exposureEV: 4 })` applies +4 stops (16×) of presentation exposure compensation to a raster-based scene. The value is finite in [-16,16], with a per-render default of 0; positive values brighten. It affects tone-mapped radiance views only, without changing scene lighting, temporal history or progressive GI samples. Invalid values reject before frame preparation. Clear, diffuse and authored-boxes reject nonzero exposure explicitly. See [raster.md](raster.md) for debug-view behavior and limitations.
+
 `setScene({ renderer: 'gi', probesPerUpdate: 32, raysPerProbe: 64 })` creates the shared two-room raster/trace fixture. `render({ gi: { doorOpen: false, lightIntensity: 1 } })` patches its persistent world state. Changes invalidate the world cache and temporal history; camera cuts reset only screen history. `gi.enabled: false` pauses tracing/composition while retaining owned allocations. This experiment has a small exact triangle BVH built/refitted in TypeScript; its 132-triangle CPU work does not justify a WASM job boundary. GPU tracing, directional probe updates and shading run in WGSL. Debug views and per-frame `gi` telemetry expose budgets and epochs, with unmeasured GPU quantities explicitly null.
 
 `engine.info` describes the selected canvas format, enabled features, texture dimension limit, and CPU ABI/linear-memory size. WASM linear-memory bytes are not total browser memory or GPU memory.

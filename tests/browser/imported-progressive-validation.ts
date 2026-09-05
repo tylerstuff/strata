@@ -185,6 +185,47 @@ export async function validateImportedProgressive() {
     cases.push({ name: 'public-perspective-sky-progress', receipt, referenceHdr, referenceDisplay, checkpoints, atCap, capCounters,
       interpretation: 'Exactly one scheduled update per covered pixel per frame is independently established by complete counters; general public counters do not expose per-pixel spp.' });
 
+    // Exposure is presentation-only. Keep the same capped HDR accumulation while
+    // varying EV and raw diagnostic views, so new stochastic samples cannot hide a reset.
+    const exposureBefore = counters(engine, 16 * 16 * limits.maxSamples);
+    const exposureAllocations = [engine.getTelemetry().allocatedGpuBufferBytes, engine.getTelemetry().allocatedGpuTextureBytes];
+    const zeroEv = await frame(engine, canvas, { ...onOptions, exposureEV: 0 }, 'exposure-ev-zero'); captures.push(zeroEv.capture!);
+    require(same(zeroEv.capture!.pixels, capped.capture!.pixels), 'Explicit EV0 must be byte-identical to the omitted exposure default.');
+    const plusTwoEv = await frame(engine, canvas, { ...onOptions, exposureEV: 2 }, 'exposure-ev-plus-two'); captures.push(plusTwoEv.capture!);
+    require(plusTwoEv.capture!.meanRgb.every((value, c) => value > zeroEv.capture!.meanRgb[c]! + 10),
+      'Two stops must visibly brighten every channel of the nonzero final GI image.');
+    const exposureRestored = await frame(engine, canvas, onOptions, 'exposure-default-restored'); captures.push(exposureRestored.capture!);
+    require(same(exposureRestored.capture!.pixels, capped.capture!.pixels), 'Exposure must default to EV0 per render, rather than persist the last explicit EV.');
+    const rawViews: Record<string, unknown>[] = [];
+    for (const debugView of ['normal', 'material', 'depth', 'shadow'] as const) {
+      const rawZero = await frame(engine, canvas, { ...onOptions, debugView, exposureEV: 0 }, `exposure-${debugView}-zero`);
+      const rawNegative = await frame(engine, canvas, { ...onOptions, debugView, exposureEV: -2 }, `exposure-${debugView}-minus-two`);
+      captures.push(rawZero.capture!, rawNegative.capture!);
+      require(rawZero.capture!.maxRgb.some(value => value > 8), `${debugView} exposure witness must contain nonblack values.`);
+      require(same(rawZero.capture!.pixels, rawNegative.capture!.pixels), `${debugView} contains raw diagnostic quantities and must be byte-identical across exposure changes.`);
+      rawViews.push({ debugView, meanRgb: rawZero.capture!.meanRgb, identical: true });
+    }
+    const invalidExposure: Record<string, unknown>[] = [];
+    for (const [name, exposureEV] of [['nan', NaN], ['positive-infinity', Infinity], ['negative-infinity', -Infinity],
+      ['above-range', 16.01], ['below-range', -16.01], ['string', '2'], ['null', null]] as const) {
+      const before = engine.getTelemetry(), size = [canvas.width, canvas.height]; let rejection = '';
+      try { engine.render({ ...onOptions, exposureEV } as unknown as RenderOptions); } catch (error) { rejection = code(error); }
+      require(rejection === 'INVALID_OPTIONS', `Invalid exposure ${name} must reject with INVALID_OPTIONS.`);
+      require(same(engine.getTelemetry(), before) && same([canvas.width, canvas.height], size),
+        `Invalid exposure ${name} must preserve all public counters, allocations, receipt, progress and canvas dimensions.`);
+      invalidExposure.push({ name, rejection });
+    }
+    const afterInvalidExposure = await frame(engine, canvas, onOptions, 'exposure-after-invalid'); captures.push(afterInvalidExposure.capture!);
+    require(same(afterInvalidExposure.capture!.pixels, capped.capture!.pixels), 'A valid default render after rejected EV values must preserve the capped image.');
+    const exposureAfter = counters(engine, 16 * 16 * limits.maxSamples);
+    require(exposureAfter.revision === exposureBefore.revision && exposureAfter.attempted === exposureBefore.attempted
+      && exposureAfter.completed === exposureBefore.completed, 'EV changes and raw debug views must not reset, resample or mutate the capped GI accumulation.');
+    require(same([engine.getTelemetry().allocatedGpuBufferBytes, engine.getTelemetry().allocatedGpuTextureBytes], exposureAllocations),
+      'Exposure and raw-view changes must not allocate replacement GI or raster targets.');
+    cases.push({ name: 'public-presentation-exposure-preserves-capped-gi', exposureBefore, exposureAfter, rawViews, invalidExposure,
+      defaultMeanRgb: zeroEv.capture!.meanRgb, plusTwoMeanRgb: plusTwoEv.capture!.meanRgb,
+      scope: 'Actual public presentation and capped progressive GI; progressive mode deliberately disables TAA, so this case makes no TAA-history claim.' });
+
     const beforeRejected = engine.getTelemetry(); const beforeSize = [canvas.width, canvas.height];
     let resizeError = '';
     try { engine.resize(33, 33); } catch (error) { resizeError = code(error); }
@@ -224,6 +265,23 @@ export async function validateImportedProgressive() {
     captures.push(emissionOn.capture!); const emissionCounters = counters(engine, 9 * 16 * 16);
     require(same(emissionOff.capture!.pixels, emissionOn.capture!.pixels), 'Primary emission must remain identical with zero incoming indirect lighting.');
     cases.push({ name: 'primary-emission-counted-once', emissionCounters, meanRgb: emissionOn.capture!.meanRgb });
+
+    // A known nonzero direct HDR value verifies exposure's numeric 2**EV scale,
+    // without relying on sky sampling or comparing two near-black images.
+    const emissionOptions: RenderOptions = { temporal: true, imported: { ...noSky, indirect: { enabled: true } } };
+    const emissionDirectZero = await frame(engine, canvas, { ...emissionOptions, debugView: 'direct', exposureEV: 0 }, 'exposure-emission-direct-zero');
+    const emissionDirectTwo = await frame(engine, canvas, { ...emissionOptions, debugView: 'direct', exposureEV: 2 }, 'exposure-emission-direct-plus-two');
+    const emissionFinalTwo = await frame(engine, canvas, { ...emissionOptions, exposureEV: 2 }, 'exposure-emission-final-plus-two');
+    const emissionDefault = await frame(engine, canvas, emissionOptions, 'exposure-emission-default');
+    captures.push(emissionDirectZero.capture!, emissionDirectTwo.capture!, emissionFinalTwo.capture!, emissionDefault.capture!);
+    const expectedEmissionTwo = [0.12, 0.03, 0.015].map(value => display(value * 2 * (2 ** 2)));
+    require(same(emissionDirectZero.capture!.pixels, emissionOff.capture!.pixels), 'Direct EV0 must preserve the original emission image.');
+    require(emissionDirectTwo.capture!.meanRgb.every((value, c) => Math.abs(value - expectedEmissionTwo[c]!) < 1.5),
+      'Direct output must apply exactly fourfold linear exposure before the specified tone and sRGB transfers, within half-float and 8-bit rounding.');
+    require(same(emissionDirectTwo.capture!.pixels, emissionFinalTwo.capture!.pixels), 'Final and direct views must expose the same known emission identically when indirect energy is zero.');
+    require(same(emissionDefault.capture!.pixels, emissionOff.capture!.pixels), 'Default exposure must return emission to its original byte values.');
+    cases.push({ name: 'public-direct-final-exposure-numeric', expectedEmissionTwo, actualMeanRgb: emissionDirectTwo.capture!.meanRgb,
+      absoluteDisplayByteTolerance: 1.5, definedBeforeGpuObservation: true });
 
     let posted!: (id: number) => void;
     const observedPost = new Promise<number>(resolve => { posted = resolve; });
