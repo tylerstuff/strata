@@ -234,3 +234,79 @@ records exact source, external artifact paths, independent audits and limitation
 The BigInt full control is correctness-only. Issue #20 remains open for the
 matched 30-second warmup / 60-second 720p and 1080p performance comparison using
 the original 1 MiB workload and a production-policy full maintenance control.
+## Matched performance preparation
+
+`tests/helpers/full-trace-performance-updater.ts` supplies a separate diagnostic
+full maintenance control using the production TwoSum/outward-float32 numerical
+policy. Each changed target regenerates all dynamic triangles, packs all records
+and refits all nodes once, then writes the five complete buffers. It retains the
+same target/queued/submitted contracts and renderer history rules. It does not
+call the old refit followed by a second bounds repair or execute independent
+BigInt/ray-oracle work in the timed updater. The normal production profiler's
+timestamp arithmetic remains unchanged in both arms.
+
+CPU qualification on the original courtyard matched all five arrays across the
+13 frozen targets and all 4,096 packed CPU ray results across eight states. The
+controlled offset-zero-to-0.4 transition produces 184,640 bytes in five full
+writes versus 912 bytes in seven incremental writes. Retained typed control
+metadata is 187,185 bytes versus 150,801 bytes for incremental maintenance;
+temporary JavaScript objects, borrowed packed data and GPU storage are separate.
+This is CPU correctness and accounting, not measured performance. Source and
+external evidence are recorded on issue #20.
+
+Prepare from a reviewed clean commit after building the package. The performance
+asset root is the external parent containing the original
+`integrated-courtyard-v1-s1337-t4-c64` directory:
+
+```sh
+npm run build
+node scripts/run-benchmark.mjs --trace-prepare-only --commit EXACT_COMMIT \
+  --asset-root /external/cooked/root --output /external/new-performance-freeze
+```
+
+Preparation freezes two external package builds with the same production build
+flags, worker/WASM and module sources, replacing only the internal updater in the
+full arm. It freezes all 83 source assets, the benchmark app, settings and run
+order. Assets, builds and results must remain outside Git and CI.
+
+Before timing, prepare and independently review a separate correctness manifest
+with `scripts/test-trace-updates.mjs --prepare-only`, using `--full-control
+full-performance`. The original correctness-only mode remains available. An
+explicit `--renderer-churn skip-unchanged-candidate-only` can omit the already
+covered candidate-only Stage C; it records `skipped`, not exercised coverage.
+Renderer steps now use the literal reviewed numbers and an owned, fully validated
+serialized plan, preserving all original schedules and numerical/image gates.
+
+Only a matching passed hardware direct-write and paired-renderer receipt for the
+new control can admit a timing run. A separately allocated GPU window then uses:
+
+```sh
+node scripts/run-benchmark.mjs --trace-performance \
+  --manifest /external/new-performance-freeze/manifest.json --manifest-sha256 SHA \
+  --correctness-report /external/new-correctness/report.json --correctness-report-sha256 SHA \
+  --correctness-manifest /external/new-correctness-freeze/manifest.json --correctness-manifest-sha256 SHA \
+  --output /external/new-performance-result
+```
+
+The fixed order is incremental 720p, full 720p, full 1080p, incremental 1080p.
+Every run uses a fresh context, 30-second warmup, original 60-second browser-time
+tour, 1 MiB streamed pool, all-on GI/reflections/TAA and unchanged quality budgets.
+Independent RAF timing means frame counts and sinusoidal samples can differ.
+Capture-start trace counters make the first measured delta explicit; final trace
+counters come from the last measured frame, separately from post-capture drains.
+Images at t0/3/5/16/32 and disposal diagnostics are collected outside timing.
+
+The offline summary reports fixed time windows, positive-target-delta opening
+CPU samples, actual uploads, GPU sample coverage, cadence and tracked memory.
+Its practical numerical decision is not overall acceptance: source, stable power,
+errors, visual evidence, GPU coverage and cleanup require separate validation.
+Canonical upload savings refer to the controlled transition, not every moving
+frame. The frozen practical improvement rules are at least 25% lower opening
+changed-target CPU p95 and 90% less canonical trace traffic; whole-tour CPU/GPU
+tails and slow-callback shares must also stay within their reviewed bounds.
+Single opposite-order pairs do not establish statistical significance, overall
+visual quality, whole VRAM use or a general 60 FPS result.
+
+CPU tooling checks are `npm run test:trace-updates:launcher`,
+`npm run test:trace-performance:unit`, focused trace control/plan tests and both
+TypeScript configurations. The actual asset/hardware qualification remains local.

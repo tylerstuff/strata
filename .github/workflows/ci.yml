@@ -32,6 +32,7 @@ jobs:
       - run: npm run test:unit
       - run: npm run test:benchmark-server
       - run: npm run test:trace-updates:launcher
+      - run: npm run test:trace-performance:unit
       - run: npm run test:gallery:unit
       - run: npm run build
       - name: Validate preview lifecycle and packed CPU consumer
