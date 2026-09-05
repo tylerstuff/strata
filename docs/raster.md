@@ -22,7 +22,7 @@ Lighting and temporal history remain linear in `rgba16float`. Presentation appli
 
 `render({ exposureEV: 4 })` applies +4 stops (16×) of exposure compensation to this frame. Positive values brighten; this is compensation, not calibrated photographic EV100. The finite range is [-16,16], and omission means 0 (1×), including after a previously exposed frame. Final, direct, indirect-only and reflection radiance views apply this multiplier. Raw depth, normal, motion, material, shadow, geometry and trace diagnostics do not. The indirect-only room diagnostic retains its existing additional 20× display gain (about +4.322 stops); use **final** for matched GI-on/off comparisons.
 
-Exposure changes neither scene-linear lighting nor temporal/progressive accumulation, source uploads or reset keys. Invalid values reject before frame preparation. Clear, legacy diffuse and authored-boxes renderers have no tone-mapped presentation and explicitly reject nonzero exposure. This is a manual display control: it does not repair dark baked-in scan textures, increase traced samples, reduce variance or provide automatic exposure adaptation.
+Exposure changes neither scene-linear lighting nor temporal/progressive accumulation, source uploads or reset keys. Invalid values reject before frame preparation. Clear, legacy diffuse and authored-boxes do not use this shared raster presentation control and explicitly reject nonzero exposure. This is a manual display control: it does not repair dark baked-in scan textures, increase traced samples, reduce variance or provide automatic exposure adaptation.
 
 ## Shared outputs and ordering
 

@@ -494,7 +494,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         const requestedControls = renderOptions ?? defaultRenderOptions;
         validateRenderOptions(requestedControls);
         if ((requestedControls.exposureEV ?? 0) !== 0 && (!scene || scene.kind === 'diffuse' || scene.kind === 'authored-boxes')) {
-          throw new StrataError('UNSUPPORTED_FEATURE', 'Nonzero exposureEV requires a raster-based renderer; clear, diffuse and authored-boxes have no tone-mapped presentation.');
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Nonzero exposureEV requires the shared raster presentation; clear, diffuse and authored-boxes do not support this control.');
         }
         if (requestedControls.imported !== undefined && scene?.kind !== 'imported') {
           throw new StrataError('UNSUPPORTED_FEATURE', 'Imported controls require an imported scene.');
