@@ -212,8 +212,17 @@ export function validatePhaseArtifact(artifact) {
   }
   return bytes;
 }
-export async function withPhaseDeadline(operation, label, milliseconds) {
-  let timer; try { return await Promise.race([operation, new Promise((_, reject) => { timer = setTimeout(() => reject(Error(`${label} deadline exceeded.`)), milliseconds); })]); }
+export async function withPhaseDeadline(operation, label, milliseconds, now = () => performance.now()) {
+  assert(Number.isFinite(milliseconds) && milliseconds > 0, 'A positive bounded duration is required.');
+  const deadline = now() + milliseconds;
+  const expired = cause => Object.assign(Error(`${label} deadline exceeded.`), cause === undefined ? {} : { cause });
+  let timer;
+  try {
+    const result = await Promise.race([Promise.resolve().then(() => typeof operation === 'function' ? operation() : operation),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(expired()), milliseconds); })]);
+    if (now() >= deadline) throw expired();
+    return result;
+  } catch (error) { if (now() >= deadline) throw expired(error); throw error; }
   finally { clearTimeout(timer); }
 }
 export async function closePhaseBrowser(browserServer) {
@@ -226,7 +235,20 @@ export function finalizePhaseStatus(report, elapsedMs) {
   if (report.browserErrors.length || report.status !== 'pass' || !report.cleanup.browserExited || !report.cleanup.serverClosed
     || !report.cleanup.deviceDestroyed || !report.cleanup.artifactsDrained || !report.cleanup.frozenInputsVerified
     || report.cleanup.forcedKill || elapsedMs >= PHASE_LIMITS.totalMs) report.status = 'fail';
-  report.elapsedMs = elapsedMs; return report.status;
+  report.observedElapsedMs = elapsedMs; return report.status;
+}
+/** A disk report is a provisional data artifact, never independently a passing run. */
+export async function publishPhaseReport(report, path, started, { now = () => performance.now(), write = writeFile } = {}) {
+  const beforeWrite = now() - started;
+  finalizePhaseStatus(report, beforeWrite);
+  const document = { ...report, status: report.status === 'pass' ? 'collected' : 'fail',
+    publication: { status: 'provisional', childReportWriteStartedElapsedMs: beforeWrite,
+      admission: 'Requires independent supervisor observation of child exit0, completed artifact writes and retired owned process groups within the original absolute300s allocation. This file alone is not a pass.' } };
+  const bytes = json(document);
+  await withPhaseDeadline(() => write(path, bytes, { flag: 'wx' }), 'Provisional report publication', PHASE_LIMITS.totalMs - beforeWrite, now);
+  const completed = now() - started; finalizePhaseStatus(report, completed);
+  return { path, status: report.status === 'pass' ? 'collected' : 'fail', reportSha256: proofHash(bytes),
+    childDataCompletedElapsedMs: completed, admission: document.publication.admission };
 }
 
 /** Loopback server serves ONLY the reviewed bundles and allowlisted assets, verifying bytes on each request. */
@@ -250,12 +272,12 @@ async function frozenPhaseServer(frozen, failures) {
 }
 
 export async function runPhase(args) {
-  const started = performance.now(), frozen = await verifyPhase(args['--manifest'], args['--manifest-sha256']);
+  const started = performance.now(), frozen = await withPhaseDeadline(() => verifyPhase(args['--manifest'], args['--manifest-sha256']), 'Frozen input preflight', PHASE_LIMITS.workMs);
   const output = await newExternalDirectory(args['--output']);
   const report = { kind: 'strata-issue20-shared-lighting-phase-results', correctnessOnly: true, performanceEligible: false,
     startedAt: new Date().toISOString(), manifest: { path: resolve(args['--manifest']), sha256: args['--manifest-sha256'] },
     status: 'running', browserErrors: [], cells: [], cleanup: {}, limits: PHASE_LIMITS };
-  let browser, browserServer, server, watchdog, stopped = false, acceptingCallbacks = true, activeCell = null, totalBytes = 0;
+  let browser, browserServer, server, watchdog, stopped = false, acceptingCallbacks = true, activeCell = null, totalBytes = 0, published;
   const active = () => { assert(!stopped && performance.now() - started < PHASE_LIMITS.workMs, 'Diagnostic work ended.'); };
   const remainingWork = maximum => Math.max(1, Math.min(maximum, PHASE_LIMITS.workMs - (performance.now() - started)));
   let writes = Promise.resolve();
@@ -357,7 +379,7 @@ export async function runPhase(args) {
   // Work stops early enough to close and confirm the exact owned browser before the whole300s cap.
   watchdog = setTimeout(() => { stopped = true; report.cleanup.forcedKill = true; void browserServer?.kill().catch(e => report.browserErrors.push(String(e))); },
     Math.max(1, PHASE_LIMITS.totalMs - 1000 - (performance.now() - started)));
-  try { await withPhaseDeadline(work(), 'Phase diagnostic work', Math.max(1, PHASE_LIMITS.workMs - (performance.now() - started))); }
+  try { await withPhaseDeadline(work, 'Phase diagnostic work', Math.max(1, PHASE_LIMITS.workMs - (performance.now() - started))); }
   catch (error) { report.status = 'fail'; report.failure = { message: error.message, stack: error.stack, proofDifference: error.proofDifference, proofEvidence: error.proofEvidence }; }
   finally {
     stopped = true; acceptingCallbacks = false;
@@ -389,11 +411,12 @@ export async function runPhase(args) {
         const p = browserServer.process(); report.cleanup.browserExited = p.exitCode !== null || p.signalCode !== null;
       } catch (error) { report.browserErrors.push(String(error)); }
     }
-    clearTimeout(watchdog); finalizePhaseStatus(report, performance.now() - started);
-    report.completedAt = new Date().toISOString(); report.totalRawBytes = totalBytes;
-    await writeFile(resolve(output, 'report.json'), json(report), { flag: 'wx' });
+    finalizePhaseStatus(report, performance.now() - started);
+    report.collectionCleanupCompletedAt = new Date().toISOString(); report.totalRawBytes = totalBytes;
+    try { published = await publishPhaseReport(report, resolve(output, 'report.json'), started); }
+    finally { clearTimeout(watchdog); }
   }
-  return { path: resolve(output, 'report.json'), status: report.status };
+  return published;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { const args = parsePhaseArguments(process.argv.slice(2)); const result = args['--prepare-only'] ? await preparePhase(args) : await runPhase(args);

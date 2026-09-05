@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { inflateSync } from 'node:zlib';
 import { bundleTraceProof, proofHash } from './test-trace-updates.mjs';
-import { assertPhaseBundleGraph, closePhaseBrowser, finalizePhaseStatus, parsePhaseArguments, phaseNativePng, PHASE_LIMITS, PHASE_RUNS,
+import { assertPhaseBundleGraph, closePhaseBrowser, finalizePhaseStatus, parsePhaseArguments, phaseNativePng, publishPhaseReport, PHASE_LIMITS, PHASE_RUNS,
   validatePhaseArtifact, verifyPhase, verifyPhaseFile, withPhaseDeadline } from './test-trace-gi-phase.mjs';
 
 const temporary = async t => { const path = await mkdtemp(join(tmpdir(), 'strata-phase-launcher-')); t.after(() => rm(path, { recursive: true, force: true })); return path; };
@@ -79,4 +79,25 @@ test('bounded CPU watchdog fails an unresolved operation and does not retry it',
   let calls = 0; const work = () => { calls++; return new Promise(() => {}); };
   await assert.rejects(withPhaseDeadline(work(), 'synthetic owned work', 10), /deadline exceeded/); assert.equal(calls, 1);
   assert.equal(await withPhaseDeadline(Promise.resolve(7), 'already done', 100), 7);
+});
+test('absolute completion admission rejects overdue resolve and rejection even before the timer runs', async () => {
+  let clock = 0; const now = () => clock;
+  await assert.rejects(withPhaseDeadline(() => { clock = 11; return 'late success'; }, 'late resolve', 10, now), /deadline/);
+  clock = 0; const cause = Error('late original rejection');
+  await assert.rejects(withPhaseDeadline(() => { clock = 10; throw cause; }, 'late reject', 10, now), error => /deadline/.test(error.message) && error.cause === cause);
+  clock = 0;
+  assert.equal(await withPhaseDeadline(() => { clock = 9; return 7; }, 'on time', 10, now), 7);
+});
+test('disk reports stay provisional and a late completed write cannot return an admitted child success', async () => {
+  const report = () => ({ status: 'pass', browserErrors: [], cleanup: { deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
+  let clock = 100, written;
+  const runtime = { now: () => clock, write: async (_path, bytes) => { written = JSON.parse(bytes); clock = PHASE_LIMITS.totalMs + 1; } };
+  await assert.rejects(publishPhaseReport(report(), '/synthetic-report.json', 0, runtime), /deadline/);
+  assert.equal(written.status, 'collected'); assert.equal(written.publication.status, 'provisional');
+  assert.match(written.publication.admission, /supervisor observation of child exit0/);
+  clock = 100; runtime.write = async (_path, bytes) => { written = JSON.parse(bytes); clock = 200; };
+  const completed = await publishPhaseReport(report(), '/synthetic-report.json', 0, runtime);
+  assert.equal(completed.status, 'collected'); assert.equal(completed.childDataCompletedElapsedMs, 200);
+  assert.equal(completed.reportSha256, proofHash(JSON.stringify(written, null, 2) + '\n'));
+  assert.equal(written.observedElapsedMs, 100, 'The receipt does not claim to know its own later write completion.');
 });

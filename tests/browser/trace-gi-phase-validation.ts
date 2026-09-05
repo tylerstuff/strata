@@ -2,8 +2,65 @@
 import { IntegratedRenderer } from '../../packages/core/src/integrated/integrated-renderer.js';
 import type { ReflectionRenderControls } from '../../packages/core/src/reflections/reflection-renderer.js';
 import type { CameraFrame } from '../../packages/core/src/rendering/raster-math.js';
-export { finishProofDevice } from './trace-update-proof-gpu.js';
-import { assertBytesEqual, createRecordedDevice, proofDeadline, proofSha256, proofWriteInput } from './trace-update-proof-gpu.js';
+import { assertBytesEqual, createRecordedDevice, finishProofDevice as finishSharedProofDevice, proofSha256, proofWriteInput } from './trace-update-proof-gpu.js';
+
+/** Diagnostic-only monotonic deadline. Promise completion cannot bypass a delayed timer callback. */
+export async function traceGiPhaseDeadline<T>(operation: () => T | PromiseLike<T>, label: string, milliseconds = 15000,
+  now: () => number = () => performance.now()): Promise<T> {
+  const started = now();
+  if (!Number.isFinite(started) || !Number.isFinite(milliseconds) || milliseconds <= 0 || !Number.isFinite(started + milliseconds)) {
+    throw Error('Invalid phase diagnostic deadline.');
+  }
+  const expired = (elapsed: number) => !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= milliseconds;
+  const failure = (outcome: string, elapsed: number, cause?: unknown) => Object.assign(
+    new Error(`Phase diagnostic absolute deadline exceeded: ${label} (${milliseconds}ms; elapsed ${elapsed}ms; ${outcome})`,
+      cause === undefined ? undefined : { cause }),
+    { phaseDeadline: { label, milliseconds, elapsedMs: elapsed, outcome } });
+  let timer: ReturnType<typeof setTimeout> | undefined, timerError: Error | undefined;
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { timerError = failure('timer', now() - started); reject(timerError); }, milliseconds);
+    });
+    let result: T;
+    try {
+      result = await Promise.race([Promise.resolve().then(() => {
+        const elapsed = now() - started;
+        if (expired(elapsed)) throw failure('before operation', elapsed);
+        return operation();
+      }), timeout]);
+    } catch (cause) {
+      if (cause === timerError) throw cause;
+      const elapsed = now() - started;
+      if (expired(elapsed)) throw failure('rejected operation', elapsed, cause);
+      throw cause;
+    }
+    const elapsed = now() - started;
+    if (expired(elapsed)) throw failure('resolved operation', elapsed);
+    return result;
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+}
+
+/** Keep shared scope draining/disposal, but reject completion outside this diagnostic's absolute bound. */
+export async function finishProofDevice(device: GPUDevice, scopes: number, beforeDestroy: () => void, milliseconds = 15000,
+  now: () => number = () => performance.now()) {
+  let completed: Awaited<ReturnType<typeof finishSharedProofDevice>> | undefined;
+  let pending: ReturnType<typeof finishSharedProofDevice> | undefined;
+  try {
+    return await traceGiPhaseDeadline(async () => {
+      pending = finishSharedProofDevice(device, scopes, beforeDestroy, milliseconds);
+      completed = await pending; return completed;
+    }, 'phase GPU error-scope cleanup', milliseconds, now);
+  } catch (error) {
+    // The outer timer may fire just before the shared helper's bounded scope timers.
+    // Retain cleanup ownership until that helper has drained and attempted disposal.
+    if (pending && !completed) {
+      try { completed = await pending; }
+      catch (cleanupError) { if (error instanceof Error && cleanupError !== error) Object.assign(error, { cleanupError }); }
+    }
+    if (completed && error instanceof Error) Object.assign(error, { proofCleanup: completed });
+    throw error;
+  }
+}
 
 function check(value: unknown, message: string): asserts value { if (!value) throw Error(message); }
 function freeze<T>(value: T): T { if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); } return value; }
@@ -81,7 +138,7 @@ async function readBuffer(device: GPUDevice, source: GPUBuffer): Promise<ArrayBu
   check(source.size > 0 && source.size % 4 === 0 && Boolean(source.usage & 4), 'Unexpected source buffer readback contract.');
   const buffer = device.createBuffer({ label: 'Strata phase diagnostic buffer copy', size: source.size, usage: 1 | 8 });
   try { const e = device.createCommandEncoder(); e.copyBufferToBuffer(source, 0, buffer, 0, source.size); device.queue.submit([e.finish()]);
-    await proofDeadline(buffer.mapAsync(1), 'phase buffer mapping', 15000);
+    await traceGiPhaseDeadline(() => buffer.mapAsync(1), 'phase buffer mapping', 15000);
     const bytes = buffer.getMappedRange().slice(0); buffer.unmap(); return bytes;
   } finally { buffer.destroy(); }
 }
@@ -91,7 +148,7 @@ async function textureBytes(device: GPUDevice, texture: GPUTexture) {
   const row = texture.width * bpp, stride = Math.ceil(row / 256) * 256, buffer = device.createBuffer({ size: stride * texture.height, usage: 1 | 8 });
   try { const e = device.createCommandEncoder(); e.copyTextureToBuffer({ texture, ...(texture.format === 'depth32float' ? { aspect: 'depth-only' as const } : {}) },
     { buffer, bytesPerRow: stride, rowsPerImage: texture.height }, [texture.width, texture.height]); device.queue.submit([e.finish()]);
-    await proofDeadline(buffer.mapAsync(1), `phase texture ${texture.label}`, 15000);
+    await traceGiPhaseDeadline(() => buffer.mapAsync(1), `phase texture ${texture.label}`, 15000);
     const raw = new Uint8Array(buffer.getMappedRange()), out = new Uint8Array(row * texture.height);
     for (let y = 0; y < texture.height; y++) out.set(raw.subarray(y * stride, y * stride + row), y * row); buffer.unmap(); return out.buffer;
   } finally { buffer.destroy(); }
@@ -133,21 +190,24 @@ export async function runTraceGiPhaseCell(native: GPUDevice, input: TraceGiPhase
     await save({ ...record, base64: b64(data) }); return record;
   };
   try {
-    let abandonCreation = false;
-    const creation = IntegratedRenderer.create(device, plan.format, { renderer: 'integrated', manifestUrl: input.manifestUrl, traceProxyUrl: input.traceProxyUrl,
-      cameraMode: plan.cameraMode, geometryMode: plan.geometry.mode, poolBytes: plan.geometry.requestedPoolBytes, pixelError: plan.geometry.pixelError,
-      maxConcurrentRequests: plan.geometry.maxConcurrentRequests, uploadBudgetBytes: plan.geometry.uploadBudgetBytes,
-      ...plan.initialWorld, probesPerUpdate: plan.lighting.probesPerUpdate, raysPerProbe: plan.lighting.raysPerProbe,
-      resolutionScale: plan.lighting.resolutionScale, maxRaysPerFrame: plan.lighting.maxRaysPerFrame });
-    void creation.then(value => { if (abandonCreation) value.dispose(); }, () => {});
-    try { renderer = await proofDeadline(creation, 'phase renderer creation', 60000); } catch (error) { abandonCreation = true; throw error; }
+    let abandonCreation = false, createdRenderer: IntegratedRenderer | undefined;
+    try {
+      renderer = await traceGiPhaseDeadline(async () => {
+        createdRenderer = await IntegratedRenderer.create(device, plan.format, { renderer: 'integrated', manifestUrl: input.manifestUrl, traceProxyUrl: input.traceProxyUrl,
+          cameraMode: plan.cameraMode, geometryMode: plan.geometry.mode, poolBytes: plan.geometry.requestedPoolBytes, pixelError: plan.geometry.pixelError,
+          maxConcurrentRequests: plan.geometry.maxConcurrentRequests, uploadBudgetBytes: plan.geometry.uploadBudgetBytes,
+          ...plan.initialWorld, probesPerUpdate: plan.lighting.probesPerUpdate, raysPerProbe: plan.lighting.raysPerProbe,
+          resolutionScale: plan.lighting.resolutionScale, maxRaysPerFrame: plan.lighting.maxRaysPerFrame });
+        if (abandonCreation) createdRenderer.dispose();
+        return createdRenderer;
+      }, 'phase renderer creation', 60000);
+    } catch (error) { abandonCreation = true; createdRenderer?.dispose(); throw error; }
     const r = renderer;
     let shadowPipeline: Promise<GPUComputePipeline> | undefined;
     const nativeCopy = async (t: GPUTexture): Promise<ArrayBuffer> => {
       if (t.usage & 1) return textureBytes(native, t);
       check(t.format === 'depth32float' && Boolean(t.usage & 4), 'Unexpected noncopyable diagnostic texture.');
-      shadowPipeline ??= native.createComputePipelineAsync({ layout: 'auto', compute: { module: native.createShaderModule({ label: 'Strata phase diagnostic exact shadow texel load', code: traceGiPhaseShadowReadShader }), entryPoint: 'readShadow' } });
-      const pipeline = await proofDeadline(shadowPipeline, 'shadow diagnostic pipeline', 15000);
+      const pipeline = await traceGiPhaseDeadline(() => shadowPipeline ??= native.createComputePipelineAsync({ layout: 'auto', compute: { module: native.createShaderModule({ label: 'Strata phase diagnostic exact shadow texel load', code: traceGiPhaseShadowReadShader }), entryPoint: 'readShadow' } }), 'shadow diagnostic pipeline', 15000);
       const copy = native.createTexture({ label: 'Strata phase diagnostic shadow copy', size: [t.width, t.height], format: 'r32float', usage: 8 | 1 });
       try { const group = native.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.createView() }, { binding: 1, resource: copy.createView() }] });
         const e = native.createCommandEncoder(), pass = e.beginComputePass({ label: 'Strata phase diagnostic shadow read' }); pass.setPipeline(pipeline); pass.setBindGroup(0, group);
@@ -248,7 +308,8 @@ export async function runTraceGiPhaseCell(native: GPUDevice, input: TraceGiPhase
         native.queue.submit([e.finish()]); r.submitted(++localFrameId);
       }
       catch (error) { r.cancelFrame(); throw error; }
-      await proofDeadline(native.queue.onSubmittedWorkDone(), `phase submission ${id}`, 15000); await proofDeadline(r.flushFeedback(15000), `geometry feedback ${id}`, 15000);
+      await traceGiPhaseDeadline(() => native.queue.onSubmittedWorkDone(), `phase submission ${id}`, 15000);
+      await traceGiPhaseDeadline(() => r.flushFeedback(15000), `geometry feedback ${id}`, 15000);
       for (let i = first; i < recorded.writes.length; i++) { const w = recorded.writes[i]!; await writeRecord(`writes/${String(i).padStart(4, '0')}.bin`, w.bytes); }
       if (localFrameId > 2) check(recorded.writes.length === first, 'Held capture unexpectedly changed tracing source.');
       await event({ type: 'submission', id, before, requestedControls: controls, time, firstWrite: first, writes: recorded.writes.slice(first).map(w => ({ label: w.label, offset: w.offset, byteLength: w.byteLength, returned: w.returned, phase: w.phase })) });

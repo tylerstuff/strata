@@ -1,8 +1,95 @@
-import { describe, expect, it } from 'vitest';
-import { injectTraceGiPhaseClock, serializeTraceGiPhaseCamera, traceGiPhasePlan, validateTraceGiPhasePlan } from '../browser/trace-gi-phase-validation.js';
+import { describe, expect, it, vi } from 'vitest';
+import { finishProofDevice, injectTraceGiPhaseClock, serializeTraceGiPhaseCamera, traceGiPhaseDeadline, traceGiPhasePlan, validateTraceGiPhasePlan } from '../browser/trace-gi-phase-validation.js';
 import { createRasterCamera } from '../../packages/core/src/rendering/raster-math.js';
 
 type Bag = Record<string, unknown>;
+
+describe('absolute phase diagnostic deadlines', () => {
+  it('accepts timely completion and preserves a timely rejection object', async () => {
+    let clock = 100;
+    expect(await traceGiPhaseDeadline(() => { clock += 14999; return 42; }, 'mapping', 15000, () => clock)).toBe(42);
+    const original = Error('mapping failed'); clock = 100;
+    await expect(traceGiPhaseDeadline(() => { clock += 14999; return Promise.reject(original); }, 'mapping', 15000, () => clock)).rejects.toBe(original);
+  });
+
+  it('rejects resolved operations at or beyond the absolute bound even when the timer never runs', async () => {
+    for (const elapsed of [15000, 15001, 40000]) {
+      let clock = 100;
+      const result = traceGiPhaseDeadline(() => Promise.resolve().then(() => { clock += elapsed; return 'late success'; }), 'blocked map', 15000, () => clock);
+      await expect(result).rejects.toMatchObject({ phaseDeadline: { label: 'blocked map', milliseconds: 15000, elapsedMs: elapsed, outcome: 'resolved operation' } });
+    }
+  });
+
+  it('postchecks late rejection and retains the original cause', async () => {
+    let clock = 100; const original = Error('late native rejection');
+    const result = traceGiPhaseDeadline(() => Promise.resolve().then(() => { clock += 20000; throw original; }), 'blocked fence', 15000, () => clock);
+    await expect(result).rejects.toMatchObject({ cause: original,
+      phaseDeadline: { label: 'blocked fence', elapsedMs: 20000, milliseconds: 15000, outcome: 'rejected operation' } });
+  });
+
+  it('starts the absolute interval before invoking synchronous work and keeps the separate 60-second creation allowance', async () => {
+    let clock = 0;
+    expect(await traceGiPhaseDeadline(() => { clock = 59999; return 'created'; }, 'creation', 60000, () => clock)).toBe('created');
+    clock = 0;
+    await expect(traceGiPhaseDeadline(() => { clock = 60001; return 'late creation'; }, 'creation', 60000, () => clock))
+      .rejects.toMatchObject({ phaseDeadline: { milliseconds: 60000, elapsedMs: 60001, outcome: 'resolved operation' } });
+    clock = 0;
+    await expect(traceGiPhaseDeadline(() => { clock = -1; return 'invalid monotonic clock'; }, 'mapping', 15000, () => clock)).rejects.toThrow('absolute deadline');
+  });
+
+  it('still times out stalled operations, clears its timer and cannot admit a later resolution', async () => {
+    vi.useFakeTimers();
+    try {
+      let clock = 0, resolve!: (value: string) => void;
+      const pending = new Promise<string>(yes => { resolve = yes; });
+      const outcome = traceGiPhaseDeadline(() => pending, 'stalled map', 15000, () => clock).then(value => ({ value }), error => ({ error }));
+      await Promise.resolve(); clock = 15000; await vi.advanceTimersByTimeAsync(15000);
+      const result = await outcome;
+      expect(result).toMatchObject({ error: { phaseDeadline: { milliseconds: 15000, elapsedMs: 15000, outcome: 'timer' } } });
+      expect(vi.getTimerCount()).toBe(0); resolve('late'); await Promise.resolve(); expect(await outcome).toBe(result);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('rejects late shared scope cleanup after actual disposal, retaining any original scope error receipt', async () => {
+    for (const scopedError of [null, Error('native validation failure')]) {
+      let clock = 0; const order: string[] = [];
+      const device = { popErrorScope: () => { order.push('pop'); clock = 15001; return Promise.resolve(scopedError); },
+        destroy: () => { order.push('destroy'); } } as unknown as GPUDevice;
+      const result = finishProofDevice(device, 1, () => { order.push('beforeDestroy'); }, 15000, () => clock);
+      await expect(result).rejects.toMatchObject({ phaseDeadline: { milliseconds: 15000, elapsedMs: 15001, outcome: 'resolved operation' },
+        proofCleanup: { destroyed: true, scopesAttempted: 1, errors: scopedError ? ['Error: native validation failure'] : [] } });
+      expect(order).toEqual(['pop', 'beforeDestroy', 'destroy']);
+    }
+  });
+
+  it('keeps 15-second default bounds on both local cleanup and the reused scope helper', async () => {
+    vi.useFakeTimers(); const timer = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      const order: string[] = [], device = { popErrorScope: async () => null, destroy: () => { order.push('destroy'); } } as unknown as GPUDevice;
+      const result = await finishProofDevice(device, 2, () => { order.push('beforeDestroy'); });
+      expect(result).toEqual({ errors: [], destroyed: true, scopesAttempted: 2 });
+      expect(timer.mock.calls.map(call => call[1])).toEqual([15000, 15000, 15000]);
+      expect(order).toEqual(['beforeDestroy', 'destroy']); expect(vi.getTimerCount()).toBe(0);
+    } finally { timer.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it('retains cleanup ownership through the shared scope timeout before returning the outer deadline failure', async () => {
+    vi.useFakeTimers();
+    try {
+      let clock = 0; const order: string[] = [];
+      const device = { popErrorScope: () => new Promise<GPUError | null>(() => {}), destroy: () => { order.push('destroy'); } } as unknown as GPUDevice;
+      const settled = finishProofDevice(device, 1, () => { order.push('beforeDestroy'); }, 15000, () => clock)
+        .then(() => { order.push('unexpected success'); return null; }, error => { order.push('failed after cleanup'); return error; });
+      await Promise.resolve(); clock = 15000; await vi.advanceTimersByTimeAsync(15000);
+      const error = await settled;
+      expect(error).toMatchObject({ phaseDeadline: { milliseconds: 15000, elapsedMs: 15000, outcome: 'timer' },
+        proofCleanup: { destroyed: true, scopesAttempted: 1 } });
+      expect(error.proofCleanup.errors).toHaveLength(1);
+      expect(error.proofCleanup.errors[0]).toContain('GPU error scope 0');
+      expect(order).toEqual(['beforeDestroy', 'destroy', 'failed after cleanup']); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+});
 
 function assertDeepFrozen(value: unknown): void {
   if (value === null || typeof value !== 'object') return;
