@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { assertProbeResetLifecycle, rendererProofPlan } from '../browser/trace-update-renderer-validation.js';
+import { advanceRendererProofModes, assertDisabledRendererCaches, assertProbeResetLifecycle, assertRendererProofModes,
+  assertRendererSharpSample, rendererProofPlan, rendererSharpRay } from '../browser/trace-update-renderer-validation.js';
 import type { RendererProofKind } from '../browser/trace-update-renderer-validation.js';
 import { GiTraceUpdater } from '../../packages/core/src/gi/trace-updates.js';
-import { buildGiTraceData } from '../../packages/core/src/gi/trace-data.js';
+import { buildGiTraceData, traceGiBvh } from '../../packages/core/src/gi/trace-data.js';
+import type { GiRay } from '../../packages/core/src/gi/trace-data.js';
+import { createGiCamera, invertGiMatrix } from '../../packages/core/src/gi/room-geometry.js';
 import { createGiScene } from '../../packages/core/src/gi/scene-data.js';
 import { createReflectionScene } from '../../packages/core/src/reflections/reflection-scene.js';
 import { createIntegratedScene } from '../../packages/core/src/integrated/integrated-scene.js';
@@ -11,10 +14,12 @@ describe('frozen renderer-pair proof schedule', () => {
   it('stays within explicit submission/checkpoint limits with one bounded failure and immutable input controls', () => {
     for (const kind of ['gi', 'reflections', 'integrated'] as const) {
       const steps = rendererProofPlan.steps[kind];
-      expect(steps).toHaveLength(62);
-      expect(new Set(steps.map(step => step.id)).size).toBe(62);
-      expect(steps.filter(step => step.action === 'submit')).toHaveLength(59);
-      expect(steps.filter(step => step.checkpoint)).toHaveLength(21);
+      const count = kind === 'gi' ? { steps: 62, submissions: 59, checkpoints: 21 } : { steps: 63, submissions: 60, checkpoints: 22 };
+      expect(rendererProofPlan.exactCounts[kind]).toEqual(count);
+      expect(steps).toHaveLength(count.steps);
+      expect(new Set(steps.map(step => step.id)).size).toBe(count.steps);
+      expect(steps.filter(step => step.action === 'submit')).toHaveLength(count.submissions);
+      expect(steps.filter(step => step.checkpoint)).toHaveLength(count.checkpoints);
       expect(steps.filter(step => step.action === 'submit').length).toBeLessThanOrEqual(rendererProofPlan.limits.successfulFramesPerArm);
       expect(steps.filter(step => step.checkpoint).length).toBeLessThanOrEqual(rendererProofPlan.limits.textureCheckpointsPerFixture);
       expect(steps.filter(step => step.action === 'fail-write').map(step => [step.id, step.failWriteOrdinal])).toEqual([['partial-write-failure', 2]]);
@@ -28,8 +33,11 @@ describe('frozen renderer-pair proof schedule', () => {
 
   it('separates sharp initialization from registered roughness edits and omits unsupported standalone GI controls', () => {
     expect(rendererProofPlan.settings).toMatchObject({ roughness: 0, temporal: false, probesPerUpdate: 32, raysPerProbe: 64,
-      resolutionScale: 1, maxRaysPerFrame: 32768, requestedResidentPoolBytes: 8 * 1024 ** 2, allocatedCanonicalResidentPoolBytes: 80 * 65536 });
+      resolutionScale: 1, maxRaysPerFrame: 32768, maxDistance: 16, requestedResidentPoolBytes: 8 * 1024 ** 2, allocatedCanonicalResidentPoolBytes: 80 * 65536 });
     expect(rendererProofPlan.steps.reflections.slice(0, 12).map(step => step.id)).toEqual(Array.from({ length: 12 }, (_, i) => `sharp-warm-${i + 1}`));
+    expect(rendererProofPlan.version).toBe('issue20-renderer-pair-v2');
+    expect(rendererProofPlan.steps.reflections[12]).toMatchObject({ id: 'sharp-moved-point4', checkpoint: true, controls: { reflections: { objectOffset: .4, roughness: 0 } } });
+    expect(rendererProofPlan.steps.gi.some(step => step.id === 'sharp-moved-point4')).toBe(false);
     expect(rendererProofPlan.steps.reflections.find(step => step.id === 'world-S0')?.controls.reflections?.roughness).toBe(.08);
     expect(rendererProofPlan.steps.reflections.find(step => step.id === 'world-S7')?.controls).toMatchObject({ gi: { wallColor: 'neutral' }, reflections: { roughness: .3 } });
     expect(rendererProofPlan.steps.reflections.find(step => step.id === 'world-S8')?.controls.gi?.lightIntensity).toBe(0);
@@ -40,6 +48,53 @@ describe('frozen renderer-pair proof schedule', () => {
     expect(rendererProofPlan.streamedTimes).toEqual([0, 34, 46, 0]);
     expect(rendererProofPlan.limits.streamedFramesPerPose).toBe(30);
     expect(rendererProofPlan.limits.streamedDeadlineMs).toBe(90_000);
+  });
+
+  it('uses requested persistent modes and rejects CPU negative controls that ignore disable or advance inactive caches', () => {
+    let expected = { gi: true, reflections: 'world' as 'world' | 'off' | 'probe-only' | null };
+    const inactive = [];
+    for (const step of rendererProofPlan.steps.reflections) {
+      expected = advanceRendererProofModes(expected, step.controls);
+      expect(rendererProofPlan.modeTransitions.reflections!.find(row => row.id === step.id)).toEqual({ id: step.id, ...expected });
+      if (step.id.startsWith('disabled-edit-')) {
+        inactive.push(step.id); expect(expected).toEqual({ gi: false, reflections: 'off' });
+        // Deliberately ignore the requested mode in the observed arm. Pair equality alone would accept two such arms.
+        expect(() => assertRendererProofModes(expected, { enabled: true }, { mode: 'world' })).toThrow('harness-owned requested modes');
+        expect(() => assertRendererProofModes(expected, { enabled: false }, { mode: 'off' })).not.toThrow();
+      }
+    }
+    expect(inactive).toEqual(['disabled-edit-1', 'disabled-edit-2', 'disabled-edit-3']);
+    const before = { probe: { cacheEpoch: 8, refreshFrontier: 32, sourceFrameId: 50, submittedFrames: 50, sampleFrameIndex: 49 },
+      reflection: { cacheEpoch: 17, sourceFrameId: 50, submittedFrames: 50, totalScheduledCandidates: 5000 } };
+    expect(() => assertDisabledRendererCaches(before, before, [{ label: 'Strata geometry selection' }])).not.toThrow();
+    for (const label of ['Strata GI software probe trace', 'Strata selective reflection trace', 'Strata reflection shade']) {
+      expect(() => assertDisabledRendererCaches(before, before, [{ label }])).toThrow('encoded a GI/reflection pass');
+    }
+    expect(() => assertDisabledRendererCaches(before, { ...before, probe: { ...before.probe, submittedFrames: 51 } }, [])).toThrow('advanced cache');
+    expect(() => assertDisabledRendererCaches(before, { ...before, reflection: { ...before.reflection, cacheEpoch: 18 } }, [])).toThrow('advanced cache');
+  });
+
+  it('independently rejects stale initial geometry at the single moved sharp checkpoint (CPU negative control only)', () => {
+    const camera = createGiCamera(320, 180, 0, [0, 0], 'receiver'), config = new ArrayBuffer(240), f = new Float32Array(config), u = new Uint32Array(config);
+    f.set(invertGiMatrix(camera.viewProjection)); f.set(camera.eye, 32);
+    u.set([320, 180, 320, 180], 36); u.set([12, 2, 2, 1], 40);
+    // Frozen receiver projection has this entire mirror rectangle below the32,768 candidate cap.
+    u.set([0, 27930, 27930, 1], 44); f.set([0, 16, .8, 1], 48); u.set([1, 1, 0, 0], 52); u.set([1, 42, 266, 105], 56);
+    const witness = rendererSharpRay(camera.viewProjection, config, .4);
+    expect(witness).toMatchObject({ x: 192, y: 89, candidate: 12693, scheduledOffset: 12693, initialEmitterDistance: null });
+    expect(witness.expectedDistance).toBeCloseTo(1.1017776, 6);
+    expect(rendererSharpRay(camera.viewProjection, config, 0).initialEmitterDistance).not.toBeNull();
+    const ray: GiRay = { origin: witness.origin, direction: witness.direction, tMin: .002, tMax: 16 };
+    const stale = traceGiBvh(buildGiTraceData(createReflectionScene({ roughness: 0 })), ray);
+    const moved = traceGiBvh(buildGiTraceData(createReflectionScene({ roughness: 0, objectOffset: .4 })), ray);
+    expect(moved.boxId).toBe(12); expect(stale.boxId).not.toBe(12);
+    const sample = { source: 1, frame: 12, epoch: 2, mask: 1, distance: moved.distance, rgb: [3.5, .3, .1] };
+    expect(() => assertRendererSharpSample(witness, config, 12, sample)).not.toThrow();
+    // Even granting stale data a fresh tag and bright color cannot disguise its wrong intersection distance.
+    expect(() => assertRendererSharpSample(witness, config, 12, { ...sample, distance: stale.distance })).toThrow('expected emitter distance');
+    expect(() => assertRendererSharpSample(witness, config, 12, { ...sample, frame: 11 })).toThrow('current-frame');
+    const unscheduled = config.slice(0); new Uint32Array(unscheduled)[45] = 1;
+    expect(() => rendererSharpRay(camera.viewProjection, unscheduled, .4)).toThrow('not in this current scheduled window');
   });
 
   it('rejects a shared false-pass where cancelling the reset commits state or retry silently reuses old history', () => {

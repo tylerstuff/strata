@@ -3,7 +3,6 @@ import { ReflectionRenderer } from '../../packages/core/src/reflections/reflecti
 import { IntegratedRenderer } from '../../packages/core/src/integrated/integrated-renderer.js';
 import type { ReflectionRenderControls } from '../../packages/core/src/reflections/reflection-renderer.js';
 import type { GiTraceData } from '../../packages/core/src/gi/trace-data.js';
-import type { ReflectionSceneData } from '../../packages/core/src/reflections/reflection-scene.js';
 import { assertBytesEqual, createRecordedDevice, proofDeadline, proofSha256, readBuffer } from './trace-update-proof-gpu.js';
 
 export type RendererProofKind = 'gi' | 'reflections' | 'integrated';
@@ -38,6 +37,7 @@ function steps(kind: RendererProofKind): readonly RendererProofStep[] {
       ...(action === 'fail-write' ? { failWriteOrdinal: 2 } : {}) });
   };
   for (let i = 0; i < 12; i++) add(`sharp-warm-${i + 1}`, {}, i === 0 || i === 11);
+  if (kind !== 'gi') add('sharp-moved-point4', { reflections: { objectOffset: .4, roughness: 0 } }, true);
   for (const [index, patch] of mutations.entries()) {
     const world = { ...baseWorld, ...patch };
     add(`world-S${index}`, { gi: { doorOpen: world.doorOpen, wallColor: world.wallColor, lightIntensity: world.lightIntensity },
@@ -62,13 +62,22 @@ function steps(kind: RendererProofKind): readonly RendererProofStep[] {
   return freeze(result);
 }
 export const rendererProofPlan = freeze({
-  version: 'issue20-renderer-pair-v1', format: 'rgba8unorm' as GPUTextureFormat,
+  version: 'issue20-renderer-pair-v2', format: 'rgba8unorm' as GPUTextureFormat,
   settings: { temporal: false, probesPerUpdate: 32, raysPerProbe: 64, seed: 1337, roughness: 0,
-    resolutionScale: 1, maxRaysPerFrame: 32768, screenTracing: false, requestedResidentPoolBytes: 8 * 1024 ** 2,
+    resolutionScale: 1, maxRaysPerFrame: 32768, maxDistance: 16, screenTracing: false, requestedResidentPoolBytes: 8 * 1024 ** 2,
     allocatedCanonicalResidentPoolBytes: 80 * 65536, streamedPoolBytes: 1024 ** 2 },
   limits: { successfulFramesPerArm: 96, textureCheckpointsPerFixture: 24, streamedFramesPerPose: 30,
     streamedDeadlineMs: 90_000, totalDeadlineMs: 600_000 },
   streamedTimes: [0, 34, 46, 0],
+  exactCounts: { gi: { steps: 62, submissions: 59, checkpoints: 21 }, reflections: { steps: 63, submissions: 60, checkpoints: 22 },
+    integrated: { steps: 63, submissions: 60, checkpoints: 22 } },
+  modeTransitions: Object.fromEntries((['gi', 'reflections', 'integrated'] as const).map(kind => {
+    let modes: RendererProofModes = { gi: true, reflections: kind === 'gi' ? null : 'world' };
+    return [kind, steps(kind).map(step => { modes = advanceRendererProofModes(modes, step.controls); return { id: step.id, ...modes }; })];
+  })),
+  sharpGeometry: { mirrorMin: [-2, .01, -1], mirrorMax: [-1, .01, 1], planeY: .01,
+    initialEmitterCenter: [-.8, 1.12, .2], emitterHalfSize: [.18, .18, .18], emitterEmission: [4, .25, .08],
+    objectBoxId: 12, initialOffset: 0, movedOffset: .4, normalBias: .002, tMin: .002, tMax: 16 },
   readbackLayouts: { probeState: '384×16B u32(epoch,valid,updates,lastFrame)', probeRays: '32×64×32B', probeStats: '8u32', probeConfig: '96B',
     reflectionStats: '8u32', reflectionConfig: '240B', irradiance: '192×128 rgba16float, valid current-epoch8×8 tiles',
     visibility: '384×256 rg32float, same16×16 tiles', rawReflection: 'viewport rgba16float/current frame+epoch rgba32uint tags',
@@ -82,6 +91,20 @@ export const rendererProofPlan = freeze({
 type Renderer = GiRenderer | ReflectionRenderer | IntegratedRenderer;
 type Bag = Readonly<Record<string, number | string | boolean | null>>;
 function requireProof(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
+export interface RendererProofModes { gi: boolean; reflections: 'off' | 'probe-only' | 'world' | null }
+export function advanceRendererProofModes(previous: RendererProofModes, controls: ReflectionRenderControls): RendererProofModes {
+  return { gi: controls.gi?.enabled ?? previous.gi,
+    reflections: previous.reflections === null ? null : controls.reflections?.mode ?? previous.reflections };
+}
+export function assertRendererProofModes(expected: RendererProofModes, gi: Bag, reflections: Bag | null): void {
+  requireProof(gi.enabled === expected.gi && (expected.reflections === null ? reflections === null : reflections?.mode === expected.reflections),
+    'Observed effect modes differ from harness-owned requested modes.');
+}
+export function assertDisabledRendererCaches(before: { probe: Bag; reflection: Bag | null }, after: { probe: Bag; reflection: Bag | null },
+  dispatches: readonly { label: string }[]): void {
+  requireProof(!dispatches.some(pass => /\bGI\b|reflection/i.test(pass.label)), 'Both-disabled frame encoded a GI/reflection pass.');
+  equalJson(after, before, 'Both-disabled frame advanced cache epoch/frontier/sample/source/submission telemetry');
+}
 
 /** Diagnostic read of real STORAGE-only buffers; resource descriptors stay unchanged. */
 export const rendererProofReadStorageShader = `@group(0) @binding(0) var<storage,read> source:array<u32>;
@@ -173,37 +196,67 @@ function currentRaw(data: ArrayBuffer, metadata: ArrayBuffer, config: Uint32Arra
   for (let i = 0; i < tags.length; i += 4) if (tags[i + 1] !== config[40] || tags[i + 2] !== config[41] || !config[47]) result.fill(0, i / 4 * stride, (i / 4 + 1) * stride);
   return result.buffer;
 }
-/** One independently projected mirror/emitter AABB witness, separate from the BVH and GGX code. */
-function sharpWitness(owner: ReflectionRenderer | IntegratedRenderer, raw: ArrayBuffer, metadata: ArrayBuffer, config: ArrayBuffer) {
-  const scene: ReflectionSceneData = owner.currentScene, cube = scene.boxes[scene.objectBoxId]!, mirror = scene.boxes[scene.reflectorBoxId]!;
-  const camera = owner.currentCamera; requireProof(camera && cube.yaw === 0 && mirror.yaw === 0, 'Sharp witness geometry/camera changed.');
-  const planeY = mirror.center[1] + mirror.halfSize[1], virtual = [cube.center[0], 2 * planeY - cube.center[1], cube.center[2]];
+/** Test oracle uses frozen literal geometry; actual scene data never defines the expected hit. */
+export function rendererSharpRay(viewProjection: ArrayLike<number>, config: ArrayBuffer, objectOffset: 0 | .4) {
+  const geometry = rendererProofPlan.sharpGeometry, center = [...geometry.initialEmitterCenter]; center[2]! += objectOffset;
+  const virtual = [center[0]!, 2 * geometry.planeY - center[1]!, center[2]!];
   const transform = (m: ArrayLike<number>, p: readonly number[]) => [0, 1, 2, 3].map(row => m[row]! * p[0]! + m[row + 4]! * p[1]! + m[row + 8]! * p[2]! + m[row + 12]!);
-  const clip = transform(camera.viewProjection, virtual), words = new Uint32Array(config), f = new Float32Array(config);
+  const clip = transform(viewProjection, virtual), words = new Uint32Array(config), f = new Float32Array(config);
+  requireProof(words[36] === 320 && words[37] === 180 && words[38] === 320 && words[39] === 180 && words[42] === 2,
+    'Sharp witness dimensions/world mode differ from the frozen checkpoint.');
+  if (objectOffset === .4) requireProof(words[44] === 0 && words[52] === 1, 'Moved sharp source did not reset the scheduled window.');
   const x = Math.floor((clip[0]! / clip[3]! * .5 + .5) * words[36]!), y = Math.floor((.5 - clip[1]! / clip[3]! * .5) * words[37]!);
   requireProof(x >= 0 && y >= 0 && x < words[36]! && y < words[37]!, 'Sharp virtual emitter is outside the viewport.');
-  const realCorners = [-1, 1].flatMap(a => [-1, 1].flatMap(b => [-1, 1].map(c => transform(camera.viewProjection,
-    [cube.center[0] + a * cube.halfSize[0], cube.center[1] + b * cube.halfSize[1], cube.center[2] + c * cube.halfSize[2]]))));
-  requireProof(realCorners.every(p => p[1]! / p[3]! > 1), 'Actual emitter is no longer entirely above the camera frustum.');
+  requireProof(f[48] === 0 && f[49] === geometry.tMax, 'Sharp witness requires the frozen perfect mirror and ray extent.');
+  const realCorners = [-1, 1].flatMap(a => [-1, 1].flatMap(b => [-1, 1].map(c => transform(viewProjection,
+    [center[0]! + a * geometry.emitterHalfSize[0]!, center[1]! + b * geometry.emitterHalfSize[1]!, center[2]! + c * geometry.emitterHalfSize[2]!]))));
+  requireProof(realCorners.every(p => p[1]! / p[3]! > 1), 'Expected emitter is no longer entirely above the camera frustum.');
+  const localX = x - words[56]!, localY = y - words[57]!, regionPixels = words[46]!;
+  requireProof(localX >= 0 && localY >= 0 && localX < words[58]! && localY < words[59]! && regionPixels === words[58]! * words[59]!,
+    'Sharp witness pixel lies outside the scheduled candidate region.');
+  const candidate = localY * words[58]! + localX, scheduledOffset = (candidate + regionPixels - words[44]!) % regionPixels;
+  requireProof(words[47] === 1 && scheduledOffset < words[45]!, 'Sharp witness pixel is not in this current scheduled window.');
   const q = transform(f, [(x + .5) / words[36]! * 2 - 1, 1 - (y + .5) / words[37]! * 2, .5]);
-  const delta = q.slice(0, 3).map((v, i) => v / q[3]! - f[32 + i]!), t = (planeY - f[33]!) / delta[1]!;
+  const delta = q.slice(0, 3).map((v, i) => v / q[3]! - f[32 + i]!), t = (geometry.planeY - f[33]!) / delta[1]!;
   const point = delta.map((v, i) => f[32 + i]! + t * v), length = Math.hypot(...delta);
-  const direction = [delta[0]! / length, -delta[1]! / length, delta[2]! / length], origin = [point[0]!, planeY + .002, point[2]!];
-  let enter = .002, exit = 32;
-  for (let axis = 0; axis < 3; axis++) {
-    const low = cube.center[axis]! - cube.halfSize[axis]!, high = cube.center[axis]! + cube.halfSize[axis]!;
-    if (direction[axis] === 0) requireProof(origin[axis]! >= low && origin[axis]! <= high, 'Sharp mirror ray misses cube.');
-    else { const a = (low - origin[axis]!) / direction[axis]!, b = (high - origin[axis]!) / direction[axis]!; enter = Math.max(enter, Math.min(a, b)); exit = Math.min(exit, Math.max(a, b)); }
-  }
-  requireProof(enter <= exit, 'Sharp independent AABB ray misses emitter.');
-  const at = y * words[36]! + x, tags = new Uint32Array(metadata), colors = new Uint16Array(raw);
-  requireProof(tags[at * 4] === 1 && tags[at * 4 + 1] === words[40] && tags[at * 4 + 2] === words[41] && tags[at * 4 + 3] === 1, 'Sharp emitter pixel lacks a fresh completed hit.');
-  const distance = half(colors[at * 4 + 3]!), rgb = [0, 1, 2].map(c => half(colors[at * 4 + c]!));
-  // Raw distance is binary16. Two ulps are a fixed storage bound, not the cross-arm image gate.
-  const distanceBound = 2 * 2 ** (Math.floor(Math.log2(enter)) - 10);
-  requireProof(Math.abs(distance - enter) <= distanceBound && rgb[0]! >= scene.materials[cube.materialId]!.emission[0] * .84,
-    'Sharp pixel does not match the emitter distance/emission witness.');
-  return { x, y, objectBoxId: cube.id, allEightRealCornersAboveFrustum: true, expectedDistance: enter, distance, distanceBound, rgb };
+  requireProof(point[0]! > geometry.mirrorMin[0]! && point[0]! < geometry.mirrorMax[0]!
+    && point[2]! > geometry.mirrorMin[2]! && point[2]! < geometry.mirrorMax[2]!, 'Sharp ray does not hit the frozen mirror interior.');
+  const direction: [number, number, number] = [delta[0]! / length, -delta[1]! / length, delta[2]! / length];
+  const origin: [number, number, number] = [point[0]!, geometry.planeY + geometry.normalBias, point[2]!];
+  const slab = (boxCenter: readonly number[]): number | null => {
+    let enter = geometry.tMin, exit = geometry.tMax;
+    for (let axis = 0; axis < 3; axis++) {
+      const low = boxCenter[axis]! - geometry.emitterHalfSize[axis]!, high = boxCenter[axis]! + geometry.emitterHalfSize[axis]!;
+      if (direction[axis] === 0) { if (origin[axis]! < low || origin[axis]! > high) return null; }
+      else { const a = (low - origin[axis]!) / direction[axis]!, b = (high - origin[axis]!) / direction[axis]!; enter = Math.max(enter, Math.min(a, b)); exit = Math.min(exit, Math.max(a, b)); }
+    }
+    return enter <= exit ? enter : null;
+  };
+  const expectedDistance = slab(center), initialEmitterDistance = slab(geometry.initialEmitterCenter);
+  requireProof(expectedDistance !== null, 'Sharp independent AABB ray misses the expected emitter.');
+  if (objectOffset === .4) requireProof(initialEmitterDistance === null, 'Moved sharp witness also intersects the stale initial emitter.');
+  return { x, y, objectOffset, center, origin, direction, expectedDistance, initialEmitterDistance, candidate, scheduledOffset,
+    allEightRealCornersAboveFrustum: true, distanceBound: 2 * 2 ** (Math.floor(Math.log2(expectedDistance)) - 10) };
+}
+export function assertRendererSharpSample(witness: ReturnType<typeof rendererSharpRay>, config: ArrayBuffer, expectedFrameIndex: number,
+  sample: { source: number; frame: number; epoch: number; mask: number; distance: number; rgb: readonly number[] }): void {
+  const words = new Uint32Array(config);
+  requireProof(words[40] === expectedFrameIndex && sample.source === 1 && sample.frame === expectedFrameIndex && sample.epoch === words[41] && sample.mask === 1,
+    'Sharp emitter pixel lacks a current-frame completed hit.');
+  // Two binary16 ulps are the unchanged storage bound, not the exact cross-arm image gate.
+  requireProof(Math.abs(sample.distance - witness.expectedDistance) <= witness.distanceBound
+    && sample.rgb[0]! >= rendererProofPlan.sharpGeometry.emitterEmission[0]! * .84,
+    'Sharp pixel does not match the expected emitter distance/emission witness.');
+}
+function sharpWitness(owner: ReflectionRenderer | IntegratedRenderer, raw: ArrayBuffer, metadata: ArrayBuffer, config: ArrayBuffer,
+  objectOffset: 0 | .4, expectedFrameIndex: number) {
+  const camera = owner.currentCamera; requireProof(camera, 'Sharp witness camera is unavailable.');
+  const witness = rendererSharpRay(camera.viewProjection, config, objectOffset);
+  const words = new Uint32Array(config), at = witness.y * words[36]! + witness.x, tags = new Uint32Array(metadata), colors = new Uint16Array(raw);
+  const sample = { source: tags[at * 4]!, frame: tags[at * 4 + 1]!, epoch: tags[at * 4 + 2]!, mask: tags[at * 4 + 3]!,
+    distance: half(colors[at * 4 + 3]!), rgb: [0, 1, 2].map(c => half(colors[at * 4 + c]!)) };
+  assertRendererSharpSample(witness, config, expectedFrameIndex, sample);
+  return { ...witness, ...sample, objectBoxId: rendererProofPlan.sharpGeometry.objectBoxId };
 }
 export interface RendererProofFrame {
   id: string; action: RendererProofStep['action']; submitted: boolean; frameId: number;
@@ -255,6 +308,7 @@ export async function createRendererProofArm(native: GPUDevice, options: Rendere
   // Creation is checked against the actual initial writes, not assumed from CPU arrays.
   model.forEach(bytes => bytes.fill(0));
   let consumedWrites = 0, frameId = 0, disposed = false, successfulFrames = 0, checkpoints = 0;
+  let expectedModes: RendererProofModes = { gi: true, reflections: options.kind === 'gi' ? null : 'world' };
   const applyWrites = () => {
     for (; consumedWrites < recorded.writes.length; consumedWrites++) {
       const write = recorded.writes[consumedWrites]!; if (!write.returned) continue;
@@ -311,6 +365,18 @@ export async function createRendererProofArm(native: GPUDevice, options: Rendere
     async writeLog() { return Promise.all(recorded.writes.map(async write => ({ ...write, bytes: await byteRecord(write.bytes, true) }))); },
     async step(step) {
       requireProof(!disposed, 'Proof arm disposed.'); recorded.setPhase(step.id); const firstWrite = recorded.writes.length;
+      expectedModes = advanceRendererProofModes(expectedModes, step.controls);
+      const expectedDisabled = !expectedModes.gi && (expectedModes.reflections === null || expectedModes.reflections === 'off');
+      const cachesBefore = expectedDisabled ? { probe: { ...owner.probeCache.telemetry },
+        reflection: 'reflectionCache' in owner ? { ...owner.reflectionCache.telemetry } : null } : undefined;
+      const disabledSources: Record<string, GPUBuffer> = {};
+      if (step.id.startsWith('disabled-edit-')) {
+        requireProof(expectedDisabled, 'Frozen disabled step did not request both effects off.');
+        const p = owner.probeCache.diagnostics;
+        Object.assign(disabledSources, { disabledProbeState: p.stateBuffer, disabledProbeRays: p.rayBuffer, disabledProbeStats: p.statisticsBuffer, disabledProbeConfig: p.configBuffer });
+        if ('reflectionCache' in owner) { const r = owner.reflectionCache.diagnostics; Object.assign(disabledSources, { disabledReflectionStats: r.statisticsBuffer, disabledReflectionConfig: r.configBuffer }); }
+      }
+      const disabledBefore = Object.fromEntries(await Promise.all(Object.entries(disabledSources).map(async ([key, buffer]) => [key, await readBuffer(native, buffer)])));
       const before = { ...owner.giTelemetry }, dispatches: RendererProofFrame['dispatches'] = [];
       const resetBefore = step.id === 'hard-reset-cancel' ? { probe: { ...owner.probeCache.telemetry },
         reflection: 'reflectionCache' in owner ? { ...owner.reflectionCache.telemetry } : null,
@@ -328,6 +394,7 @@ export async function createRendererProofArm(native: GPUDevice, options: Rendere
       if (step.action === 'fail-write') recorded.failTraceWrite(step.failWriteOrdinal);
       try {
         stats = owner.encode(observed, output.createView(), step.width, step.height, step.time, step.controls);
+        assertRendererProofModes(expectedModes, owner.giTelemetry, 'reflectionTelemetry' in owner ? owner.reflectionTelemetry : null);
         if (resetBefore) {
           resetConfig = owner.probeCache.diagnostics.configBuffer;
           if ('reflectionCache' in owner) reflectionResetConfig = owner.reflectionCache.diagnostics.configBuffer;
@@ -347,13 +414,18 @@ export async function createRendererProofArm(native: GPUDevice, options: Rendere
       await proofDeadline(native.queue.onSubmittedWorkDone(), `renderer ${step.id}`);
       if ('flushFeedback' in owner && submitted) await owner.flushFeedback();
       const gi = { ...owner.giTelemetry }, reflections = 'reflectionTelemetry' in owner ? { ...owner.reflectionTelemetry } : null;
-      const activeGi = gi.enabled === true, activeReflection = reflections?.mode === 'world';
+      assertRendererProofModes(expectedModes, gi, reflections);
+      const activeGi = expectedModes.gi, activeReflection = expectedModes.reflections === 'world';
       const writes = recorded.writes.slice(firstWrite);
       const updateWrites = recorded.writes.slice(initialWriteCount), returned = updateWrites.filter(write => write.returned);
       requireProof(gi.traceAttemptedWriteCalls === updateWrites.length && gi.traceQueuedWriteCalls === returned.length
         && gi.traceQueuedUploadBytes === returned.reduce((sum, write) => sum + write.byteLength, 0), 'Maintenance telemetry differs from actual attempted/returned trace writes.');
       if (step.id === 'queued-upload-retry') requireProof(writes.length === 0, 'Successful cancelled flush was redundantly uploaded on retry.');
-      if (!activeGi && (!reflections || reflections.mode === 'off')) requireProof(writes.length === 0, 'Disabled effects flushed tracing source.');
+      if (expectedDisabled) {
+        requireProof(writes.length === 0 && gi.traceQueuedUpdateCount === before.traceQueuedUpdateCount, 'Disabled effects flushed tracing source.');
+        assertDisabledRendererCaches(cachesBefore!, { probe: owner.probeCache.telemetry,
+          reflection: 'reflectionCache' in owner ? owner.reflectionCache.telemetry : null }, dispatches);
+      }
       if (!submitted) {
         requireProof(gi.traceLastSubmittedUpdateCount === before.traceLastSubmittedUpdateCount && gi.traceLastSubmittedFrameId === before.traceLastSubmittedFrameId, 'Cancelled frame advanced submitted trace attribution.');
       } else requireProof(gi.traceLastSubmittedFrameId === frameId && gi.traceLastSubmittedUpdateCount === gi.traceQueuedUpdateCount, 'Submitted trace source token differs from queued source.');
@@ -361,6 +433,11 @@ export async function createRendererProofArm(native: GPUDevice, options: Rendere
       const gpuTrace = await physical(), cpuTrace = arrays(owner.traceData).map(bytes => bytes.slice(0));
       if (!gi.tracePendingRangeCount) gpuTrace.forEach((bytes, i) => equal(bytes, cpuTrace[i]!, `fully queued target buffer${i}`));
       const gpuBuffers: Record<string, ArrayBuffer> = {}, images: Record<string, ArrayBuffer> = {}, activity: Record<string, unknown> = {};
+      for (const [key, buffer] of Object.entries(disabledSources)) {
+        gpuBuffers[key] = await readBuffer(native, buffer); equal(gpuBuffers[key]!, disabledBefore[key]!, `Both-disabled actual cache ${key}`);
+      }
+      if (expectedDisabled) activity.disabled = { expectedModes: { ...expectedModes }, cachesBefore, cachesAfter: { probe: { ...owner.probeCache.telemetry },
+        reflection: 'reflectionCache' in owner ? { ...owner.reflectionCache.telemetry } : null }, unchangedActualBuffers: Object.keys(disabledSources), giReflectionPasses: 0 };
       if (resetBefore) {
         requireProof(resetConfig, 'Cancelled reset did not expose its queued configuration.');
         const config = await readBuffer(native, resetConfig), state = await readBuffer(native, owner.probeCache.diagnostics.stateBuffer);
@@ -428,11 +505,12 @@ export async function createRendererProofArm(native: GPUDevice, options: Rendere
         }
         const hdr = textures.get(options.kind === 'gi' ? 'Strata composed GI HDR' : 'Strata composed reflection HDR');
         if (activeGi || activeReflection) { requireProof(hdr, 'Active linear HDR composition resource missing.'); images.hdr = await readTexture(native, hdr); activity.hdr = finiteRgb(images.hdr, 'composed HDR'); }
-        if (step.id === 'sharp-warm-12') {
+        if (step.id === 'sharp-warm-12' || step.id === 'sharp-moved-point4') {
           requireProof(Number(activity.probeHits) > 0 && (activity.irradiance as { nonzeroPixels: number }).nonzeroPixels > 0, 'Warm GI activity is vacuous.');
           if (activeReflection && 'reflectionCache' in owner) {
             requireProof(new Uint32Array(gpuBuffers.reflectionStats!)[3]! > 0 && (activity.reflectionRaw as { maxRgb: number }).maxRgb > 1, 'Sharp offscreen emitter phase is vacuous.');
-            activity.sharpWitness = sharpWitness(owner, images.reflectionRaw!, images.reflectionRawMetadata!, gpuBuffers.reflectionConfig!);
+            activity.sharpWitness = sharpWitness(owner, images.reflectionRaw!, images.reflectionRawMetadata!, gpuBuffers.reflectionConfig!,
+              step.id === 'sharp-moved-point4' ? .4 : 0, frameId - 1);
           }
         }
       }
@@ -455,7 +533,7 @@ async function summarize(frame: RendererProofFrame) {
 export async function runRendererPairValidation(device: GPUDevice, candidateFactory: RendererProofFactory, fullFactory: RendererProofFactory,
   assetUrls: { manifestUrl: string; traceProxyUrl: string }, onProgress?: (event: unknown) => Promise<void>) {
   const report: { version: string; plan: typeof rendererProofPlan; pairs: unknown[]; streamed: unknown; cleanup: unknown[]; status: string } =
-    { version: 'issue20-renderer-pair-v1', plan: rendererProofPlan, pairs: [], streamed: null, cleanup: [], status: 'running' };
+    { version: rendererProofPlan.version, plan: rendererProofPlan, pairs: [], streamed: null, cleanup: [], status: 'running' };
   const started = performance.now(); let arms: RendererProofArm[] = [], last: unknown;
   const progress = (event: unknown) => onProgress ? proofDeadline(onProgress(event), 'renderer proof progress persistence') : Promise.resolve();
   try {
