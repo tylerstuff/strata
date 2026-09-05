@@ -132,7 +132,7 @@ export async function validateImportedRendering() {
     cases.push({ name: 'uv-image-orientation', ...uv });
 
     const unlitMaterial = material({ ...textured, unlit: true, metallicFactor: 1, roughnessFactor: 1, occlusionTexture: texture(0),
-      normalTexture: texture(1), emissiveFactor: [8, 4, 2], emissiveStrength: 8 });
+      normalTexture: texture(1), emissiveFactor: [1, 0.5, 0.25], emissiveStrength: 64 });
     const unlitAsset = asset([quad(0, 0, 1, 0, 2, color)], [unlitMaterial], [base, normal]);
     const unlitDark = await render(unlitAsset); const unlitBright = await render(unlitAsset, { ...controls,
       lighting: { directionToLight: [0, 0, 1], color: [1, 0.5, 0.25], intensity: 8, ambient: [1, 1, 1] } });
@@ -284,11 +284,14 @@ export async function validateImportedPublicLifecycle() {
     const lateImage = await image('base', 2, 2);
     const lateAsset = asset([quad()], [material({ baseColorTexture: { image: 0, sampler } })], [lateImage]);
     const beforeLate = engine.getTelemetry(); const originalBitmap = globalThis.createImageBitmap;
-    let releaseBitmap!: () => void; let enteredBitmap!: () => void;
+    let releaseBitmap!: () => void; let enteredBitmap!: () => void; let closedBitmap!: () => void;
     const released = new Promise<void>(resolve => { releaseBitmap = resolve; });
     const entered = new Promise<void>(resolve => { enteredBitmap = resolve; });
+    const closed = new Promise<void>(resolve => { closedBitmap = resolve; });
     globalThis.createImageBitmap = (async (source: ImageBitmapSource, options?: ImageBitmapOptions) => {
-      const bitmap = await originalBitmap(source, options); enteredBitmap(); await released; return bitmap;
+      const bitmap = await originalBitmap(source, options); const close = bitmap.close.bind(bitmap);
+      bitmap.close = () => { close(); closedBitmap(); };
+      enteredBitmap(); await released; return bitmap;
     }) as typeof createImageBitmap;
     let lateRejection = '';
     try {
@@ -296,12 +299,15 @@ export async function validateImportedPublicLifecycle() {
         (error: { code?: string }) => { lateRejection = String(error.code ?? error); });
       await Promise.race([entered, pending.then(() => { throw new Error(`Imported creation ended before the held bitmap: ${lateRejection}`); })]);
       await engine.setScene({ renderer: 'diffuse', instanceCount: 1 });
-      releaseBitmap(); await pending; await engine.waitForIdle();
+      releaseBitmap(); await pending; await closed;
+      // Match the already-rendered baseline: a new diffuse scene allocates its
+      // depth target on first render. The prompt abort receipt precedes late cleanup.
+      engine.render(); await engine.waitForIdle();
       require(lateRejection === 'SCENE_LOAD_SUPERSEDED', 'Late decoded-image creation must reject as superseded.');
       const afterLate = engine.getTelemetry();
       require(afterLate.imported === undefined && afterLate.allocatedGpuBufferBytes === beforeLate.allocatedGpuBufferBytes
         && afterLate.allocatedGpuTextureBytes === beforeLate.allocatedGpuTextureBytes, 'Superseded imported resources survived late cleanup.');
-      engine.render(); await engine.waitForIdle(); stages.push({ name: 'late-decode-superseded', telemetry: afterLate });
+      stages.push({ name: 'late-decode-superseded', telemetry: afterLate });
     } finally { releaseBitmap(); globalThis.createImageBitmap = originalBitmap; }
     engine.dispose(); const disposed = engine.getTelemetry();
     require(disposed.allocatedGpuBufferBytes === 0 && disposed.allocatedGpuTextureBytes === 0 && disposed.wasmMemoryBytes === 0, 'Public imported lifecycle leaked allocation estimates.');
