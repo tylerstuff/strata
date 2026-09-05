@@ -163,3 +163,38 @@ bounds, shaders and cache policy: the same 60-second route, 30-second warmup,
 1 MiB pool, fixed 720p/1080p resolutions and verified hardware/power conditions.
 Report actual trace and total uploads, CPU distributions, GPU span, callback
 stalls, retained memory and visual differences separately.
+
+## Actual-write correctness harness
+
+`scripts/test-trace-updates.mjs` prepares a separate diagnostic build. Preparation
+is CPU-only; it loads the original external courtyard and frozen 512-ray ABI,
+validates every asset hash, and writes immutable input, step, source, expanded
+WGSL and bundle manifests outside the repository. A dirty draft is explicitly
+non-runnable. Use a new output directory for every preparation and run.
+
+```sh
+node scripts/test-trace-updates.mjs --prepare-only \
+  --asset-root /external/courtyard --rays /external/preregistered/rays.bin \
+  --output /external/new-proof-preparation
+```
+
+After independent review of the clean harness and its manifest, an explicitly
+allocated local GPU window can use `--run --manifest PATH --manifest-sha256 SHA
+--output NEW_EXTERNAL_DIR --adapter hardware` (or separately named `software`).
+Running without a mode is an error. The adapter class must match the requested
+class; the runner does not silently switch to a fallback adapter. Browser
+execution has a ten-minute deadline and bounded diagnostic readbacks.
+
+The direct stage exercises the production updater on real buffers, including
+partial-write prefixes, retries and the canonical byte plan. Renderer pairs use
+the same GI/reflection/integrated code with separate resources on one device;
+only the full-control bundle replaces the internal updater. Exact cache, source
+and defined-image comparisons remain failures when they differ. A separate
+candidate-only 1 MiB residency case labels missing churn coverage unexercised.
+
+The full control uses independent BigInt bounds and brute reference work. It is
+**ineligible for performance comparisons**. Preparing this harness or passing
+its CPU tests establishes neither GPU correctness nor image quality or 60 FPS.
+No benchmark assets, generated bundles or captured images belong in Git or CI.
+CPU checks are `node --test scripts/test-trace-updates.test.mjs`, the four
+`trace-update`/`full-trace-updater` unit files, and both TypeScript configurations.
