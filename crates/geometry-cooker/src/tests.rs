@@ -61,7 +61,8 @@ fn complete_area_winding_and_full_boundaries_at_every_lod() {
         assert_eq!(source.indices.len() / 3, cells * cells * 2);
         let source_boundary = boundary(&source);
         assert_eq!(source_boundary.len(), cells * 4);
-        for step in config.steps() {
+        // Certified steps include every legacy step and all new intermediates.
+        for step in LodProfile::Certified.steps(config) {
             let coarse = mesh(config, 0, step);
             assert_eq!(area(&coarse), (cells * cells) as f64);
             assert_eq!(
@@ -85,8 +86,6 @@ fn adjacent_tiles_share_identical_position_and_normal_bits() {
         tiles: 2,
         cells: 128,
     };
-    let left = mesh(config, 0, 128);
-    let right = mesh(config, 1, 8);
     let shared = |mesh: &Mesh| -> BTreeMap<u32, ([u32; 3], [u32; 3])> {
         mesh.vertices
             .iter()
@@ -102,8 +101,12 @@ fn adjacent_tiles_share_identical_position_and_normal_bits() {
             })
             .collect()
     };
-    assert_eq!(shared(&left), shared(&right));
-    assert_eq!(shared(&left).len(), 129);
+    let reference = shared(&mesh(config, 0, 1));
+    assert_eq!(reference.len(), 129);
+    for step in LodProfile::Certified.steps(config) {
+        assert_eq!(shared(&mesh(config, 0, step)), reference);
+        assert_eq!(shared(&mesh(config, 1, step)), reference);
+    }
 }
 
 fn source_height(config: Config, x: f64, z: f64) -> f64 {

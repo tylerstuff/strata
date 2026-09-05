@@ -1,17 +1,19 @@
 use std::path::PathBuf;
 use strata_geometry_cooker::{
-    Config, PAGE_BYTES, cook, cook_trace_proxy, write_cooked, write_trace_proxy,
+    Config, LodProfile, PAGE_BYTES, cook_trace_proxy, cook_with_profile, write_cooked,
+    write_trace_proxy,
 };
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::default();
     let mut output: Option<PathBuf> = None;
     let mut trace_proxy = false;
+    let mut profile = LodProfile::Legacy;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         if argument == "--help" {
             println!(
-                "strata-geometry-cooker [--output EXTERNAL_DIRECTORY] [--seed U32] [--tiles 1..16] [--cells 8|16|32|64|128] [--trace-proxy (seed1337/tiles4/cells64 only)]"
+                "strata-geometry-cooker [--output EXTERNAL_DIRECTORY] [--seed U32] [--tiles 1..16] [--cells 8|16|32|64|128] [--lod-profile legacy|certified] [--trace-proxy (seed1337/tiles4/cells64 only)]"
             );
             return Ok(());
         }
@@ -25,6 +27,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--seed" => config.seed = value.parse()?,
             "--tiles" => config.tiles = value.parse()?,
             "--cells" => config.cells = value.parse()?,
+            "--lod-profile" => {
+                profile = match value.as_str() {
+                    "legacy" => LodProfile::Legacy,
+                    "certified" => LodProfile::Certified,
+                    _ => return Err("LOD profile must be legacy or certified.".into()),
+                }
+            }
             _ => return Err(format!("Unknown argument: {argument}").into()),
         }
     }
@@ -38,11 +47,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .join("Downloads/Strata-Cooked-Geometry")
         .join(format!(
-            "terrain-v1-s{}-t{}-c{}",
-            config.seed, config.tiles, config.cells
+            "terrain-v1-s{}-t{}-c{}{}",
+            config.seed,
+            config.tiles,
+            config.cells,
+            if profile == LodProfile::Certified {
+                "-certified-v1"
+            } else {
+                ""
+            }
         ))
     });
-    let cooked = cook(config)?;
+    let cooked = cook_with_profile(config, profile)?;
     let proxy = if trace_proxy {
         Some(cook_trace_proxy(config, &cooked.manifest)?)
     } else {
