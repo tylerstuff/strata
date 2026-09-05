@@ -8,6 +8,28 @@ const MAX_PROCESSES = 512;
 const CENSUS_MS = 1000;
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+function diagnosticText(value, maxBytes = 512) {
+  if (typeof value !== 'string') return null;
+  const bytes = Buffer.from(value);
+  if (bytes.length <= maxBytes) return value;
+  let result = bytes.subarray(0, maxBytes).toString('utf8');
+  while (Buffer.byteLength(result) > maxBytes || result.endsWith('\ufffd')) result = result.slice(0, -1);
+  return result;
+}
+const diagnosticNumber = value => Number.isSafeInteger(value) ? value : null;
+function diagnosticIdentity(value, stringBytes = 512) {
+  if (!value || typeof value !== 'object') return null;
+  return { pid: diagnosticNumber(value.pid), ppid: diagnosticNumber(value.ppid), pgid: diagnosticNumber(value.pgid),
+    start: diagnosticText(value.start, Math.min(64, stringBytes)), state: diagnosticText(value.state, Math.min(32, stringBytes)),
+    command: diagnosticText(value.command, stringBytes) };
+}
+function diagnosticDetail(value, stringBytes = 512) {
+  if (!value || typeof value !== 'object') return null;
+  return { kind: diagnosticText(value.kind, Math.min(64, stringBytes)), rowIndex: diagnosticNumber(value.rowIndex),
+    rowBytes: diagnosticNumber(value.rowBytes), rowPrefix: diagnosticText(value.rowPrefix, stringBytes),
+    identity: diagnosticIdentity(value.identity, stringBytes) };
+}
+
 async function census() {
   // comm records the executable, never argv or the process environment.
   const { stdout } = await execute('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,lstart=,stat=,comm='], {
@@ -15,9 +37,15 @@ async function census() {
     maxBuffer: 4 * 1024 * 1024,
   });
   assert.ok(stdout.trim(), 'Process census unexpectedly returned no rows');
-  return stdout.split('\n').filter(line => line.trim()).map(line => {
+  return stdout.split('\n').filter(line => line.trim()).map((line, rowIndex) => {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+((?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(\S+)\s+(.+?)\s*$/.exec(line);
-    assert.ok(match, 'Ambiguous process census row');
+    try { assert.ok(match, 'Ambiguous process census row'); }
+    catch (error) {
+      // This prefix is only the selected PID/PPID/PGID/lstart/stat/comm columns;
+      // ps was never asked for argv or environment values.
+      error.diagnostic = { kind: 'ps-comm-row-parse', rowIndex, rowBytes: Buffer.byteLength(line), rowPrefix: diagnosticText(line, 384) };
+      throw error;
+    }
     return { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]),
       start: match[4].replace(/\s+/g, ' '), state: match[5], command: match[6] };
   });
@@ -66,10 +94,11 @@ export function createProcessTracker({ rootPid, rootCommand, pollIntervalMs = 25
       assert.ok(Array.isArray(rows), 'Process census must return an array');
       const current = new Map();
       for (const row of rows) {
-        assert.ok(row && Number.isSafeInteger(row.pid) && row.pid > 0 && Number.isSafeInteger(row.ppid) && row.ppid >= 0
+        try { assert.ok(row && Number.isSafeInteger(row.pid) && row.pid > 0 && Number.isSafeInteger(row.ppid) && row.ppid >= 0
           && Number.isSafeInteger(row.pgid) && row.pgid >= 0 && typeof row.start === 'string' && row.start.length > 0
           && typeof row.command === 'string' && row.command.length > 0 && !/[\u0000\r\n]/.test(row.command)
-          && (row.state === undefined || typeof row.state === 'string') && !current.has(row.pid), 'Invalid or duplicate process census identity');
+          && (row.state === undefined || typeof row.state === 'string') && !current.has(row.pid), 'Invalid or duplicate process census identity'); }
+        catch (error) { error.diagnostic = { kind: 'invalid-census-identity', identity: diagnosticIdentity(row) }; throw error; }
         current.set(row.pid, { pid: row.pid, ppid: row.ppid, pgid: row.pgid, start: row.start, command: row.command,
           ...(row.state === undefined ? {} : { state: row.state }) });
       }
@@ -79,6 +108,8 @@ export function createProcessTracker({ rootPid, rootCommand, pollIntervalMs = 25
         initialAttempted = true;
         const root = current.get(rootPid);
         if (!root || !live(root) || (root.command !== rootCommand && root.command !== basename(rootCommand))) {
+          report.initialRootObservation = { expected: { pid: rootPid, command: diagnosticText(rootCommand) }, observed: diagnosticIdentity(root),
+            reason: !root ? 'missing' : !live(root) ? 'not-live' : 'command-mismatch' };
           unknown('The spawned root identity was unavailable before initial observation.');
           return;
         }
@@ -105,7 +136,9 @@ export function createProcessTracker({ rootPid, rootCommand, pollIntervalMs = 25
       initialAttempted = true;
       latest = new Map();
       unknown('Process census failed or was ambiguous; absence and ownership cannot be proven.');
-      if (report.censusErrors.length < 32) report.censusErrors.push({ message: error.message });
+      if (report.censusErrors.length < 32) report.censusErrors.push({ message: diagnosticText(error.message),
+        code: typeof error.code === 'number' ? error.code : diagnosticText(error.code, 64), signal: diagnosticText(error.signal, 32),
+        killed: typeof error.killed === 'boolean' ? error.killed : null, diagnostic: diagnosticDetail(error.diagnostic) });
     }
   }
   function sample() {
@@ -261,4 +294,78 @@ export function superviseChildProcess(child, { rootCommand, timeoutMs = 240_000,
       } catch (error) { cleanup('failure', error); }
     }
   });
+}
+
+/** Diagnostic-only whitelist: one bounded JSON line, with no workload payloads. */
+export function formatProcessCleanupSummary(outcome, { maxBytes = 32 * 1024 } = {}) {
+  assert.ok(Number.isInteger(maxBytes) && maxBytes >= 1024 && maxBytes <= 32 * 1024, 'Diagnostic byte budget must be 1024..32768');
+  const processInfo = outcome?.process ?? {}, ownership = processInfo.ownership ?? {};
+  const names = ['limitations', 'observed', 'remaining', 'identityMismatches', 'censusErrors', 'signals'];
+  const arrays = Object.fromEntries(names.map(name => [name, Array.isArray(ownership[name]) ? ownership[name] : []]));
+  const counts = Object.fromEntries(names.map(name => [name, arrays[name].length]));
+  const caps = Object.fromEntries(names.map(name => [name, Math.min(32, counts[name])]));
+  let stringBytes = 512, includeInitialRoot = true;
+  const boolean = value => typeof value === 'boolean' ? value : null;
+  function render() {
+    let truncated = !includeInitialRoot && ownership.initialRootObservation !== undefined;
+    const text = (value, limit = stringBytes) => {
+      const clipped = diagnosticText(value, limit);
+      if (typeof value === 'string' && clipped !== value) truncated = true;
+      return clipped;
+    };
+    const identity = value => value && typeof value === 'object' ? {
+      pid: diagnosticNumber(value.pid), ppid: diagnosticNumber(value.ppid), pgid: diagnosticNumber(value.pgid),
+      start: text(value.start, Math.min(64, stringBytes)), command: text(value.command), state: text(value.state, Math.min(32, stringBytes)),
+    } : null;
+    const detail = value => value && typeof value === 'object' ? {
+      kind: text(value.kind, Math.min(64, stringBytes)), rowIndex: diagnosticNumber(value.rowIndex), rowBytes: diagnosticNumber(value.rowBytes),
+      rowPrefix: text(value.rowPrefix), identity: identity(value.identity),
+    } : null;
+    const maps = {
+      limitations: value => text(value), observed: identity, remaining: identity,
+      identityMismatches: value => ({ expected: identity(value?.expected), current: identity(value?.current) }),
+      censusErrors: value => ({ message: text(value?.message), code: typeof value?.code === 'number' ? diagnosticNumber(value.code) : text(value?.code, Math.min(64, stringBytes)),
+        signal: text(value?.signal, Math.min(32, stringBytes)), killed: boolean(value?.killed), diagnostic: detail(value?.diagnostic) }),
+      signals: value => ({ ...identity(value), signal: text(value?.signal, Math.min(32, stringBytes)) }),
+    };
+    const filtered = Object.fromEntries(names.map(name => [name, arrays[name].slice(0, caps[name]).map(maps[name])]));
+    const omitted = Object.fromEntries(names.map(name => [name, counts[name] - filtered[name].length]));
+    if (Object.values(omitted).some(count => count > 0)) truncated = true;
+    const initial = ownership.initialRootObservation;
+    const initialRootObservation = includeInitialRoot && initial && typeof initial === 'object' ? {
+      expected: identity(initial.expected), observed: identity(initial.observed), reason: text(initial.reason, Math.min(64, stringBytes)),
+    } : null;
+    const summary = {
+      format: 'strata.preview.process-cleanup-diagnostic', version: 1,
+      error: outcome?.error ? { name: text(outcome.error.name, Math.min(64, stringBytes)), message: text(outcome.error.message) } : null,
+      process: { pid: diagnosticNumber(processInfo.pid), exitCode: diagnosticNumber(processInfo.exitCode),
+        exitSignal: text(processInfo.exitSignal, Math.min(32, stringBytes)), runnerSignal: text(processInfo.runnerSignal, Math.min(32, stringBytes)),
+        timedOut: boolean(processInfo.timedOut), cleanupUnknown: boolean(processInfo.cleanupUnknown), cleanupError: text(processInfo.cleanupError),
+        timeoutMs: diagnosticNumber(processInfo.timeoutMs), termGraceMs: diagnosticNumber(processInfo.termGraceMs),
+        killGraceMs: diagnosticNumber(processInfo.killGraceMs), exitGraceMs: diagnosticNumber(processInfo.exitGraceMs) },
+      ownership: { rootPid: diagnosticNumber(ownership.rootPid), cleanupUnknown: boolean(ownership.cleanupUnknown),
+        ...(initialRootObservation ? { initialRootObservation } : {}), ...filtered },
+      counts, omitted, truncated,
+    };
+    // text() may have set the flag while constructing the last fields.
+    summary.truncated = truncated;
+    return `${JSON.stringify(summary)}\n`;
+  }
+  let result = render();
+  while (Buffer.byteLength(result) > maxBytes) {
+    // Preserve one short reason/error ahead of bulky process rows. Exact totals
+    // remain visible even when all rows from a category must be omitted.
+    const drop = ['observed', 'signals', 'identityMismatches', 'remaining', 'limitations', 'censusErrors']
+      .find(name => caps[name] > (name === 'limitations' || name === 'censusErrors' ? 1 : 0));
+    if (drop) caps[drop]--;
+    else if (stringBytes > 16) stringBytes = Math.max(16, Math.floor(stringBytes / 2));
+    else if (includeInitialRoot && ownership.initialRootObservation !== undefined) includeInitialRoot = false;
+    else {
+      const last = ['limitations', 'censusErrors'].find(name => caps[name] > 0);
+      if (last) caps[last]--;
+      else throw new Error('Diagnostic envelope cannot fit its minimum byte budget');
+    }
+    result = render();
+  }
+  return result;
 }

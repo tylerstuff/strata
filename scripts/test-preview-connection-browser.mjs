@@ -7,7 +7,7 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'no
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { prepareGalleryOutput } from './gallery-output.mjs';
-import { superviseChildProcess } from './preview-process-cleanup.mjs';
+import { formatProcessCleanupSummary, superviseChildProcess } from './preview-process-cleanup.mjs';
 
 // No builds or external asset collection. Preparation never launches a browser;
 // the run stage requires its own explicitly granted browser/GPU window.
@@ -260,7 +260,18 @@ async function runBrowser() {
     const outcome = await superviseChildProcess(child, { rootCommand: process.execPath,
       timeoutMs: 240_000, termGraceMs: 5000, killGraceMs: 1000, exitGraceMs: 1000 });
     stdout = outcome.stdout; stderr = outcome.stderr; report.process = outcome.process;
-    if (outcome.error) throw Object.assign(new Error(outcome.error.message), { name: outcome.error.name });
+    if (outcome.error) {
+      try { process.stderr.write(formatProcessCleanupSummary(outcome)); }
+      catch (error) { report.process.diagnosticReportingError = error.message; }
+      try {
+        process.stderr.write(`${JSON.stringify({
+          format: 'strata.preview.process-cleanup-package-identity', version: 1,
+          sourceCommit: frozen.source.commit,
+          archives: { core: frozen.archives.core.sha256, authoring: frozen.archives.authoring.sha256, preview: frozen.archives.preview.sha256 },
+        })}\n`);
+      } catch (error) { report.process.packageIdentityReportingError = error.message; }
+      throw Object.assign(new Error(outcome.error.message), { name: outcome.error.name });
+    }
     assert.equal(stderr, '', 'Successful browser workflow must have clean stderr');
     const result = JSON.parse(await readFile(join(output, 'workflow-report.json'), 'utf8'));
     report.workflow = result;

@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { createProcessTracker } from './preview-process-cleanup.mjs';
+import { createProcessTracker, formatProcessCleanupSummary } from './preview-process-cleanup.mjs';
 
 const execute = promisify(execFile);
 const parentPath = fileURLToPath(new URL('../tests/fixtures/preview-process-parent.mjs', import.meta.url));
@@ -379,4 +379,154 @@ test('production combined output overflow retains bounded prefixes and cleans ow
   await assertStopped(fixture.workflowPid, fixture.childPid);
   ownedSignalsOnly(outcome.process.ownership, [fixture.workflowPid, fixture.childPid], control.pid);
   assert.deepEqual(await fixture.exit, { code: 0, signal: null });
+});
+
+const diagnosticArrays = ['limitations', 'observed', 'remaining', 'identityMismatches', 'censusErrors', 'signals'];
+function diagnosticFixture() {
+  const processRow = { pid: 102, ppid: 101, pgid: 102, start: 'Sun Sep 6 02:00:00 2026', state: 'S', command: '/fixture/worker',
+    argv: ['PRIVATE_ARGV_PAYLOAD'], environment: { token: 'PRIVATE_ENV_PAYLOAD' }, scene: 'PRIVATE_SCENE_PAYLOAD', image: 'PRIVATE_IMAGE_PAYLOAD' };
+  return {
+    stdout: 'PRIVATE_STDOUT_PAYLOAD', stderr: 'PRIVATE_STDERR_PAYLOAD', workflow: { scene: 'PRIVATE_WORKFLOW_PAYLOAD' },
+    error: { name: 'Error', message: 'Owned cleanup could not be verified', stack: 'PRIVATE_STACK_PAYLOAD' },
+    process: {
+      pid: 101, exitCode: 0, exitSignal: null, runnerSignal: 'SIGTERM', timedOut: false, cleanupUnknown: true,
+      cleanupError: 'Cleanup identity was not verified', timeoutMs: 240000, termGraceMs: 5000, killGraceMs: 1000, exitGraceMs: 1000,
+      scene: 'PRIVATE_PROCESS_SCENE_PAYLOAD', stdout: 'PRIVATE_PROCESS_STDOUT_PAYLOAD',
+      ownership: {
+        rootPid: 101, cleanupUnknown: true, limitations: ['Detached process ownership remained unknown'],
+        initialRootObservation: { expected: { pid: 101, command: '/fixture/runner', argv: ['PRIVATE_INITIAL_ARGV_PAYLOAD'] },
+          observed: { ...processRow, pid: 101, command: '/unexpected/runner' }, reason: 'command-mismatch', environment: 'PRIVATE_INITIAL_ENV_PAYLOAD' },
+        observed: [{ ...processRow }], remaining: [{ ...processRow }],
+        identityMismatches: [{ expected: { ...processRow }, current: { ...processRow, start: 'Sun Sep 6 02:00:01 2026' }, scene: 'PRIVATE_MISMATCH_PAYLOAD' }],
+        censusErrors: [{ message: 'Process census exceeded its deadline', code: 'ETIMEDOUT', signal: 'SIGTERM', killed: true,
+          diagnostic: { kind: 'ps-comm-row-parse', rowIndex: 7, rowBytes: 900, rowPrefix: '101 1 101 /fixture/worker',
+            identity: { ...processRow }, stdout: 'PRIVATE_PARSE_STDOUT_PAYLOAD' },
+          stdout: 'PRIVATE_CENSUS_STDOUT_PAYLOAD', stderr: 'PRIVATE_CENSUS_STDERR_PAYLOAD' }],
+        signals: [{ ...processRow, signal: 'SIGTERM' }],
+        scene: 'PRIVATE_OWNERSHIP_SCENE_PAYLOAD', images: ['PRIVATE_OWNERSHIP_IMAGE_PAYLOAD'],
+      },
+    },
+  };
+}
+
+function parsedDiagnostic(outcome, maxBytes = 32768) {
+  const text = formatProcessCleanupSummary(outcome, { maxBytes });
+  assert.equal(typeof text, 'string');
+  assert.ok(text.endsWith('\n'), 'The budget includes a terminal LF');
+  assert.ok(!text.slice(0, -1).includes('\n'), 'Diagnostic is exactly one JSONL record');
+  assert.ok(Buffer.byteLength(text, 'utf8') <= maxBytes, `Diagnostic exceeded ${maxBytes} UTF-8 bytes including LF`);
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.format, 'strata.preview.process-cleanup-diagnostic');
+  assert.equal(parsed.version, 1);
+  return { text, parsed };
+}
+
+function assertWellFormedStrings(value) {
+  if (typeof value === 'string') assert.ok(value.isWellFormed(), 'Truncation must not split a surrogate pair');
+  else if (Array.isArray(value)) value.forEach(assertWellFormedStrings);
+  else if (value && typeof value === 'object') Object.values(value).forEach(assertWellFormedStrings);
+}
+
+test('cleanup diagnostic retains actionable ownership evidence and excludes workflow payloads', () => {
+  const input = diagnosticFixture(), before = structuredClone(input);
+  const { text, parsed } = parsedDiagnostic(input);
+  assert.deepEqual(input, before, 'Formatting must not mutate the retained original report');
+  assert.equal(parsed.error.message, input.error.message);
+  assert.equal(parsed.process.cleanupUnknown, true);
+  assert.equal(parsed.process.exitCode, 0);
+  assert.equal(parsed.process.exitSignal, null);
+  assert.equal(parsed.process.runnerSignal, 'SIGTERM');
+  assert.equal(parsed.process.timedOut, false);
+  assert.equal(parsed.process.cleanupError, input.process.cleanupError);
+  assert.equal(parsed.ownership.cleanupUnknown, true);
+  assert.equal(parsed.ownership.rootPid, 101);
+  assert.equal(parsed.ownership.initialRootObservation.reason, 'command-mismatch');
+  assert.equal(parsed.ownership.initialRootObservation.expected.command, '/fixture/runner');
+  assert.equal(parsed.ownership.initialRootObservation.observed.command, '/unexpected/runner');
+  assert.deepEqual(parsed.ownership.limitations, input.process.ownership.limitations);
+  assert.equal(parsed.ownership.remaining[0].pid, 102);
+  assert.equal(parsed.ownership.identityMismatches[0].expected.start, 'Sun Sep 6 02:00:00 2026');
+  assert.equal(parsed.ownership.identityMismatches[0].current.start, 'Sun Sep 6 02:00:01 2026');
+  assert.equal(parsed.ownership.censusErrors[0].message, 'Process census exceeded its deadline');
+  assert.equal(parsed.ownership.censusErrors[0].code, 'ETIMEDOUT');
+  assert.equal(parsed.ownership.censusErrors[0].killed, true);
+  assert.equal(parsed.ownership.censusErrors[0].diagnostic.kind, 'ps-comm-row-parse');
+  assert.equal(parsed.ownership.censusErrors[0].diagnostic.rowIndex, 7);
+  assert.equal(parsed.ownership.censusErrors[0].diagnostic.rowBytes, 900);
+  assert.equal(parsed.ownership.signals[0].signal, 'SIGTERM');
+  for (const key of diagnosticArrays) {
+    assert.equal(parsed.counts[key], 1);
+    assert.equal(parsed.omitted[key], 0);
+  }
+  assert.equal(parsed.truncated, false);
+  assert.ok(!text.includes('PRIVATE_'), 'Only whitelisted process metadata belongs in the diagnostic');
+});
+
+for (const maxBytes of [1024, 2048, 32768]) {
+  test(`cleanup diagnostic bounds Unicode and large arrays within ${maxBytes} exact UTF-8 bytes`, () => {
+    const input = diagnosticFixture();
+    const unicode = '🙂漢字"\\\n'.repeat(2000);
+    input.error.message = unicode;
+    input.process.cleanupError = unicode;
+    input.process.ownership.limitations = Array.from({ length: 73 }, (_, index) => `reason-${index}-${unicode}`);
+    for (const key of diagnosticArrays.filter(value => value !== 'limitations')) {
+      const original = input.process.ownership[key][0];
+      input.process.ownership[key] = Array.from({ length: 73 }, () => structuredClone(original));
+    }
+    for (const row of input.process.ownership.observed) row.command = unicode;
+    for (const row of input.process.ownership.remaining) row.command = unicode;
+    for (const row of input.process.ownership.censusErrors) row.message = unicode;
+    const { text, parsed } = parsedDiagnostic(input, maxBytes);
+    assert.equal(parsed.truncated, true);
+    assert.equal(parsed.process.cleanupUnknown, true);
+    assert.equal(parsed.process.exitCode, 0);
+    assert.equal(parsed.ownership.cleanupUnknown, true);
+    assertWellFormedStrings(parsed);
+    for (const key of diagnosticArrays) {
+      assert.equal(parsed.counts[key], 73, `Total ${key} evidence count must survive truncation`);
+      assert.ok(parsed.ownership[key].length <= 32, `${key} exceeds its record cap`);
+      assert.equal(parsed.omitted[key], 73 - parsed.ownership[key].length);
+    }
+    assert.ok(!text.includes('PRIVATE_'));
+  });
+}
+
+test('cleanup diagnostic reports survivor totals after dropping bulky rows and keeps short root causes', () => {
+  const input = diagnosticFixture();
+  input.process.ownership.limitations = ['ROOT_CAUSE: initial root identity unavailable'];
+  input.process.ownership.remaining = Array.from({ length: 80 }, () => ({ ...input.process.ownership.remaining[0], command: '/fixture/' + 'x'.repeat(8192) }));
+  const { text, parsed } = parsedDiagnostic(input, 2048);
+  assert.equal(parsed.counts.remaining, 80);
+  assert.equal(parsed.omitted.remaining, 80 - parsed.ownership.remaining.length);
+  assert.ok(parsed.omitted.remaining > 0);
+  assert.ok(text.includes('ROOT_CAUSE'), 'A generic cleanupUnknown message alone is not actionable');
+  assert.ok(text.includes('Process census exceeded its deadline'));
+  assert.equal(parsed.process.cleanupUnknown, true);
+  assert.equal(parsed.truncated, true);
+});
+
+test('cleanup diagnostic preserves known zero and false values without inventing missing processes', () => {
+  const input = diagnosticFixture();
+  input.process.runnerSignal = null;
+  input.process.cleanupUnknown = false;
+  input.process.cleanupError = null;
+  input.process.ownership.cleanupUnknown = false;
+  for (const key of diagnosticArrays) input.process.ownership[key] = [];
+  const { parsed } = parsedDiagnostic(input);
+  assert.equal(parsed.process.exitCode, 0);
+  assert.equal(parsed.process.timedOut, false);
+  assert.equal(parsed.process.runnerSignal, null);
+  assert.equal(parsed.process.cleanupUnknown, false);
+  assert.equal(parsed.ownership.cleanupUnknown, false);
+  assert.equal(parsed.truncated, false);
+  for (const key of diagnosticArrays) {
+    assert.deepEqual(parsed.ownership[key], []);
+    assert.equal(parsed.counts[key], 0); assert.equal(parsed.omitted[key], 0);
+  }
+});
+
+test('cleanup diagnostic rejects unsupported byte budgets', () => {
+  for (const maxBytes of [0, 1023, 32769, 2048.5, NaN, Infinity]) {
+    assert.throws(() => formatProcessCleanupSummary(diagnosticFixture(), { maxBytes }));
+  }
 });
