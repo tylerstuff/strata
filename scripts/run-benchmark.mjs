@@ -15,14 +15,14 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 function parseArguments(args) {
   const options = { smoke: false, sustained: false, output: resolve(homedir(), 'Downloads/Strata-Benchmark-Results') };
-  const numeric = new Set(['duration', 'warmup', 'seed', 'instance-count', 'pool-mib', 'pixel-error', 'page-delay-ms']);
+  const numeric = new Set(['duration', 'warmup', 'seed', 'instance-count', 'pool-mib', 'pixel-error', 'page-delay-ms', 'probes-per-update', 'rays-per-probe']);
   for (let index = 0; index < args.length; index++) {
     const name = args[index];
     if (name === '--smoke') options.smoke = true;
     else if (name === '--require-ac-performance') options.requireAcPerformance = true;
     else if (name === '--sustained') options.sustained = true;
     else if (name === '--help') options.help = true;
-    else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view', '--manifest', '--geometry-mode', '--camera'].includes(name)) {
+    else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view', '--manifest', '--geometry-mode', '--camera', '--gi', '--gi-scenario'].includes(name)) {
       const value = args[++index];
       if (!value || value.startsWith('--')) throw new Error(`Missing value for ${name}.`);
       options[name.slice(2)] = numeric.has(name.slice(2)) ? Number(value) : value;
@@ -39,12 +39,17 @@ function parseArguments(args) {
   options['pool-mib'] ??= 8;
   options['pixel-error'] ??= 2;
   options['page-delay-ms'] ??= 0;
-  options.camera ??= 'tour';
-  if (!['diffuse', 'raster', 'virtual'].includes(options.renderer) || !['on', 'off'].includes(options.temporal)
-    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage'].includes(options['debug-view'])) {
-    throw new Error('Use --renderer diffuse|raster|virtual, --temporal on|off and a supported --debug-view.');
+  options.camera ??= options.renderer === 'gi' ? 'overview' : 'tour';
+  options.gi ??= 'on'; options['gi-scenario'] ??= 'door-light'; options['probes-per-update'] ??= 32; options['rays-per-probe'] ??= 64;
+  if (!['diffuse', 'raster', 'virtual', 'gi'].includes(options.renderer) || !['on', 'off'].includes(options.temporal)
+    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility'].includes(options['debug-view'])) {
+    throw new Error('Use --renderer diffuse|raster|virtual|gi, --temporal on|off and a supported --debug-view.');
   }
-  if (!['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(options['geometry-mode']) || !['tour', 'coverage'].includes(options.camera)) throw new Error('Unknown geometry mode or camera.');
+  if (!['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(options['geometry-mode'])
+    || !(options.renderer === 'gi' ? ['overview', 'receiver', 'tour'] : ['tour', 'coverage']).includes(options.camera)) throw new Error('Unknown geometry mode or camera.');
+  if (!['on', 'off'].includes(options.gi) || !['static', 'door-light'].includes(options['gi-scenario'])
+    || !Number.isInteger(options['probes-per-update']) || options['probes-per-update'] < 1 || options['probes-per-update'] > 128
+    || !Number.isInteger(options['rays-per-probe']) || options['rays-per-probe'] < 16 || options['rays-per-probe'] > 128) throw new Error('Invalid GI mode, scenario or probe/ray budget.');
   if (!Number.isFinite(options['pool-mib']) || options['pool-mib'] < 0.0625 || !Number.isSafeInteger(options['pool-mib'] * 1024 ** 2)
     || !Number.isFinite(options['pixel-error']) || options['pixel-error'] <= 0 || options['pixel-error'] > 1000
     || !Number.isFinite(options['page-delay-ms']) || options['page-delay-ms'] < 0 || options['page-delay-ms'] > 60000) throw new Error('Invalid geometry pool, error or page delay.');
@@ -57,6 +62,7 @@ function parseArguments(args) {
   for (const name of ['seed', 'instance-count']) if (options[name] !== undefined && !Number.isSafeInteger(options[name])) throw new Error(`--${name} must be an integer.`);
   if (options['instance-count'] === 0) throw new Error('--instance-count must be positive.');
   if (options.seed > 0xffff_ffff) throw new Error('--seed must be a uint32 integer (0–4294967295).');
+  if (options.renderer === 'gi' && options.seed !== 1337) throw new Error('The GI fixture uses fixed probe seed 1337.');
   if (options['instance-count'] > 16_384) throw new Error('--instance-count must be at most 16384.');
   return options;
 }
@@ -214,6 +220,7 @@ async function main() {
   if (options.help) {
     console.log('Usage: npm run benchmark -- [--smoke | --sustained] [--duration seconds] [--warmup seconds] [--seed integer] [--instance-count integer] [--output external-directory] [--device-label label] [--renderer diffuse|raster|virtual] [--temporal on|off] [--debug-view view]');
     console.log('Virtual terrain: STRATA_BENCHMARK_ASSET_DIR=/external/cooked/root plus --manifest relative/manifest.json [--geometry-mode streamed|resident-lod|resident-full|mesh-lod] [--pool-mib 8] [--pixel-error 2] [--page-delay-ms 0] [--camera tour|coverage].');
+    console.log('World-space GI: --renderer gi [--gi on|off] [--gi-scenario door-light|static] [--probes-per-update 32] [--rays-per-probe 64] [--camera overview|receiver|tour].');
     console.log('Default: headed Chrome, 720p + 1080p, 30s warmup and 60s capture per resolution. Sustained: 1080p, 30s warmup + 180s capture. Smoke timings are never performance evidence.');
     console.log('--require-ac-performance requires a confirmed macOS AC profile with Low Power Mode off. All measured sessions reject a detected power-profile change.');
     return;
@@ -299,6 +306,8 @@ async function main() {
             geometryMode: options['geometry-mode'], poolBytes: options['pool-mib'] * 1024 ** 2,
             pixelError: options['pixel-error'], pageLoadDelayMs: options['page-delay-ms'], cameraMode: options.camera,
           } : {}),
+          ...(options.renderer === 'gi' ? { giEnabled: options.gi === 'on', giScenario: options['gi-scenario'],
+            probesPerUpdate: options['probes-per-update'], raysPerProbe: options['rays-per-probe'], cameraMode: options.camera } : {}),
         });
       } finally {
         clearInterval(interval);
@@ -311,9 +320,9 @@ async function main() {
       for (const sample of samples) checkPower(sample, sessionPower, options.requireAcPerformance);
       const captureFilename = `${width}x${height}.png`;
       // The measured window has completed. Capture a known camera time separately.
-      await page.evaluate(() => globalThis.strataBenchmark.capture(0));
+      const captureState = await page.evaluate(() => globalThis.strataBenchmark.capture(0));
       const captureValidation = await captureEvidence(page, resolve(directory, captureFilename));
-      result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0, captureValidation };
+      result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0, captureValidation, ...captureState };
       report.runs.push(result);
       if (errors.length) throw new Error(`Browser errors during capture: ${errors.join('; ')}`);
       if (!captureValidation.passed) throw new Error(`The ${width}x${height} procedural scene capture is blank or lacks visible geometry; the failed image and measurements were retained locally.`);

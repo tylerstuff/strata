@@ -67,6 +67,91 @@
     }
   },
   "$defs": {
+    "giTelemetry": {
+      "type": "object",
+      "required": ["sourceFrameId", "worldRevision", "cacheEpoch", "enabled", "probeCount", "probesPerUpdate", "raysPerProbe", "primaryRaysPerFrame", "maxShadowRaysPerFrame", "updatePeriodFrames", "framesSinceReset", "probeUpdatesSinceReset", "submittedFrames", "primaryRaysSubmitted", "validProbeCount", "traceFailures", "hysteresis", "maxTraceDistance", "doorOpen", "wallColor", "lightIntensity", "traceRepresentation", "traceGeometryBytes", "cacheBufferBytes", "cacheTextureBytes", "composeBufferBytes", "composeTextureBytes"],
+      "properties": {
+        "sourceFrameId": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
+        "worldRevision": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "cacheEpoch": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "enabled": { "type": "boolean" },
+        "probeCount": { "const": 384 },
+        "probesPerUpdate": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "raysPerProbe": { "type": "integer", "minimum": 16, "maximum": 128 },
+        "primaryRaysPerFrame": { "type": "integer", "minimum": 0, "maximum": 16384 },
+        "maxShadowRaysPerFrame": { "type": "integer", "minimum": 0, "maximum": 16384 },
+        "updatePeriodFrames": { "type": "integer", "minimum": 3, "maximum": 384 },
+        "framesSinceReset": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "probeUpdatesSinceReset": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "submittedFrames": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "primaryRaysSubmitted": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "validProbeCount": { "type": ["integer", "null"], "minimum": 0, "maximum": 384 },
+        "traceFailures": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "hysteresis": { "type": "number", "minimum": 0, "maximum": 0.95 },
+        "maxTraceDistance": { "const": 32 },
+        "doorOpen": { "type": "boolean" },
+        "wallColor": { "enum": ["red", "neutral"] },
+        "lightIntensity": { "type": "number", "minimum": 0, "maximum": 8 },
+        "traceRepresentation": { "const": "triangle-bvh-v1" },
+        "traceGeometryBytes": { "type": "integer", "minimum": 0 },
+        "cacheBufferBytes": { "type": "integer", "minimum": 0 },
+        "cacheTextureBytes": { "type": "integer", "minimum": 0 },
+        "composeBufferBytes": { "type": "integer", "minimum": 0 },
+        "composeTextureBytes": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": {
+        "anyOf": [{ "type": "number" }, { "type": "string" }, { "type": "boolean" }, { "type": "null" }]
+      }
+    },
+    "giWorkload": {
+      "type": "object",
+      "required": ["renderer", "temporal", "debugView", "giEnabled", "giScenario", "sourceTriangleCount"],
+      "properties": {
+        "id": { "const": "two-room-software-gi-v1" },
+        "renderer": { "const": "gi" },
+        "seed": { "const": 1337 },
+        "instanceCount": { "const": 0 },
+        "renderPath": { "const": "world-space-diffuse-gi-v1" },
+        "cameraPath": { "enum": ["gi-receiver-v1", "gi-overview-v1", "gi-tour-v1"] },
+        "temporal": { "type": "boolean" },
+        "debugView": { "enum": ["final", "direct", "shadow", "depth", "normal", "motion", "material", "clusters", "lod", "residency", "coverage", "indirect", "trace", "probe-age", "probe-irradiance", "probe-visibility"] },
+        "giEnabled": { "type": "boolean" },
+        "giScenario": { "enum": ["static", "door-light"] },
+        "sourceTriangleCount": { "const": 132 },
+        "externalAssetsUsed": { "const": false }
+      }
+    },
+    "giQuality": {
+      "type": "object",
+      "required": ["giEnabled", "probesPerUpdate", "raysPerProbe", "traceRepresentation", "grid", "maxTraceDistance", "screenTracing", "giScenario", "scenarioPeriodSeconds", "events", "materialFixture"],
+      "properties": {
+        "giEnabled": { "type": "boolean" },
+        "probesPerUpdate": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "raysPerProbe": { "type": "integer", "minimum": 16, "maximum": 128 },
+        "traceRepresentation": { "const": "triangle-bvh-v1" },
+        "grid": { "const": [12, 4, 8] },
+        "maxTraceDistance": { "const": 32 },
+        "screenTracing": { "const": false },
+        "giScenario": { "enum": ["static", "door-light"] },
+        "scenarioPeriodSeconds": { "const": 60 },
+        "materialFixture": { "const": "shared-flat-lambertian-v1" },
+        "events": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": ["atSeconds"],
+            "properties": {
+              "atSeconds": { "type": "number", "minimum": 0, "exclusiveMaximum": 60 },
+              "doorOpen": { "type": "boolean" },
+              "lightIntensity": { "type": "number", "minimum": 0, "maximum": 8 },
+              "wallColor": { "enum": ["red", "neutral"] }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
     "distribution": {
       "type": "object",
       "required": [
@@ -197,6 +282,17 @@
             "minimum": 0
           }
         },
+        "gpuSpanMs": { "type": ["number", "null"], "minimum": 0 },
+        "gpuPassIntervals": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object", "required": ["startMs", "endMs"], "additionalProperties": false,
+            "properties": {
+              "startMs": { "type": "number", "minimum": 0 },
+              "endMs": { "type": "number", "minimum": 0 }
+            }
+          }
+        },
         "triangleCountSourceFrameId": {
           "type": [
             "integer",
@@ -234,11 +330,43 @@
               }
             ]
           }
+        },
+        "gi": {
+          "$ref": "#/$defs/giTelemetry"
         }
       }
     },
     "run": {
       "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "workload": { "type": "object", "properties": { "renderer": { "const": "gi" } }, "required": ["renderer"] }
+            }
+          },
+          "then": {
+            "required": ["quality"],
+            "properties": {
+              "workload": { "$ref": "#/$defs/giWorkload" },
+              "quality": { "$ref": "#/$defs/giQuality" },
+              "frames": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["gi", "gpuPasses", "triangleCountSourceFrameId"],
+                  "properties": {
+                    "gi": { "$ref": "#/$defs/giTelemetry" },
+                    "gpuPasses": { "type": "object" },
+                    "triangleCountSourceFrameId": { "type": "integer", "minimum": 1 }
+                  }
+                }
+              },
+              "allocations": { "type": "object", "required": ["gi"], "properties": { "gi": { "$ref": "#/$defs/giTelemetry" } } }
+            }
+          }
+        }
+      ],
       "required": [
         "schemaVersion",
         "startedAt",
@@ -306,6 +434,12 @@
               "type": "string"
             },
             "externalAssetsUsed": {
+              "type": "boolean"
+            },
+            "renderer": {
+              "enum": ["diffuse", "raster", "virtual", "gi"]
+            },
+            "temporal": {
               "type": "boolean"
             }
           }
@@ -625,6 +759,9 @@
             },
             "note": {
               "type": "string"
+            },
+            "gi": {
+              "$ref": "#/$defs/giTelemetry"
             }
           }
         },
@@ -653,6 +790,7 @@
             "gpuPassMs": {
               "$ref": "#/$defs/distribution"
             },
+            "gpuSpanMs": { "$ref": "#/$defs/distribution" },
             "meanCallbackCadenceFps": {
               "type": [
                 "number",

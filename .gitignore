@@ -40,3 +40,4 @@ Strata-Benchmark-Assets/
 /benchmarks/browser/app.js
 /benchmarks/browser/app.js.map
 /benchmarks/browser/temporal-validation.js
+/benchmarks/browser/gi-validation.js

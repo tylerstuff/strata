@@ -12,6 +12,7 @@ const temporary = await mkdtemp(join(tmpdir(), 'strata-consumers-'));
 const artifacts = join(root, 'test-results', 'consumers');
 const softwareGpu = process.env.STRATA_TEST_SOFTWARE_GPU === '1';
 const artifactSuffix = softwareGpu ? '-software' : '';
+const giModuleMarker = 'Strata one-bounce software probe trace';
 let browser;
 const servers = [];
 
@@ -63,13 +64,19 @@ async function openConsumer(url, options = {}) {
   }, options);
   const page = await context.newPage();
   page.setDefaultTimeout(30_000);
+  const modules = []; const moduleReads = [];
+  context.on('response', (response) => {
+    if (new URL(response.url()).pathname.endsWith('.js')) {
+      moduleReads.push(response.text().then((source) => modules.push({ url: response.url(), source })).catch(() => undefined));
+    }
+  });
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   const response = await page.goto(url);
   assert.equal(response.headers()['cross-origin-opener-policy'], undefined);
   assert.equal(response.headers()['cross-origin-embedder-policy'], undefined);
   await page.waitForFunction(() => Boolean(globalThis.strataTest));
-  return { context, page, errors };
+  return { context, page, errors, async loadedModules() { await Promise.all(moduleReads); return modules; } };
 }
 
 const expectedClearPixel = [10, 15, 23, 255];
@@ -107,7 +114,7 @@ async function presentedCanvas(page) {
 }
 
 async function checkConsumer(kind, url) {
-  const { context, page, errors } = await openConsumer(url);
+  const { context, page, errors, loadedModules } = await openConsumer(url);
   try {
     const adapter = await page.evaluate(async () => {
       const adapter = await navigator.gpu?.requestAdapter();
@@ -147,6 +154,32 @@ async function checkConsumer(kind, url) {
       assert.equal(await page.evaluate(() => strataTest.renderAfterDispose()), 'ENGINE_DISPOSED');
     }
 
+    // Dynamic import must remain lazy in both the native ESM package and Vite's production output.
+    const defaultModules = await loadedModules();
+    assert.equal(defaultModules.some(module => module.source.includes(giModuleMarker)), false,
+      `${kind}: the default consumer eagerly fetched GI implementation code`);
+    assert.equal((await page.evaluate(() => strataTest.start())).state, 'ready');
+    const diffuse = await page.evaluate(() => strataTest.exerciseScene({ renderer: 'diffuse', instanceCount: 8 }));
+    assert.equal(diffuse.metrics.drawCalls, 1);
+    assert.equal(diffuse.telemetry.gpuErrorCount, 0);
+    assert.equal((await loadedModules()).some(module => module.source.includes(giModuleMarker)), false,
+      `${kind}: choosing the diffuse baseline fetched the optional GI implementation`);
+    const gi = await page.evaluate(() => strataTest.exerciseScene({ renderer: 'gi', cameraMode: 'overview', probesPerUpdate: 16, raysPerProbe: 32 }));
+    assert.equal(gi.metrics.dispatchCalls, 3, `${kind}: optional GI trace/update/shade did not execute`);
+    assert.equal(gi.metrics.drawCalls, 3);
+    assert.equal(gi.telemetry.gpuErrorCount, 0, gi.telemetry.lastGpuError ?? undefined);
+    assert.equal(gi.telemetry.gi?.enabled, true);
+    assert.equal(gi.telemetry.gi?.primaryRaysPerFrame, 512);
+    assert.equal(gi.telemetry.gi?.cacheEpoch, 1);
+    assert.equal(gi.telemetry.gi?.sourceFrameId, gi.metrics.frameId);
+    const giModules = (await loadedModules()).filter(module => module.source.includes(giModuleMarker));
+    assert.ok(giModules.length > 0, `${kind}: opting into GI did not load its separate implementation`);
+    const cleared = await page.evaluate(() => strataTest.exerciseScene(null));
+    assert.equal(cleared.metrics.dispatchCalls, 0);
+    assert.equal(cleared.telemetry.allocatedGpuTextureBytes, 0);
+    assert.equal((await page.evaluate(() => strataTest.dispose())).workers, 0);
+    console.log(`${kind}: default and diffuse imports skipped GI; opt-in GI loaded ${giModules.length} module(s), rendered, and released its resources`);
+
     for (const fixture of ['missing', 'corrupt']) {
       const failure = await page.evaluate((wasmUrl) => strataTest.fail({ wasmUrl }), `${url}/__fixtures__/${fixture}.wasm`);
       assert.equal(failure.code, fixture === 'missing' ? 'WASM_LOAD_FAILED' : 'WASM_INCOMPATIBLE', failure.message);
@@ -178,7 +211,12 @@ try {
   for (const required of ['dist/index.js', 'dist/index.d.ts', 'dist/worker.js', 'dist/strata_runtime.wasm']) {
     assert.ok(files.has(required), `Packed package is missing ${required}`);
   }
+  const optionalGiFiles = [...files].filter(file => /^dist\/gi-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
+  assert.equal(optionalGiFiles.length, 1, 'Packed ESM distribution must contain one separate GI entry chunk');
   const archive = join(temporary, packed.filename);
+  const indexSource = run('tar', ['-xOf', archive, 'package/dist/index.js'], root);
+  assert.ok(indexSource.includes(`import("./${optionalGiFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import the shipped GI chunk');
+  assert.equal(indexSource.includes(giModuleMarker), false, 'Package entry must not inline GI implementation code');
   const manifest = JSON.parse(run('tar', ['-xOf', archive, 'package/package.json'], root));
   for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
     assert.equal(manifest.scripts?.[lifecycle], undefined, `Consumers must not need a ${lifecycle} build`);

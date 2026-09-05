@@ -2,7 +2,7 @@
 
 Strata is a browser game engine being designed for high-quality real-time graphics through a simple JavaScript/TypeScript package.
 
-**Status: rendering and geometry experiments.** The package initializes WebGPU and a Rust/WASM worker, renders diffuse or textured PBR scenes, and records CPU/GPU telemetry. Directional shadows, temporal anti-aliasing and bounded static-terrain streaming are implemented. The terrain prototype includes a Rust cooker, GPU LOD selection and conventional mesh comparisons; it does not yet handle arbitrary imported meshes. Indirect lighting and the editor remain planned. No npm package has been published and the final graphics performance target remains unverified.
+**Status: rendering, geometry and lighting experiments.** The package initializes WebGPU and a Rust/WASM worker, renders diffuse or textured PBR scenes, and records CPU/GPU telemetry. Directional shadows, temporal anti-aliasing and bounded static-terrain streaming are implemented. The terrain prototype includes a Rust cooker, GPU LOD selection and conventional mesh comparisons; it does not yet handle arbitrary imported meshes. A separate two-room experiment adds one-bounce world-space diffuse GI through software BVH tracing and a budgeted probe cache. General scene integration, reflections and the editor remain planned. No npm package has been published and the final graphics performance target remains unverified.
 
 ## Try the foundation
 
@@ -19,6 +19,8 @@ Open `http://127.0.0.1:4173` in a browser with WebGPU. The example uses the buil
 See [the runtime guide](docs/runtime.md) for the API, packaging, ownership, device loss, and validation commands. The API is experimental; TypeScript declarations currently target TypeScript 7+.
 
 Run `npm run benchmark` for the hardware browser baseline or read [the benchmark protocol](docs/benchmark.md). Results and captures remain outside the repository. See [the raster guide](docs/raster.md) for PBR and [the virtual geometry guide](docs/virtual-geometry.md) for cooking, streaming and comparisons.
+
+For the procedural lighting experiment, run `npm run benchmark -- --renderer gi` or see [the GI guide](docs/gi.md) for offscreen color transfer, door/light controls, quality budgets and limitations. The geometry and lighting experiments currently use different scenes.
 
 ## Product requirements
 

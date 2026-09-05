@@ -70,6 +70,20 @@ function fixture() {
 }
 
 describe('bounded GPU timestamps', () => {
+  it('preserves overlapping intervals and scheduling order independently of pass sums', async () => {
+    const f = fixture();
+    const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
+    const slot = profiler.begin(1, ['compute', 'raster', 'presentation'])!;
+    const origin = 9_000_000_000_000_000_000n;
+    f.buffers[1]!.data.set([origin + 2_000_000n, origin + 5_000_000n,
+      origin, origin + 4_000_000n, origin + 3_000_000n, origin + 6_000_000n]);
+    profiler.submitted(slot); f.buffers[1]!.mapping.resolve(); await profiler.flush();
+    const timings = profiler.drain();
+    expect(timings.map(timing => [timing.startOffsetMs, timing.endOffsetMs])).toEqual([[2, 5], [0, 4], [3, 6]]);
+    expect(timings.reduce((sum, timing) => sum + timing.gpuMs, 0)).toBe(10);
+    expect(Math.max(...timings.map(timing => timing.endOffsetMs!))).toBe(6);
+    profiler.dispose();
+  });
   it('keeps frame identity with asynchronous completions and drops busy-ring samples without allocating', async () => {
     const f = fixture();
     const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 2);
@@ -88,7 +102,7 @@ describe('bounded GPU timestamps', () => {
     f.buffers[1]!.mapping.resolve();
     await profiler.flush();
     expect(profiler.drain()).toEqual([
-      { frameId: 11, pass: 'raster', gpuMs: 2.5 }, { frameId: 10, pass: 'raster', gpuMs: 2.5 },
+      { frameId: 11, pass: 'raster', gpuMs: 2.5, startOffsetMs: 0, endOffsetMs: 2.5 }, { frameId: 10, pass: 'raster', gpuMs: 2.5, startOffsetMs: 0, endOffsetMs: 2.5 },
     ]);
     expect(profiler.pendingSamples).toBe(0);
     expect(profiler.droppedSamples).toBe(1);
@@ -105,7 +119,7 @@ describe('bounded GPU timestamps', () => {
     await profiler.flush();
     profiler.submitted(profiler.begin(2, 'clear')!);
     await profiler.flush();
-    expect(profiler.drain()).toEqual([{ frameId: 2, pass: 'clear', gpuMs: 0 }]);
+    expect(profiler.drain()).toEqual([{ frameId: 2, pass: 'clear', gpuMs: 0, startOffsetMs: 0, endOffsetMs: 0 }]);
     expect(profiler.droppedSamples).toBe(1);
     profiler.dispose();
   });
@@ -188,10 +202,10 @@ describe('bounded GPU timestamps', () => {
     f.buffers[1]!.mapping.resolve();
     await profiler.flush();
     expect(profiler.drain()).toEqual([
-      { frameId: 7, pass: 'shadow', gpuMs: 1 },
-      { frameId: 7, pass: 'raster', gpuMs: 2 },
-      { frameId: 7, pass: 'temporal', gpuMs: 0 },
-      { frameId: 7, pass: 'presentation', gpuMs: 0.5 },
+      { frameId: 7, pass: 'shadow', gpuMs: 1, startOffsetMs: 0, endOffsetMs: 1 },
+      { frameId: 7, pass: 'raster', gpuMs: 2, startOffsetMs: 2, endOffsetMs: 4 },
+      { frameId: 7, pass: 'temporal', gpuMs: 0, startOffsetMs: 5, endOffsetMs: 5 },
+      { frameId: 7, pass: 'presentation', gpuMs: 0.5, startOffsetMs: 6, endOffsetMs: 6.5 },
     ]);
     const withoutTemporal = profiler.begin(8, ['shadow', 'raster', 'presentation'])!;
     expect(withoutTemporal.timestamps.temporal).toBeUndefined();
@@ -302,7 +316,7 @@ describe('engine telemetry and scene ownership', () => {
     expect(f.encoder.beginRenderPass).toHaveBeenCalledWith(expect.objectContaining({ timestampWrites: expect.any(Object) }));
     f.buffers[1]!.mapping.resolve();
     await engine.flushGpuTimings();
-    expect(engine.drainGpuTimings()).toEqual([{ frameId: 1, pass: 'clear', gpuMs: 2.5 }]);
+    expect(engine.drainGpuTimings()).toEqual([{ frameId: 1, pass: 'clear', gpuMs: 2.5, startOffsetMs: 0, endOffsetMs: 2.5 }]);
   });
 
   it('measures CPU submission separately and returns an abandoned timestamp slot after a failed frame', async () => {

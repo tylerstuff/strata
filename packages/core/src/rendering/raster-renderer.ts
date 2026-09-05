@@ -8,6 +8,7 @@ import { presentationShader, rasterShader } from './raster-shaders.js';
 import { TemporalResolve } from './temporal-resolve.js';
 import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from './raster-types.js';
 import type { RasterGeometryProvider } from './geometry-provider.js';
+import type { RasterGiProvider } from './gi-provider.js';
 
 const bufferUsage = { copyDestination: 0x8, index: 0x10, vertex: 0x20, uniform: 0x40 };
 const textureUsage = { copyDestination: 0x2, binding: 0x4, attachment: 0x10 };
@@ -15,7 +16,7 @@ const shadowSize = 2048;
 const materialSize = 64;
 const frameUniformBytes = 352;
 const presentationUniformBytes = 16;
-const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage'] as const;
+const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility'] as const;
 
 export function normalizeRasterControls(controls: RasterControls = {}): Required<RasterControls> {
   if (!controls || typeof controls !== 'object'
@@ -84,9 +85,10 @@ export class RasterRenderer {
     private readonly instanceCount: number,
     private readonly halfExtent: number,
     private readonly geometry?: RasterGeometryProvider,
+    private readonly gi?: RasterGiProvider,
   ) { this.lightMatrix = geometry?.lightMatrix ?? createLightMatrix(halfExtent); }
 
-  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider): Promise<RasterRenderer> {
+  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider, gi?: RasterGiProvider): Promise<RasterRenderer> {
     const data = geometry ? undefined : buildProceduralScene(options);
     if (device.limits.maxTextureDimension2D < shadowSize) {
       throw new StrataError('UNSUPPORTED_LIMIT', `Raster shadows require ${shadowSize}-pixel textures.`);
@@ -125,7 +127,7 @@ export class RasterRenderer {
         device.createRenderPipelineAsync({
           label: 'Strata PBR MRT pipeline', layout: 'auto',
           vertex: { module, entryPoint: geometry?.vertexEntryPoint ?? 'vertexMain', buffers: geometry ? geometry.vertexBuffers ?? [] : vertexBuffers },
-          fragment: { module, entryPoint: 'fragmentMain', targets: [
+          fragment: { module, entryPoint: geometry?.fragmentEntryPoint ?? 'fragmentMain', targets: [
             { format: 'rgba16float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }, { format: 'rgba16float' },
           ] },
           primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
@@ -167,8 +169,10 @@ export class RasterRenderer {
         entries: [{ binding: 0, resource: { buffer: frameUniform } }] });
       const rasterBindings = device.createBindGroup({ label: 'Strata PBR materials and light', layout: rasterPipeline.getBindGroupLayout(0), entries: [
         { binding: 0, resource: { buffer: frameUniform } },
-        { binding: 1, resource: baseTexture.createView() }, { binding: 2, resource: mrTexture.createView() },
-        { binding: 3, resource: materialSampler }, { binding: 4, resource: shadowView }, { binding: 5, resource: shadowSampler },
+        ...(geometry?.usesMaterialTextures === false ? [] : [
+          { binding: 1, resource: baseTexture.createView() }, { binding: 2, resource: mrTexture.createView() },
+          { binding: 3, resource: materialSampler },
+        ]), { binding: 4, resource: shadowView }, { binding: 5, resource: shadowSampler },
       ] });
       temporal = await TemporalResolve.create(device);
       geometry?.attachPipelines(rasterPipeline, shadowPipeline);
@@ -178,7 +182,7 @@ export class RasterRenderer {
         shadowView, shadowBindings, rasterBindings, rasterPipeline, shadowPipeline, presentationPipeline,
         bufferBytes: geometryBytes + frameUniformBytes + presentationUniformBytes,
         initialUploadBytes: geometryBytes + material.baseColor.byteLength + material.metallicRoughness.byteLength,
-      }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry);
+      }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry, gi);
     } catch (cause) {
       temporal?.dispose();
       for (const resource of [...buffers, ...textures]) resource.destroy();
@@ -186,28 +190,33 @@ export class RasterRenderer {
     }
   }
 
-  get initialUploadBytes(): number { return this.resources.initialUploadBytes + this.temporal.initialUploadBytes + (this.geometry?.initialUploadBytes ?? 0); }
-  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes + (this.geometry?.gpuBufferBytes ?? 0); }
+  get initialUploadBytes(): number { return this.resources.initialUploadBytes + this.temporal.initialUploadBytes + (this.geometry?.initialUploadBytes ?? 0) + (this.gi?.initialUploadBytes ?? 0); }
+  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes + (this.geometry?.gpuBufferBytes ?? 0) + (this.gi?.gpuBufferBytes ?? 0); }
   get gpuTextureBytes(): number {
     if (this.disposed) return 0;
     return shadowSize * shadowSize * 4 + materialSize * materialSize * 8
-      + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes;
+      + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes + (this.gi?.gpuTextureBytes ?? 0);
   }
   get allocatedBytes(): number { return this.gpuBufferBytes + this.gpuTextureBytes; }
   /** Internal views remain owned by this renderer and expire on resize/disposal. */
   get outputs(): RasterOutputs | undefined { return this.targets?.views; }
+  /** Internal diagnostic readback only. The texture expires on resize/disposal. */
+  get directTexture(): GPUTexture | undefined { return this.targets?.textures[0]; }
 
   passNames(controls: RasterControls = {}): readonly RasterPassName[] {
     const geometryPass: RasterPassName[] = this.geometry?.selectionPass ? ['selection'] : [];
-    return normalizeRasterControls(controls).temporal
-      ? [...geometryPass, 'shadow', 'raster', 'temporal', 'presentation'] : [...geometryPass, 'shadow', 'raster', 'presentation'];
+    return [
+      ...(this.gi?.active ? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, 'shadow', 'raster',
+      ...(this.gi?.active ? ['gi-shade'] as const : []),
+      ...(normalizeRasterControls(controls).temporal ? ['temporal'] as const : []), 'presentation',
+    ];
   }
 
   private resize(width: number, height: number): Targets {
     if (this.targets?.width === width && this.targets.height === height) return this.targets;
     const textures: GPUTexture[] = [];
     const make = (label: string, format: GPUTextureFormat): GPUTextureView => {
-      const texture = this.device.createTexture({ label, size: [width, height], format, usage: textureUsage.binding | textureUsage.attachment });
+      const texture = this.device.createTexture({ label, size: [width, height], format, usage: textureUsage.binding | textureUsage.attachment | 0x1 });
       textures.push(texture);
       return texture.createView();
     };
@@ -247,15 +256,17 @@ export class RasterRenderer {
     const previous = reset ? camera : this.previousCamera ?? camera;
     const previousTime = reset ? timeSeconds : this.previousState?.time ?? timeSeconds;
     const targets = this.resize(width, height);
+    const giPrepared = this.gi?.active ? this.gi.prepare(encoder, camera, width, height, timeSeconds, timestamps) : undefined;
     const prepared = this.geometry?.prepare(encoder, camera, width, height, reset, settings, timestamps.selection);
     const frameData = new Float32Array(frameUniformBytes / 4);
     frameData.set(camera.viewProjection, 0); frameData.set(previous.viewProjection, 16);
     frameData.set(camera.view, 32); frameData.set(previous.view, 48);
     frameData.set(this.lightMatrix, 64); frameData.set([...camera.eye, timeSeconds], 80);
-    frameData.set([previousTime, camera.far, Math.max(0, debugViews.indexOf(settings.debugView) - 6), 0], 84);
+    const debugIndex = debugViews.indexOf(settings.debugView);
+    frameData.set([previousTime, camera.far, debugIndex >= 7 && debugIndex <= 10 ? debugIndex - 6 : 0, 0], 84);
     this.device.queue.writeBuffer(this.resources.frameUniform, 0, frameData);
     const presentationData = new ArrayBuffer(presentationUniformBytes);
-    new Uint32Array(presentationData)[0] = debugViews.indexOf(settings.debugView);
+    new Uint32Array(presentationData).set([debugIndex, this.gi?.active ? 1 : 0]);
     new Float32Array(presentationData).set([camera.far, 1], 2);
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
     const drawGeometry = (pass: GPURenderPassEncoder, pipeline: GPURenderPipeline, bindings: GPUBindGroup): void => {
@@ -281,24 +292,31 @@ export class RasterRenderer {
     drawGeometry(raster, this.resources.rasterPipeline, this.resources.rasterBindings);
     let resolved = targets.views.hdr;
     let drawCalls = (prepared?.drawCalls ?? 2) + 1;
-    let dispatchCalls = prepared?.dispatchCalls ?? 0;
-    let uploadBytes = frameUniformBytes + presentationUniformBytes + (prepared?.uploadBytes ?? 0);
+    let dispatchCalls = (prepared?.dispatchCalls ?? 0) + (giPrepared?.dispatchCalls ?? 0);
+    let uploadBytes = frameUniformBytes + presentationUniformBytes + (prepared?.uploadBytes ?? 0) + (giPrepared?.uploadBytes ?? 0);
     let triangles = (prepared?.triangles ?? this.instanceCount * 24) + 1;
+    if (this.gi?.active) {
+      const composed = this.gi.compose(encoder, targets.views, camera, width, height, timeSeconds, settings, timestamps);
+      resolved = composed.view; dispatchCalls += composed.dispatchCalls; uploadBytes += composed.uploadBytes;
+    }
+    const unfiltered = resolved;
     if (settings.temporal) {
-      const temporal = this.temporal.encode(encoder, { hdr: targets.views.hdr, motion: targets.views.motion }, width, height,
+      const temporal = this.temporal.encode(encoder, { hdr: resolved, motion: targets.views.motion }, width, height,
         this.historyReady && !reset, timestamps.temporal);
       resolved = temporal.view;
       drawCalls += temporal.drawCalls; dispatchCalls += temporal.dispatchCalls; uploadBytes += temporal.uploadBytes;
       triangles += temporal.drawCalls;
     }
-    let bindings = this.presentationBindings.get(resolved);
+    // World-cache diagnostics must remain current even when the caller enables TAA.
+    const presented = debugIndex >= 11 ? unfiltered : resolved;
+    let bindings = this.presentationBindings.get(presented);
     if (!bindings) {
       bindings = this.device.createBindGroup({ label: 'Strata presentation views', layout: this.resources.presentationPipeline.getBindGroupLayout(0), entries: [
-        { binding: 0, resource: { buffer: this.resources.presentationUniform } }, { binding: 1, resource: resolved },
+        { binding: 0, resource: { buffer: this.resources.presentationUniform } }, { binding: 1, resource: presented },
         { binding: 2, resource: targets.views.hdr }, { binding: 3, resource: targets.views.normal },
         { binding: 4, resource: targets.views.material }, { binding: 5, resource: targets.views.motion },
       ] });
-      this.presentationBindings.set(resolved, bindings);
+      this.presentationBindings.set(presented, bindings);
     }
     const presentation = encoder.beginRenderPass({ label: 'Strata tone mapping and debug presentation',
       colorAttachments: [{ view: target, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
@@ -314,6 +332,7 @@ export class RasterRenderer {
     this.disposed = true;
     this.temporal.dispose();
     this.geometry?.dispose();
+    this.gi?.dispose();
     for (const resource of [...this.resources.buffers, ...this.resources.textures, ...(this.targets?.textures ?? [])]) resource.destroy();
     this.targets = undefined;
     this.previousCamera = undefined;

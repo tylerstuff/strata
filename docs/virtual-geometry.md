@@ -53,7 +53,7 @@ GPU counters are delayed. Their `sourceFrameId` explicitly identifies the measur
 
 ## Local measurements
 
-The [M2 comparison](benchmarks/2026-09-05-m2-geometry.md) records the first matched conventional/resident/streamed runs. Streaming lowers tracked buffer memory and CPU submission cost, but adds GPU overhead and misses requested detail in 16.47% of sampled frames. Complete coarse coverage is validated separately from refinement quality.
+The [M2 comparison](benchmarks/2026-09-05-m2-geometry.md) records the first matched conventional/resident/streamed runs. Streaming lowers tracked buffer memory and CPU submission cost, but increases the sum of overlapping GPU pass intervals and misses requested detail in 16.47% of sampled frames. Complete coarse coverage is validated separately from refinement quality.
 
 Cook externally using the command in [geometry-format.md](geometry-format.md), then run:
 

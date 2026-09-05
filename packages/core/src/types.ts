@@ -4,12 +4,15 @@ export type { RasterControls } from './rendering/raster-types.js';
 import type { RasterControls } from './rendering/raster-types.js';
 export type { VirtualSceneOptions, GeometryTelemetry, GeometryMode } from './geometry/virtual-types.js';
 import type { VirtualSceneOptions, GeometryTelemetry } from './geometry/virtual-types.js';
+export type { GiSceneOptions, GiControls, GiTelemetry } from './gi/gi-types.js';
+import type { GiSceneOptions, GiControls, GiTelemetry } from './gi/gi-types.js';
 
-export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions;
+export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions;
 
 export interface RenderOptions extends RasterControls {
   /** Deterministic scene time, independent of wall-clock scheduling. */
   timeSeconds?: number;
+  gi?: GiControls;
 }
 
 export interface CreateEngineOptions {
@@ -71,6 +74,7 @@ export interface FrameMetrics {
   /** Virtual geometry counts are delayed; this identifies their GPU feedback frame. */
   readonly triangleCountSourceFrameId?: number | null;
   readonly geometry?: GeometryTelemetry;
+  readonly gi?: GiTelemetry;
   readonly uploadBytes: number;
   readonly allocatedGpuBufferBytes: number;
   /** Texture payload estimates exclude canvas/driver allocations and alignment. */
@@ -83,6 +87,9 @@ export interface GpuTiming {
   readonly pass: string;
   /** One named pass duration, excluding between-pass gaps and display scanout; may be quantized to zero. */
   readonly gpuMs: number;
+  /** Pass boundaries relative to the earliest recorded boundary in this frame; passes may overlap. */
+  readonly startOffsetMs?: number;
+  readonly endOffsetMs?: number;
 }
 
 export interface EngineTelemetry {
@@ -99,6 +106,7 @@ export interface EngineTelemetry {
   /** Most recent uncaptured GPU error, capped at 2048 characters. */
   readonly lastGpuError: string | null;
   readonly geometry?: GeometryTelemetry;
+  readonly gi?: GiTelemetry;
 }
 
 export interface Engine {

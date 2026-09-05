@@ -24,6 +24,9 @@ await build({
   entryPoints: ['packages/core/src/index.ts', 'packages/core/src/worker.ts'],
   outdir: fileURLToPath(dist),
   bundle: true,
+  splitting: true,
+  // Keep every chunk beside worker.js/WASM so module-relative asset URLs stay valid.
+  chunkNames: '[name]-[hash]',
   format: 'esm',
   platform: 'browser',
   target: 'es2022',

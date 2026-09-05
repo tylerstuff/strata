@@ -10,7 +10,20 @@
       header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 12px; }
       h1 { margin: 0; font-size: 22px; margin-right: auto; }
       select, button, input[type="text"] { background: #263447; border: 1px solid #506579; color: inherit; padding: 8px 14px; border-radius: 6px; font: inherit; }
-      #geometry { margin-bottom: 12px; } #geometry label { display: inline-flex; gap: 8px; align-items: center; margin: 8px 12px 8px 0; }
+      [hidden] { display: none !important; }
+      .settings-panel { margin: 0 0 14px; padding: 14px 16px; border: 1px solid #35475d; border-radius: 8px; background: #111c2b; max-width: 1246px; }
+      .settings-row { display: flex; flex-wrap: wrap; align-items: end; gap: 14px 20px; }
+      .settings-row > label { display: grid; gap: 6px; font-size: 13px; color: #b9c9df; }
+      .settings-row > label.toggle { display: flex; align-items: center; align-self: center; gap: 8px; font-size: 15px; color: #e6edf7; }
+      input[type="checkbox"] { accent-color: #86d4c2; }
+      select:disabled { opacity: .5; }
+      summary { cursor: pointer; }
+      .settings-panel details { margin-top: 12px; }
+      .settings-panel details .settings-row { margin-top: 12px; }
+      .settings-panel p { margin: 10px 0 0; line-height: 1.5; }
+      #geometry label { display: inline-flex; gap: 8px; align-items: center; margin: 8px 12px 8px 0; }
+      .control-note { margin: 0 0 12px; }
+      @media (max-width: 640px) { body { padding: 12px; } header { gap: 10px; } h1 { width: 100%; } select { max-width: 100%; } .settings-row > label { flex: 1 1 170px; } }
       #manifest { width: min(60vw, 620px); }
       button { cursor: pointer; } button:disabled { opacity: .45; }
       canvas { display: block; width: min(100%, 1280px); aspect-ratio: 16 / 9; background: #101927; }
@@ -22,20 +35,57 @@
   <body>
     <header>
       <h1>Strata / Renderer</h1>
-      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option><option value="virtual">Cooked terrain</option></select>
-      <select id="debug" aria-label="Rendering view"><option value="final">Final</option><option value="direct">Direct light</option><option value="shadow">Shadows</option><option value="depth">Depth</option><option value="normal">Normals</option><option value="motion">Motion</option><option value="material">Materials</option><option value="clusters">Clusters</option><option value="lod">LOD</option><option value="residency">Residency</option><option value="coverage">Coverage</option></select>
+      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option><option value="virtual">Cooked terrain</option><option value="gi">World-space GI · two rooms</option></select>
+      <select id="debug" aria-label="Rendering view">
+        <option value="final">Final</option>
+        <optgroup label="Scene views" data-renderers="raster virtual gi">
+          <option value="direct">Direct light</option><option value="shadow">Shadows</option><option value="depth">Depth</option><option value="normal">Normals</option><option value="motion">Motion</option><option value="material">Materials</option>
+        </optgroup>
+        <optgroup label="Terrain views" data-renderers="virtual">
+          <option value="clusters">Clusters</option><option value="lod">LOD</option><option value="residency">Residency</option><option value="coverage">Coverage</option>
+        </optgroup>
+        <optgroup label="Global illumination views" data-renderers="gi">
+          <option value="indirect">Indirect light only · ×20 display</option><option value="trace">Tracing geometry</option><option value="probe-age">Probe freshness</option><option value="probe-irradiance">Probe irradiance</option><option value="probe-visibility">Probe visibility</option>
+        </optgroup>
+      </select>
       <label><input id="temporal" type="checkbox" checked> Temporal AA</label>
       <select id="resolution" aria-label="Internal render resolution"><option value="1280x720">1280 × 720</option><option value="1920x1080">1920 × 1080</option></select>
       <button id="start">Run benchmark</button>
       <button id="download" disabled>Save results</button>
     </header>
-    <details id="geometry">
+    <p class="control-note">Settings apply when you start the next benchmark.</p>
+    <section id="gi-controls" class="settings-panel" aria-label="Global illumination settings" hidden>
+      <div class="settings-row">
+        <label class="toggle"><input id="gi-enabled" type="checkbox" checked> Diffuse GI</label>
+        <label>Camera
+          <select id="gi-camera"><option value="receiver">Receiver room</option><option value="overview" selected>Whole scene</option><option value="tour">Receiver tour</option></select>
+        </label>
+        <label>Lighting scenario
+          <select id="gi-scenario"><option value="static">Static lighting</option><option value="door-light">Door and light changes</option></select>
+        </label>
+      </div>
+      <p>Compare light bouncing from the colored wall with direct lighting. Switch Diffuse GI off for the direct-light baseline.</p>
+      <p id="gi-scenario-note">The door stays open and the light stays fixed.</p>
+      <details>
+        <summary>GI quality and update budget</summary>
+        <div class="settings-row">
+          <label>Probes per frame
+            <select id="gi-probes"><option value="16">16</option><option value="32" selected>32 · default</option><option value="64">64</option><option value="128">128</option></select>
+          </label>
+          <label>Rays per probe
+            <select id="gi-rays"><option value="16">16</option><option value="32">32</option><option value="64" selected>64 · default</option><option value="128">128</option></select>
+          </label>
+        </div>
+        <p id="gi-budget-note">2,048 primary rays and up to 2,048 shadow rays per frame. A complete probe sweep takes 12 frames.</p>
+      </details>
+    </section>
+    <details id="geometry" class="settings-panel" hidden>
       <summary>Cooked terrain settings</summary>
       <label>Manifest URL <input id="manifest" type="text" value="/external-assets/terrain-v1-s1337-t8-c128/manifest.json"></label>
       <label>Geometry <select id="geometry-mode"><option value="streamed">Streamed · 8 MiB pool</option><option value="resident-lod">Resident GPU LOD</option><option value="resident-full">Resident finest</option><option value="mesh-lod">Conventional mesh LOD</option></select></label>
       <p>Serve locally cooked data through STRATA_BENCHMARK_ASSET_DIR. The terrain tour uses a 2-pixel error target. Results record the achieved error while pages are missing.</p>
     </details>
-    <canvas width="1280" height="720" aria-label="Deterministic procedural benchmark scene"></canvas>
+    <canvas width="1280" height="720" aria-label="Strata real-time renderer benchmark"></canvas>
     <output role="status">Ready. The default run warms up for 30 seconds, then measures for 60 seconds.</output>
     <p>Keep this tab visible. Results describe this scene and hardware; advanced rendering and the final performance target remain under development.</p>
     <script type="module" src="/benchmarks/browser/app.js"></script>

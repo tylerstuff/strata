@@ -1,10 +1,12 @@
 import { createEngine, type Engine } from '@strata-engine/core';
 import { distribution, normalizeOptions, summarizeFrames, type BenchmarkOptions, type FrameSample } from './metrics.js';
+import { initializeBenchmarkControls, readGiBenchmarkControls } from './ui-controls.js';
 
 const canvas = document.querySelector<HTMLCanvasElement>('canvas')!;
 const status = document.querySelector<HTMLOutputElement>('output')!;
 const startButton = document.querySelector<HTMLButtonElement>('#start')!;
 const downloadButton = document.querySelector<HTMLButtonElement>('#download')!;
+initializeBenchmarkControls();
 let engine: Engine | undefined;
 let running = false;
 let lastResult: unknown;
@@ -37,7 +39,10 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
     await engine.setScene(options.renderer === 'virtual' ? {
       renderer: 'virtual', manifestUrl: options.manifestUrl!, geometryMode: options.geometryMode,
       poolBytes: options.poolBytes, pixelError: options.pixelError,
-      pageLoadDelayMs: options.pageLoadDelayMs, cameraMode: options.cameraMode,
+      pageLoadDelayMs: options.pageLoadDelayMs, cameraMode: options.cameraMode as 'tour' | 'coverage',
+    } : options.renderer === 'gi' ? {
+      renderer: 'gi', cameraMode: options.cameraMode as 'overview' | 'receiver' | 'tour',
+      probesPerUpdate: options.probesPerUpdate, raysPerProbe: options.raysPerProbe,
     } : { seed: options.seed, instanceCount: options.instanceCount, renderer: options.renderer });
     const compiledAt = performance.now();
     if (engine.info.adapter.isFallbackAdapter && options.mode !== 'smoke') {
@@ -62,6 +67,10 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
         if (!sample) continue;
         sample.gpuMs = (sample.gpuMs ?? 0) + timing.gpuMs;
         sample.gpuPasses![timing.pass] = timing.gpuMs;
+        if (timing.startOffsetMs !== undefined && timing.endOffsetMs !== undefined) {
+          sample.gpuPassIntervals![timing.pass] = { startMs: timing.startOffsetMs, endMs: timing.endOffsetMs };
+          sample.gpuSpanMs = Math.max(sample.gpuSpanMs ?? 0, timing.endOffsetMs);
+        }
         const values = capturedTimings.get(timing.pass) ?? [];
         values.push(timing.gpuMs);
         capturedTimings.set(timing.pass, values);
@@ -99,7 +108,10 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
             return;
           }
           const timeSeconds = (timestamp - (measuring ? captureStart : phaseStart)) / 1000;
-          const metrics = engine!.render({ timeSeconds, temporal: options.temporal, debugView: options.debugView });
+          const phase = options.giScenario === 'static' ? 0 : Math.floor(timeSeconds % 60 / 10);
+          const metrics = engine!.render({ timeSeconds, temporal: options.temporal, debugView: options.debugView,
+            ...(options.renderer === 'gi' ? { gi: { enabled: options.giEnabled, doorOpen: phase !== 1, wallColor: phase === 5 ? 'neutral' : 'red', lightIntensity: phase === 3 ? 0.2 : 1 } } : {}),
+          });
           if (measuring) {
             const sample: FrameSample = {
               frameId: metrics.frameId,
@@ -108,11 +120,14 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
               cpuSubmissionMs: metrics.cpuSubmissionMs,
               gpuMs: null,
               gpuPasses: {},
+              gpuSpanMs: null,
+              gpuPassIntervals: {},
               drawCalls: metrics.drawCalls,
               dispatchCalls: metrics.dispatchCalls,
               triangles: metrics.triangles,
               ...(metrics.triangleCountSourceFrameId === undefined ? {} : { triangleCountSourceFrameId: metrics.triangleCountSourceFrameId }),
               ...(metrics.geometry === undefined ? {} : { geometry: metrics.geometry }),
+              ...(metrics.gi === undefined ? {} : { gi: metrics.gi }),
               uploadBytes: metrics.uploadBytes,
               allocatedGpuBufferBytes: metrics.allocatedGpuBufferBytes,
               allocatedGpuTextureBytes: metrics.allocatedGpuTextureBytes,
@@ -136,12 +151,13 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       raf = requestAnimationFrame(frame);
     });
     // Readback is drained after timing, never awaited in the frame loop.
-    await engine.flushGpuTimings();
+    await engine.flushGpuTimings(options.mode === 'smoke' ? 30_000 : undefined);
     collectGpu();
     const finalTelemetry = engine.getTelemetry();
     const summary = summarizeFrames(frames);
     const entries = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
     const virtual = options.renderer === 'virtual';
+    const gi = options.renderer === 'gi';
     const geometry = finalTelemetry.geometry;
     const result = {
       schemaVersion: 1,
@@ -149,18 +165,25 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       completedAt: new Date().toISOString(),
       mode: options.mode,
       workload: {
-        id: virtual ? 'cooked-analytic-terrain-v1' : options.renderer === 'diffuse' ? 'procedural-boxes-v1' : 'procedural-pbr-boxes-v1',
-        seed: virtual ? geometry?.sourceSeed : options.seed, instanceCount: virtual ? 0 : options.instanceCount,
-        cameraPath: virtual ? geometry?.cameraPath : 'orbit-20s-v1',
-        renderPath: virtual ? 'virtual-pbr-shadow-temporal-v1' : options.renderer === 'diffuse' ? 'diffuse-raster-v1' : 'pbr-shadow-temporal-v1',
+        id: gi ? 'two-room-software-gi-v1' : virtual ? 'cooked-analytic-terrain-v1' : options.renderer === 'diffuse' ? 'procedural-boxes-v1' : 'procedural-pbr-boxes-v1',
+        seed: virtual ? geometry?.sourceSeed : options.seed, instanceCount: virtual || gi ? 0 : options.instanceCount,
+        cameraPath: gi ? `gi-${options.cameraMode}-v1` : virtual ? geometry?.cameraPath : 'orbit-20s-v1',
+        renderPath: gi ? 'world-space-diffuse-gi-v1' : virtual ? 'virtual-pbr-shadow-temporal-v1' : options.renderer === 'diffuse' ? 'diffuse-raster-v1' : 'pbr-shadow-temporal-v1',
         renderer: options.renderer, temporal: options.renderer !== 'diffuse' && options.temporal, debugView: options.debugView,
         externalAssetsUsed: virtual, ...(virtual ? { geometryMode: options.geometryMode, sourceTriangleCount: geometry?.sourceTriangleCount, uniqueCompiledBytes: geometry?.uniqueCompiledBytes } : {}),
+        ...(gi ? { giEnabled: options.giEnabled, giScenario: options.giScenario, sourceTriangleCount: 132 } : {}),
       },
       quality: options.renderer !== 'diffuse' ? {
-        shadowMapSize: 2048, shadowKernel: '3x3-comparison', materialFixture: virtual ? 'terrain-checker-v1' : 'checker-metal-rough-v1', exposure: 1,
+        shadowMapSize: 2048, shadowKernel: '3x3-comparison', materialFixture: gi ? 'shared-flat-lambertian-v1' : virtual ? 'terrain-checker-v1' : 'checker-metal-rough-v1', exposure: 1,
         temporalFilter: 'depth-qualified-bilinear-clamped-v1', temporalHistoryWeight: 0.9, jitterSequenceLength: 8,
         ...(virtual ? { geometryMode: options.geometryMode, poolBytes: options.poolBytes, pixelError: options.pixelError, pageLoadDelayMs: options.pageLoadDelayMs,
           shadowGeometry: 'selected-visible-lod-and-offscreen-roots', manifestUrl: options.manifestUrl } : {}),
+        ...(gi ? { giEnabled: options.giEnabled, probesPerUpdate: options.probesPerUpdate, raysPerProbe: options.raysPerProbe,
+          traceRepresentation: 'triangle-bvh-v1', grid: [12, 4, 8], maxTraceDistance: 32, screenTracing: false,
+          giScenario: options.giScenario, scenarioPeriodSeconds: 60, events: options.giScenario === 'static' ? [] : [
+            { atSeconds: 10, doorOpen: false }, { atSeconds: 20, doorOpen: true }, { atSeconds: 30, lightIntensity: 0.2 },
+            { atSeconds: 40, lightIntensity: 1 }, { atSeconds: 50, wallColor: 'neutral' },
+          ] } : {}),
       } : { shading: 'diffuse-directional' },
       resolution: { width: options.width, height: options.height, devicePixelRatio, cssWidth: canvas.clientWidth, cssHeight: canvas.clientHeight, screenWidth: screen.width, screenHeight: screen.height },
       capture: { warmupSeconds: options.warmupSeconds, requestedDurationSeconds: options.durationSeconds, actualDurationMs: captureEnd - captureStart, frameCount: frames.length, visibilityChanges },
@@ -181,17 +204,18 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       metadata: options.metadata,
       limitations: [
         'RAF intervals measure browser callback cadence, not scan-out or uncapped GPU throughput.',
-        'GPU pass timestamps exclude presentation and may be quantized by the browser.',
-        virtual ? 'This static analytic terrain tests geometry streaming; it does not validate arbitrary meshes or the integrated graphics target.' : 'This small procedural scene establishes a rendering baseline; it does not validate the final 60 FPS graphics goal.',
+        'GPU pass intervals may overlap; their sum is not elapsed frame time. GPU span covers the earliest to latest recorded pass boundary, including gaps but excluding earlier copies/uploads, browser composition and scan-out.',
+        gi ? 'This flat two-room scene tests one-bounce world-space diffuse GI and discrete changes. It does not validate general scenes or integrated graphics.' : virtual ? 'This static analytic terrain tests geometry streaming; it does not validate arbitrary meshes or the integrated graphics target.' : 'This small procedural scene establishes a rendering baseline; it does not validate the final 60 FPS graphics goal.',
         'No Sketchfab models are loaded, copied, or uploaded by this run.',
         ...(virtual ? ['Triangle and GPU selection counters describe their explicit sourceFrameId, which can lag the submitted frame. Missing counters stay labelled null.'] : []),
+        ...(gi ? ['Named pass sums exclude between-pass work, including atlas preservation copies. Use GI-on/off callback and submission measurements alongside pass sums.', 'Disabling GI pauses its work but retains the scene-owned trace/cache allocations.'] : []),
       ],
       frames,
     };
     lastResult = result;
     lastOptions = options;
     downloadButton.disabled = false;
-    status.textContent = `Complete · ${summary.meanCallbackCadenceFps?.toFixed(1) ?? 'unavailable'} callback FPS · p95 ${summary.frameIntervalMs.p95?.toFixed(2) ?? 'unavailable'} ms · GPU p95 ${summary.gpuPassMs.p95?.toFixed(3) ?? 'unavailable'} ms`;
+    status.textContent = `Complete · ${summary.meanCallbackCadenceFps?.toFixed(1) ?? 'unavailable'} callback FPS · p95 ${summary.frameIntervalMs.p95?.toFixed(2) ?? 'unavailable'} ms · GPU span p95 ${summary.gpuSpanMs.p95?.toFixed(3) ?? 'unavailable'} ms`;
     return result;
   } catch (error) {
     engine?.dispose();
@@ -206,13 +230,17 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
 
 async function capture(timeSeconds = 0, debugView = lastOptions?.debugView ?? 'final') {
   if (running || !engine) throw new Error('Capture imagery only after a benchmark completes.');
-  engine.render({ timeSeconds, temporal: lastOptions?.temporal ?? true, debugView, cameraCut: true });
+  engine.render({ timeSeconds, temporal: lastOptions?.temporal ?? true, debugView, cameraCut: true,
+    ...(lastOptions?.renderer === 'gi' ? { gi: { enabled: lastOptions.giEnabled, doorOpen: true, wallColor: 'red', lightIntensity: 1, resetCache: true } } : {}),
+  });
   await nextFrame();
   // Accumulate a fixed number of held-time frames after the single reset.
-  for (let frame = 0; frame < 8; frame++) {
+  const settleFrames = lastOptions?.mode !== 'smoke' && lastOptions?.renderer === 'gi' && lastOptions.giEnabled ? 240 : 8;
+  for (let frame = 0; frame < settleFrames; frame++) {
     engine.render({ timeSeconds: timeSeconds + (debugView === 'motion' ? (frame + 1) / 60 : 0), temporal: lastOptions?.temporal ?? true, debugView });
     await nextFrame();
   }
+  return { settleFrames };
 }
 
 declare global {
@@ -229,7 +257,9 @@ startButton.addEventListener('click', () => {
   const temporal = document.querySelector<HTMLInputElement>('#temporal')!.checked;
   const manifestUrl = document.querySelector<HTMLInputElement>('#manifest')!.value;
   const geometryMode = document.querySelector<HTMLSelectElement>('#geometry-mode')!.value as BenchmarkOptions['geometryMode'];
-  void run({ width: width!, height: height!, renderer, debugView, temporal, manifestUrl, geometryMode }).catch(error => { status.textContent = String(error); });
+  void run({ width: width!, height: height!, renderer, debugView, temporal, manifestUrl, geometryMode,
+    ...(renderer === 'gi' ? readGiBenchmarkControls() : {}),
+  }).catch(error => { status.textContent = String(error); });
 });
 downloadButton.addEventListener('click', () => {
   const url = URL.createObjectURL(new Blob([JSON.stringify(lastResult, null, 2)], { type: 'application/json' }));
