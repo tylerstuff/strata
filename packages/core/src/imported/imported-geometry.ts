@@ -376,7 +376,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     return this.materials.map(m => this.device.createBindGroup({ label: 'Strata imported material bindings', layout: pipeline.getBindGroupLayout(1), entries: shadow ? [
       { binding: 0, resource: { buffer: m.buffer } }, { binding: 1, resource: m.textures[0]!.createView() }, { binding: 2, resource: m.samplers[0]! },
     ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } },
-      { binding: 12, resource: this.environment.cube.createView({ dimension: 'cube-array', arrayLayerCount: 12 }) },
+      { binding: 12, resource: this.environment.cube.createView({ dimension: '2d-array', arrayLayerCount: 12 }) },
       { binding: 13, resource: this.environment.dfg.createView() }, { binding: 14, resource: this.environment.sampler },
       { binding: 15, resource: { buffer: this.environment.uniform } }] }));
   }
