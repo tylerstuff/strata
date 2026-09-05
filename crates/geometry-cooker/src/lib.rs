@@ -1,3 +1,4 @@
+mod certified_lod;
 mod hash;
 mod trace_proxy;
 pub use trace_proxy::{CookedTraceProxy, cook_trace_proxy, write_trace_proxy};
@@ -11,6 +12,25 @@ use std::path::Path;
 pub const PAGE_BYTES: usize = 65536;
 const CLUSTER_TRIANGLES: usize = 128;
 const HESSIAN_BOUND: f64 = 0.07;
+
+/// Opt-in recipes keep existing cooked asset identities unchanged by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LodProfile {
+    #[default]
+    Legacy,
+    Certified,
+}
+impl LodProfile {
+    fn steps(self, config: Config) -> Vec<usize> {
+        match self {
+            Self::Legacy => config.steps(),
+            Self::Certified => [1, 2, 4, 8, 16, 32, 64, 128]
+                .into_iter()
+                .filter(|step| *step <= config.cells)
+                .collect(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -232,8 +252,17 @@ pub struct Cooked {
 }
 
 pub fn cook(config: Config) -> Result<Cooked, String> {
+    cook_with_profile(config, LodProfile::Legacy)
+}
+
+pub fn cook_with_profile(config: Config, profile: LodProfile) -> Result<Cooked, String> {
     let config = config.validate()?;
-    let steps = config.steps();
+    let steps = profile.steps(config);
+    let certified_errors = if profile == LodProfile::Certified {
+        Some(certified_lod::errors(config, &steps)?)
+    } else {
+        None
+    };
     let mut lods: Vec<Vec<Lod>> = (0..config.tiles * config.tiles)
         .map(|_| (0..steps.len()).map(|_| Lod::default()).collect())
         .collect();
@@ -248,7 +277,9 @@ pub fn cook(config: Config) -> Result<Cooked, String> {
             let lod = &mut tile_lods[level];
             // Taylor interpolation bound: M/2 * barycentric variance, <= M*d²/6.
             // Fan-triangle diameter <= step; finest triangles add M/3. Margin covers f32 heights.
-            lod.error = if step == 1 {
+            lod.error = if let Some(errors) = &certified_errors {
+                errors[tile][level]
+            } else if step == 1 {
                 0.0
             } else {
                 HESSIAN_BOUND * ((step * step) as f64 / 6.0 + 1.0 / 3.0) + 0.0001
@@ -303,6 +334,11 @@ pub fn cook(config: Config) -> Result<Cooked, String> {
     }
     for page in &mut pages {
         page.sha256 = hash::sha256(&page.bytes);
+    }
+    if pages.len() > 8192 || clusters.len() > 262144 {
+        return Err(
+            "Cooked geometry exceeds the runtime manifest limits; use fewer tiles or cells.".into(),
+        );
     }
     let extent = config.extent() as f32 * 0.5;
     let bounds = Bounds {
@@ -368,7 +404,11 @@ pub fn cook(config: Config) -> Result<Cooked, String> {
         .enumerate()
         .filter_map(|(id, page)| page.pinned.then_some(id))
         .collect();
-    writeln!(json, "],\"rootPageIds\":{roots:?}}}").unwrap();
+    if profile == LodProfile::Certified {
+        writeln!(json, "],\"rootPageIds\":{roots:?},\"cook\":{{\"profile\":\"certified-terrain-v1\",\"lodSteps\":{steps:?},\"errorMetric\":\"max-vertical-to-finest\",\"monotonicEnvelope\":true}}}}").unwrap();
+    } else {
+        writeln!(json, "],\"rootPageIds\":{roots:?}}}").unwrap();
+    }
     Ok(Cooked {
         manifest: json,
         pages,
