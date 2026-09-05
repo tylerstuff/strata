@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createBenchmarkServer } from './benchmark-server.mjs';
+import { createGalleryFixture } from './gallery-fixture.mjs';
 
 const repository = fileURLToPath(new URL('../', import.meta.url));
 
@@ -164,6 +165,44 @@ test('gallery without a configured collection reports an actionable empty state'
     assert.deepEqual(result.assets, []);
     assert.match(result.diagnostics[0], /STRATA_BENCHMARK_ASSET_DIR/);
   } finally { await server.close(); }
+});
+
+test('CI gallery route serves only the bounded temporary generated fixture', async () => {
+  const fixture = await createGalleryFixture();
+  const outside = await mkdtemp(join(tmpdir(), 'strata-gallery-outside-'));
+  const oldCi = process.env.CI;
+  let server;
+  try {
+    process.env.CI = 'true';
+    server = await createBenchmarkServer({ assetRoot: '', galleryFixtureRoot: fixture.directory });
+    const catalog = await (await fetch(`${server.url}/api/gallery/catalog`)).json();
+    assert.equal(catalog.available, true);
+    assert.deepEqual(catalog.assets.map(asset => asset.id), ['fixture-red', 'fixture-green']);
+    assert.deepEqual(catalog.assets.map(asset => asset.entryUrl), ['/procedural-gallery-assets/red.gltf', '/procedural-gallery-assets/green.gltf']);
+    for (const name of ['red.gltf', 'green.gltf', 'scene.bin']) {
+      assert.equal((await fetch(`${server.url}/procedural-gallery-assets/${name}`)).status, 200);
+    }
+    for (const name of ['fixture.json', 'catalog.json', 'private.txt', '%2e%2e%2fprivate.txt']) {
+      assert.equal((await fetch(`${server.url}/procedural-gallery-assets/${name}`)).status, 404);
+    }
+    assert.deepEqual(await (await fetch(`${server.url}/benchmark-config.json`)).json(), { externalAssets: { available: false, catalogUrl: null } });
+    await assert.rejects(createBenchmarkServer({ assetRoot: fixture.directory, galleryFixtureRoot: fixture.directory }), /cannot be combined/);
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', galleryFixtureRoot: tmpdir() }), /dedicated temporary/);
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', galleryFixtureRoot: repository }), /dedicated temporary/);
+    await writeFile(join(outside, 'private.bin'), 'must not be served');
+    await rm(join(fixture.directory, 'scene.bin'));
+    await symlink(join(outside, 'private.bin'), join(fixture.directory, 'scene.bin'));
+    assert.equal((await fetch(`${server.url}/procedural-gallery-assets/scene.bin`)).status, 404);
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', galleryFixtureRoot: fixture.directory }), /contained/);
+    await writeFile(join(fixture.directory, 'fixture.json'), JSON.stringify({ format: 'strata-gallery-fixture', version: 1,
+      source: { kind: 'external-model' }, files: [] }));
+    await assert.rejects(createBenchmarkServer({ assetRoot: '', galleryFixtureRoot: fixture.directory }), /Only the small generated/);
+  } finally {
+    await server?.close();
+    if (oldCi === undefined) delete process.env.CI; else process.env.CI = oldCi;
+    await fixture.dispose();
+    await rm(outside, { recursive: true, force: true });
+  }
 });
 
 test('CI procedural route serves only bounded generated fixture paths with symlink containment', async () => {

@@ -20,7 +20,7 @@ function entryPath(value) {
 }
 
 /** A bounded presentation of local metadata, not proof of renderer support or resource identity. */
-export async function readGalleryCatalog(assetRoot, containedFile) {
+export async function readGalleryCatalog(assetRoot, containedFile, assetPrefix = '/external-assets/') {
   const result = { format: 'strata.gallery.catalog', version: 1, available: false, assets: [], diagnostics: [] };
   if (!assetRoot) {
     result.diagnostics.push('Set STRATA_BENCHMARK_ASSET_DIR to the external local collection, then restart the gallery.');
@@ -57,7 +57,7 @@ export async function readGalleryCatalog(assetRoot, containedFile) {
       id: asset.id, title: text(asset.title, asset.id), category: text(asset.category), benchmarkUse: text(asset.benchmark_use),
       author: text(asset.archive_author_credit), license: text(asset.license),
       sourceUrl: link(asset.source_url), licenseUrl: link(asset.license_url),
-      entryUrl: file ? `/external-assets/${path.split('/').map(encodeURIComponent).join('/')}` : null,
+      entryUrl: file ? `${assetPrefix}${path.split('/').map(encodeURIComponent).join('/')}` : null,
       sourceSha256: typeof asset.recommended_gltf_sha256 === 'string' && /^[a-f0-9]{64}$/i.test(asset.recommended_gltf_sha256)
         ? asset.recommended_gltf_sha256.toLowerCase() : null,
       triangles: count(counts.triangles_stored_mesh_primitives_once), meshCount: count(counts.meshes),
