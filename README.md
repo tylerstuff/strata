@@ -2,7 +2,7 @@
 
 Strata is a browser game engine being designed for high-quality real-time graphics through a simple JavaScript/TypeScript package.
 
-**Status: rendering, geometry and lighting experiments.** The package initializes WebGPU and a Rust/WASM worker, renders diffuse or textured PBR scenes, and records CPU/GPU telemetry. Directional shadows, temporal anti-aliasing and bounded static-terrain streaming are implemented. The terrain prototype includes a Rust cooker, GPU LOD selection and conventional mesh comparisons; it does not yet handle arbitrary imported meshes. A separate two-room experiment adds one-bounce world-space diffuse GI through software BVH tracing and a budgeted probe cache. A selected-mirror experiment adds bounded world-space reflections with an offscreen emissive object and independent reflection history. A restricted courtyard combines streamed terrain, exact room geometry, GI and reflections, with a persistent coarse terrain tracing proxy. General scene authoring remains planned. No npm package has been published. The [first integrated M2 result](docs/benchmarks/2026-09-05-m2-integrated.md) records near-60-Hz callback cadence with occasional GPU-budget misses and substantial visible artifacts; the game-quality performance target is not achieved. Visual stability is the next priority.
+**Status: rendering, geometry and lighting experiments.** The package initializes WebGPU and a Rust/WASM worker, renders diffuse or textured PBR scenes, and records CPU/GPU telemetry. Directional shadows, temporal anti-aliasing and bounded static-terrain streaming are implemented. The terrain prototype includes a Rust cooker, GPU LOD selection and conventional mesh comparisons; it does not yet handle arbitrary imported meshes. A separate two-room experiment adds one-bounce world-space diffuse GI through software BVH tracing and a budgeted probe cache. A selected-mirror experiment adds bounded world-space reflections with an offscreen emissive object and independent reflection history. A restricted courtyard combines streamed terrain, exact room geometry, GI and reflections, with a persistent coarse terrain tracing proxy. Optional [authoring tooling](docs/authoring.md) provides versioned scene documents, typed edits and a CLI. A separate [preview package](docs/preview.md) lowers opaque root boxes into the runtime and records revision-bound browser captures; imported content and general scene authoring remain planned. No npm package has been published. The [first integrated M2 result](docs/benchmarks/2026-09-05-m2-integrated.md) records near-60-Hz callback cadence with occasional GPU-budget misses and substantial visible artifacts; the game-quality performance target is not achieved. Visual stability is the next priority.
 
 ## Try the foundation
 
@@ -28,7 +28,7 @@ For the procedural lighting experiment, run `npm run benchmark -- --renderer gi`
 - Target 60 FPS on a representative laptop GPU, with Switch 2 games as a visual reference. The minimum GPU, browser, resolution, and test scenes still need to be defined and measured.
 - Provide an ergonomic TypeScript API with precompiled Rust/WebAssembly internals and WGSL shaders. Consumers should not need Rust tooling or a custom WASM build step.
 - Initialize WASM and workers through the engine API. Support ordinary hosting without mandatory shared-memory threading or cross-origin-isolation headers.
-- Keep the visual editor separate from the embeddable runtime.
+- Make CLI commands, typed code and local connections the primary authoring interfaces. Keep an optional GUI separate from the embeddable runtime.
 - Develop a custom renderer, combining rasterization with budgeted software-traced indirect lighting and selective reflections. Investigate streamed virtualized geometry through measurable prototypes.
 
 ## Architecture
@@ -38,7 +38,7 @@ For the procedural lighting experiment, run `npm run benchmark -- --renderer gi`
 | Public package, browser integration, and initial WebGPU command submission | TypeScript |
 | Dense CPU engine systems and asset processing | Rust compiled to WebAssembly; reuse suitable existing libraries |
 | Rendering, culling, software ray traversal, and lighting filters | WGSL running through WebGPU |
-| Editor | Separate TypeScript application/package |
+| Agent-driven authoring | Separate Node/TypeScript tools, with an optional GUI |
 
 Read [the architecture brief](docs/architecture.md) for the design boundaries and unresolved questions. Proposed npm names such as `@strata-engine/core` and `@strata-engine/editor` have not been reserved or published.
 
@@ -48,7 +48,7 @@ Read [the architecture brief](docs/architecture.md) for the design boundaries an
 
 1. **M1 — Runtime foundation:** package consumption, the TypeScript/WASM boundary, and performance measurement.
 2. **M2 — Rendering feasibility:** a conventional renderer and measured geometry, lighting, and reflection prototypes.
-3. **M3 — Editor prototype:** an editor that consumes the runtime through supported APIs.
+3. **M3 — Agent-driven authoring:** CLI, typed code and local connections that consume supported runtime APIs; a GUI is optional.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue, pull-request, and validation workflow.
 

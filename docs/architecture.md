@@ -4,7 +4,7 @@ Status: accepted direction. The lifecycle, package and procedural benchmark foun
 
 ## Product boundary
 
-Strata is a standalone browser game engine built from scratch for WebGPU. It is not a Babylon Lite fork or compatibility layer. The engine should provide an integrated runtime for rendering, assets, scenes, animation, input and game systems behind a TypeScript package facade. An optional editor is a separate application using that runtime and its asset tools.
+Strata is a standalone browser game engine built from scratch for WebGPU. It is not a Babylon Lite fork or compatibility layer. The engine should provide an integrated runtime for rendering, assets, scenes, animation, input and game systems behind a TypeScript package facade. Agent-driven authoring uses CLI commands, typed code and local connections as its primary interfaces. An optional GUI is a separate application using the same runtime and asset tools.
 
 The deployment target is the browser. There are no planned native graphics backends or WebGL fallback. WebGPU availability and required device limits must be checked at startup, with a clear unsupported-device result. Hosting should work without mandatory cross-origin isolation or special shared-memory headers.
 
@@ -48,4 +48,4 @@ Begin with a reproducible browser benchmark and a conventional rendering baselin
 
 Record CPU and GPU timings separately where supported, alongside frame-time distributions, memory, upload traffic, startup time and visible artifacts. Declare the device and workload for every performance claim. Retain simpler rendering and lighting modes so experiments can demonstrate their quality and cost against a stable baseline.
 
-Editor work follows usable runtime and asset contracts. The editor may author scenes, inspect assets and launch previews, but games must build and run without it.
+Authoring work follows usable runtime and asset contracts. The optional authoring package supplies versioned documents, typed edits and a CLI; the optional preview package lowers supported opaque root boxes and captures revision-bound browser evidence. General imported content, persistent local connections and a GUI remain future work. These tools may author scenes, inspect assets and launch previews, but games must build and run without them.

@@ -27,6 +27,8 @@ jobs:
       - run: npm ci
       - name: Validate optional authoring package and packed CLI consumer
         run: npm run check:authoring
+      - name: Validate preview lifecycle and packed CPU consumer
+        run: npm run check:preview
       - run: npm run typecheck
       - run: npm run test:rust
       - run: npm run test:unit
