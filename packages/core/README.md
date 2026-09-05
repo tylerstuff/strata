@@ -1,6 +1,6 @@
 # @strata-engine/core
 
-The first Strata runtime package. It initializes a WebGPU canvas and a private Rust/WebAssembly worker, draws a clear frame, and manages resizing and disposal. Scene rendering, virtualized geometry, indirect lighting, and reflections are not implemented yet.
+The experimental Strata browser runtime. It initializes WebGPU and a private Rust/WebAssembly worker, loads authored opaque box scenes, and provides separate procedural PBR, terrain streaming, software GI and selected-reflection experiments. These remain restricted rendering proofs; general imported scenes and game-quality 60 FPS are not established.
 
 This package is currently built and packed from the repository; it has not been published to npm. Its API is experimental.
 
@@ -31,3 +31,5 @@ The package includes compiled WASM and a JavaScript module worker. Consumers nee
 For plain HTML, serve the entire `dist` directory unchanged on the same origin and import `./dist/index.js` from a module script. Use HTTPS or localhost for WebGPU. Ordinary hosting is supported without COOP/COEP headers or shared memory.
 
 See [the runtime guide](https://github.com/tylerstuff/strata/blob/main/docs/runtime.md) for ownership, errors, asset hosting, and device loss.
+
+For explicit geometry, use `setScene({ renderer: 'authored-boxes', scene })` with a validated plain JSON box descriptor. Its returned scene receipt identifies commitment; `render()` returns the identity and effective camera of the submitted frame. See [authored boxes](https://github.com/tylerstuff/strata/blob/main/docs/authored-boxes.md) for the complete example, supported profile and capture semantics. The renderer is loaded on demand and requires no authoring/editor package.

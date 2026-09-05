@@ -1,3 +1,5 @@
+import type { SceneCommitReceipt } from './types.js';
+
 /** Stable failure categories for application-level fallback and error reporting. */
 export type StrataErrorCode =
   | 'WEBGPU_UNAVAILABLE'
@@ -34,5 +36,18 @@ export class StrataError extends Error {
     super(message, options);
     this.name = 'StrataError';
     this.code = code;
+  }
+}
+
+/** Retirement failed after an atomic scene swap; the committed identity remains active. */
+export class SceneCommitError extends StrataError {
+  readonly stage = 'retire' as const;
+  readonly commitOccurred = true;
+  readonly committedScene: SceneCommitReceipt;
+
+  constructor(committedScene: SceneCommitReceipt, cause: unknown) {
+    super('SCENE_LOAD_FAILED', 'The scene committed, but retiring the previous scene failed.', { cause });
+    this.name = 'SceneCommitError';
+    this.committedScene = committedScene;
   }
 }
