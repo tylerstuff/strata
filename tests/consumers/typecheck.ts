@@ -71,12 +71,14 @@ async function lifecycle() {
     const receipt: SceneCommitReceipt = await load;
     const authoredFrame = engine.render({ camera: validateBoxCamera(camera), temporal: false, debugView: 'base-color' });
     const metadata: AuthoredFrameMetadata | undefined = authoredFrame.authored;
+    const previousAuthoredFrame: number | null | undefined = metadata?.motion.previousSubmittedFrameId;
+    const correspondence: boolean | undefined = metadata?.motion.valid;
     const submittedScene: SceneCommitReceipt = authoredFrame.scene;
     const last: number | null = engine.getTelemetry().scene.lastSubmittedFrameId;
     const checkedCamera: BoxCamera = validateAuthoredFrameCamera(boxes, camera, 640, 360);
     // @ts-expect-error setScene returns a receipt even through generic SceneOptions.
     const oldVoidWrapper: Promise<void> = engine.setScene(genericScene);
-    void receipt; void metadata; void submittedScene; void last; void checkedCamera; void oldVoidWrapper;
+    void receipt; void metadata; void previousAuthoredFrame; void correspondence; void submittedScene; void last; void checkedCamera; void oldVoidWrapper;
     await engine.waitForIdle();
     engine.dispose();
     return { abiVersion, memoryBytes, format, state };

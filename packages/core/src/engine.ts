@@ -524,7 +524,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         }
         const effectiveCamera = scene?.kind === 'authored-boxes'
           ? validateAuthoredFrameCamera(scene.descriptor, requestedControls.camera === undefined ? scene.descriptor.camera : requestedControls.camera, canvas.width, canvas.height) : undefined;
-        const controls = forceRasterCameraCut && scene && scene.kind !== 'diffuse'
+        const controls = forceRasterCameraCut && scene && scene.kind !== 'diffuse' && scene.kind !== 'authored-boxes'
           ? { ...requestedControls, cameraCut: true } : requestedControls;
         const timeSeconds = renderOptions?.timeSeconds ?? 0;
         if (!Number.isFinite(timeSeconds)) {
@@ -548,7 +548,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           if (scene?.kind === 'authored-boxes') {
             ({ drawCalls, dispatchCalls, triangles, uploadBytes, authored } = scene.value.encode(
               encoder, view, canvas.width, canvas.height, timeSeconds,
-              { camera: effectiveCamera!, debugView: (requestedControls.debugView ?? 'final') as 'final' | 'base-color', temporal: false }, timing?.timestamps,
+              { camera: effectiveCamera!, debugView: (requestedControls.debugView ?? 'final') as 'final' | 'base-color', temporal: false,
+                cameraCut: requestedControls.cameraCut ?? false }, timing?.timestamps,
             ));
           } else if (scene && scene.kind !== 'diffuse') {
             ({ drawCalls, dispatchCalls, triangles, uploadBytes, skippedGpuPasses } = scene.value.encode(
@@ -574,6 +575,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           totalUploadBytes += uploadBytes;
           if (timing) profiler!.resolve(encoder, timing, skippedGpuPasses);
           device!.queue.submit([encoder.finish()]);
+          // Authored motion owns a staged view, not encode-time history. Commit
+          // before profiler/telemetry code can throw after this actual submit.
+          if (scene?.kind === 'authored-boxes') scene.value.submitted(frameId);
           if (scene && scene.kind !== 'diffuse') forceRasterCameraCut = false;
           submittedFrames++;
           firstSubmittedFrameId ??= frameId;
@@ -596,6 +600,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           };
           return metrics;
         } catch (cause) {
+          if (scene?.kind === 'authored-boxes') scene.value.cancelFrame();
           // Encoding can advance ping-pong histories before a later pass or submission fails.
           forceRasterCameraCut = true;
           if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated' || scene?.kind === 'imported') scene.value.cancelFrame();

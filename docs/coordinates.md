@@ -1,11 +1,12 @@
 # Global coordinate foundation
 
-Status: proposed general-scene contract and isolated deterministic CPU prototype for
-[issue #18](https://github.com/tylerstuff/strata/issues/18). This slice does not change
-the engine API, production renderer, shaders, terrain format/cooker/cache, lighting
-histories, frame graph, benchmark runner or scene loading. It does not implement
-large-world rendering, world streaming, physics or browser multi-view rendering.
-The restricted [integrated courtyard](integrated.md) keeps its existing coordinates.
+Status: selected coordinate contract and deterministic CPU prototype for
+[issue #18](https://github.com/tylerstuff/strata/issues/18), with a restricted
+[authored-box production integration](authored-boxes.md). That path uses the
+camera-relative packer and submitted-camera motion. General scene integration,
+world streaming, physics and browser multi-view rendering remain unfinished.
+The terrain format/cooker/cache, lighting histories and restricted
+[integrated courtyard](integrated.md) keep their existing coordinates.
 
 ## Decision and authoring boundary
 
@@ -249,6 +250,13 @@ binary64 XYZ for this foundation. No GPU run, build/packed-consumer test or full
 coordinated integration.
 
 ## Deferred integration acceptance
+
+The bounded production authored-box path now consumes the selected coordinate
+packer and retains each last submitted camera/origin/model pack for motion
+vectors. Its independent error gates, reset semantics and submission ownership
+are described in [authored-boxes.md](authored-boxes.md#submitted-camera-motion).
+It has no temporal resolve or jitter; the broader renderer integration below
+remains unfinished.
 
 1. Replace early float32 world/view construction at the production camera/model
    boundary (for example `rendering/raster-math.ts`) with matched binary64 scene
