@@ -4,7 +4,7 @@ Status: accepted direction. The lifecycle, package and procedural benchmark foun
 
 ## Product boundary
 
-Strata is a standalone browser game engine built from scratch for WebGPU. It is not a Babylon Lite fork or compatibility layer. The engine should provide an integrated runtime for rendering, assets, scenes, animation, input and game systems behind a TypeScript package facade. An optional editor is a separate application using that runtime and its asset tools.
+Strata is a standalone browser game engine built from scratch for WebGPU. It is not a Babylon Lite fork or compatibility layer. The engine should provide an integrated runtime for rendering, assets, scenes, animation, input and game systems behind a TypeScript package facade. Authoring primarily serves Codex and other agents through files, code, noninteractive CLI commands and structured results. Optional visual tools consume the same public contracts in a separate package.
 
 The deployment target is the browser. There are no planned native graphics backends or WebGL fallback. WebGPU availability and required device limits must be checked at startup, with a clear unsupported-device result. Hosting should work without mandatory cross-origin isolation or special shared-memory headers.
 
@@ -48,4 +48,4 @@ Begin with a reproducible browser benchmark and a conventional rendering baselin
 
 Record CPU and GPU timings separately where supported, alongside frame-time distributions, memory, upload traffic, startup time and visible artifacts. Declare the device and workload for every performance claim. Retain simpler rendering and lighting modes so experiments can demonstrate their quality and cost against a stable baseline.
 
-Editor work follows usable runtime and asset contracts. The editor may author scenes, inspect assets and launch previews, but games must build and run without it.
+Authoring work follows usable runtime and asset contracts. Core authoring operations must be available through files, code and a noninteractive CLI, with explicit revisions, diagnostics and repeatable preview controls. The optional gallery supports visual inspection through those APIs. Games must build and run without authoring tools or a GUI.

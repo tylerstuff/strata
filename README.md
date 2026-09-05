@@ -22,13 +22,15 @@ Run `npm run benchmark` for the hardware browser baseline or read [the benchmark
 
 For the procedural lighting experiment, run `npm run benchmark -- --renderer gi` or see [the GI guide](docs/gi.md) for offscreen color transfer, door/light controls, quality budgets and limitations. For the selected mirror, use `npm run benchmark -- --renderer reflections`; the [reflection guide](docs/reflections.md) describes its controls and limits. The [integrated courtyard](docs/integrated.md) combines these paths in one image and documents its explicit raster, tracing and collision limits.
 
+For local imported models and animation, configure `STRATA_BENCHMARK_ASSET_DIR` and run `npm run gallery`. The [gallery guide](docs/gallery.md) covers lighting, playback and scripted captures. Models and derived files remain outside Git; the gallery is an inspection tool, with explicit import limits and no imported GI or reflections.
+
 ## Product requirements
 
 - Render locally in an ordinary browser using WebGPU.
 - Target 60 FPS on a representative laptop GPU, with Switch 2 games as a visual reference. The minimum GPU, browser, resolution, and test scenes still need to be defined and measured.
 - Provide an ergonomic TypeScript API with precompiled Rust/WebAssembly internals and WGSL shaders. Consumers should not need Rust tooling or a custom WASM build step.
 - Initialize WASM and workers through the engine API. Support ordinary hosting without mandatory shared-memory threading or cross-origin-isolation headers.
-- Keep the visual editor separate from the embeddable runtime.
+- Make files, code and noninteractive CLI commands the primary authoring interface for Codex and other agents. Keep optional visual tools separate from the embeddable runtime.
 - Develop a custom renderer, combining rasterization with budgeted software-traced indirect lighting and selective reflections. Investigate streamed virtualized geometry through measurable prototypes.
 
 ## Architecture
@@ -38,7 +40,7 @@ For the procedural lighting experiment, run `npm run benchmark -- --renderer gi`
 | Public package, browser integration, and initial WebGPU command submission | TypeScript |
 | Dense CPU engine systems and asset processing | Rust compiled to WebAssembly; reuse suitable existing libraries |
 | Rendering, culling, software ray traversal, and lighting filters | WGSL running through WebGPU |
-| Editor | Separate TypeScript application/package |
+| Agent authoring and optional visual tools | Separate TypeScript packages using public runtime APIs |
 
 Read [the architecture brief](docs/architecture.md) for the design boundaries and unresolved questions. Proposed npm names such as `@strata-engine/core` and `@strata-engine/editor` have not been reserved or published.
 
@@ -48,7 +50,7 @@ Read [the architecture brief](docs/architecture.md) for the design boundaries an
 
 1. **M1 — Runtime foundation:** package consumption, the TypeScript/WASM boundary, and performance measurement.
 2. **M2 — Rendering feasibility:** a conventional renderer and measured geometry, lighting, and reflection prototypes.
-3. **M3 — Editor prototype:** an editor that consumes the runtime through supported APIs.
+3. **M3 — Agent-driven authoring:** file, code and CLI workflows that consume the runtime through supported APIs, with optional visual inspection.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue, pull-request, and validation workflow.
 
