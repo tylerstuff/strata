@@ -63,3 +63,25 @@ For a capture, serialize mutations/submissions/resizes, verify the committed gen
 A nonempty scene uses one instanced raster draw, 12 triangles per box, `760 + 144*N` requested GPU buffer bytes, `648 + 80*N` initial upload bytes and `112 + 64*N` upload bytes per frame. Depth uses width×height×4 bytes. These counts exclude browser/driver padding and swapchain memory. Empty scenes have no geometry/depth resources. There is no hidden settling loop.
 
 Validation covers frozen descriptors, numerical caps and independent packing references; lifecycle tests cover request races, aborts, cleanup failure and submitted identity. The browser witness and packed HTML/Vite consumer checks must pass before claiming rendered correctness. Keep capture evidence external. This profile does not close the larger authoring, coordinate integration, lighting or performance tasks.
+
+### Hardware correctness checkpoint
+
+At immutable source `2ec49d4a4eb3d2266829a224c376ea191a3e32eb`, Chrome152.0.7977.82 on the Apple Metal adapter passed 154 offscreen production-renderer frames plus three built-public-Engine submissions. The fixture has16 boxes at512×512, 55-degree vertical FOV, near0.1/far32:15 independently predicted visible boxes and one intentionally occluded box. This is a functional test, with no performance claim.
+
+| Check | Observed result |
+| --- | --- |
+| Static reference coverage | Minimum per-object IoU0.996422 for the dyadic fixture and1.0 for the decimal fixture |
+| Reference depth on eroded object interiors | 9,247/13,288 tested pixels; zero rejected pixels; maximum errors1.25838e-6/7.06473e-7 |
+| Signed common offsets through1,000km | Both fixture variants produced bit-identical color/depth to their origin captures in this run |
+| Camera motion at origin and1,000km | 32 paired steps per variant,31 visible changes each; each near/far pair had identical color/depth |
+| Early-f32 negative control at1,000km | The right small box lost all of its64/100 predicted visible pixels; the left witness also moved |
+| Direct PBR, edited materials and reversed light | 360 independently computed samples each, zero8-bit channel differences; zero radiance was black |
+| Public Engine | Commit/submission receipts, per-frame camera override, resize/aspect, repeated revision, clear and disposal passed |
+
+Acceptance thresholds remain distinct from those observations. Coverage IoU thresholds are0.98 against the independent oracle and0.995 for offset comparisons; centroid limits are0.5/0.25pixels. The depth threshold is2e-6 over eroded interior samples with an aggregate allowed rejection fraction of0.1%; this is not a per-object maximum-error guarantee. Paired motion tests establish offset equivalence and visible motion, not an independently verified camera trajectory at every step. The PBR sample oracle covers the dyadic origin fixture. Box axis normals test orientation/sign/stride; the need for inverse-transpose normals under nonuniform scale is established by the separate oblique CPU reference.
+
+The100km negative control is reported without a mandatory visible failure: the dyadic gap changed geometrically but remained between the same pixel centers, whereas the decimal witness changed pixels. The1,000km negative control must fail both fixtures. No positive threshold was relaxed for these results.
+
+The source/built-runtime hashes remained unchanged throughout the run, with zero GPU, browser, device-loss or cleanup errors. Reports and GPU-readback PNGs are external at `~/Downloads/Strata-Benchmark-Results/2026-09-05T06-52-41.359Z-authored-box-validation/`; report SHA-256 is `f5b284a2b0f14a77228d103a0852d4488488f5ec8aa2387356ce4af367bfd6ef`. These PNGs are encoded GPU readbacks, not compositor presentation receipts. Separately, the packed b17b8ac implementation passed ordinary HTML and production Vite hardware playback.
+
+Run `npm run build && npm run test:authored-boxes` for the complete functional witness, or `node scripts/test-authored-boxes.mjs --prepare-only` for its CPU reference preparation. `node scripts/test-consumers.mjs --cpu-only` checks the built archive, TypeScript/SSR contract and Vite output without launching a browser; omit the flag for actual packed browser playback.
