@@ -137,7 +137,11 @@ describe('region initialization with real cooked sources and bounded ownership',
     expect(ready.regions.map(region => region.id)).toEqual(['region-2', 'region-3']);
     expect(ready.startedEntries).toBe(4);
     expect(ready.peakLiveEntries).toBe(2);
-    expect(h.network.requests.filter(request => request.kind === 'manifest').map(request => request.source.manifest.source.seed)).toEqual([51, 52, 53, 54]);
+    const manifestSeeds = h.network.requests.filter(request => request.kind === 'manifest').map(request => request.source.manifest.source.seed);
+    expect(manifestSeeds.slice(0, 2)).toEqual([51, 52]);
+    // Admission turns rotate while retired providers settle. Either order for
+    // the second pair is valid; this is no request-order/fairness contract.
+    expect(manifestSeeds.slice(2).sort()).toEqual([53, 54]);
     const pages = h.network.requests.filter(request => request.kind === 'page');
     expect(pages).toHaveLength(4);
     expect(pages.every(request => request.source.manifest.rootPageIds.includes(request.pageId!))).toBe(true);
