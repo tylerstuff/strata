@@ -1,5 +1,5 @@
 import { loadGalleryCatalog, orderedGalleryAssets, type GalleryAsset, type GalleryCatalog } from './catalog.js';
-import { GalleryRuntime, debugViews, lightingPresets, scenePresets, type DebugView, type GalleryAnimation, type LightingPreset, type ScenePreset } from './runtime.js';
+import { GalleryRuntime, debugViews, lightingPresets, scenePresets, type DebugView, type GalleryAnimation, type GalleryEnvironment, type GalleryShading, type GalleryTextureCap, type LightingPreset, type ScenePreset } from './runtime.js';
 import type { GalleryOrbit } from './orbit.js';
 import { fitViewportSize, watchDisplayDensity } from './viewport.js';
 
@@ -15,6 +15,11 @@ const lightSelect = element<HTMLSelectElement>('lighting-preset');
 const debugSelect = element<HTMLSelectElement>('debug-view');
 const resolutionSelect = element<HTMLSelectElement>('resolution');
 const temporalToggle = element<HTMLInputElement>('temporal-aa');
+const shadingSelect = element<HTMLSelectElement>('material-shading');
+const environmentSelect = element<HTMLSelectElement>('environment-preset');
+const environmentIntensity = element<HTMLInputElement>('environment-intensity');
+const environmentRotation = element<HTMLInputElement>('environment-rotation');
+const textureSelect = element<HTMLSelectElement>('texture-cap');
 const clipSelect = element<HTMLSelectElement>('animation-clip');
 const timeline = element<HTMLInputElement>('animation-time');
 const loopToggle = element<HTMLInputElement>('animation-loop');
@@ -27,6 +32,7 @@ let actionError: string | null = null;
 let viewportError: string | null = null;
 let shownModel: string | null = null;
 let shownClipSignature = '';
+let shownDetailsSignature = '';
 let fixedViewport = false;
 let fitMaximumDimension = 8192;
 let scrubbing = false;
@@ -115,6 +121,21 @@ function update() {
   debugSelect.value = state.settings.debugView;
   temporalToggle.disabled = !ready;
   temporalToggle.checked = state.settings.temporal;
+  for (const control of [shadingSelect, environmentSelect, textureSelect]) control.disabled = !ready;
+  shadingSelect.value = state.settings.shading;
+  environmentSelect.value = state.settings.environment.preset;
+  textureSelect.value = String(state.settings.textureCap);
+  const environment = state.settings.environment;
+  element('environment-controls').hidden = environment.preset === 'off';
+  environmentIntensity.disabled = !ready || environment.preset === 'off';
+  environmentRotation.disabled = !ready || environment.preset === 'off';
+  // Preserve an in-progress numeric edit during live telemetry updates.
+  if (document.activeElement !== environmentIntensity) environmentIntensity.value = String(environment.intensity);
+  if (document.activeElement !== environmentRotation) environmentRotation.value = String(Number((environment.rotationRadians * 180 / Math.PI).toFixed(2)));
+  element('quality-status').textContent = [
+    state.settings.shading === 'relit' ? 'Unlit materials use a matte interpretation; source PBR materials retain their settings.' : 'Source-authored materials. Unlit materials ignore lighting.',
+    environment.preset === 'off' ? 'Environment off.' : environment.intensity === 0 ? 'Environment intensity is zero.' : 'The distant environment adds illumination without scene occlusion.',
+  ].join(' ');
   liveButton.textContent = state.live ? 'Pause live view' : 'Resume live view';
   liveButton.setAttribute('aria-pressed', String(state.live));
   for (const button of modelList.querySelectorAll<HTMLButtonElement>('button[data-model-id]')) {
@@ -133,19 +154,39 @@ function update() {
     }
   }
   const details = element('model-details');
-  details.replaceChildren();
-  if (selected) {
-    details.append(detail('Category', selected.category), detail('Source triangles', formatCount(selected.triangles)), detail('Source texture edge', selected.textureMaxEdge === null ? 'Unavailable' : `${selected.textureMaxEdge.toLocaleString()} px`));
-    if (known) details.append(detail('Loaded triangles', formatCount(known.stats.triangles)), detail('Runtime primitives', formatCount(known.stats.primitives)), detail('Texture upload cap', `${known.maxTextureDimension} px`));
-    else details.append(paragraph('Runtime support and loaded counts are established after a successful import.'));
-  } else details.append(paragraph('Select a model to view its details.'));
+  const decision = state.settings.textureDecision;
+  const detailsSignature = JSON.stringify([selected?.id, selected?.category, selected?.triangles, selected?.textureMaxEdge, known?.stats, known?.maxTextureDimension, decision]);
+  if (shownDetailsSignature !== detailsSignature) {
+    shownDetailsSignature = detailsSignature;
+    const wasOpen = details.querySelector<HTMLDetailsElement>('.allocation-details')?.open ?? false;
+    details.replaceChildren();
+    if (selected) {
+      details.append(detail('Category', selected.category), detail('Source triangles', formatCount(selected.triangles)), detail('Source texture edge', selected.textureMaxEdge === null ? 'Unavailable' : `${selected.textureMaxEdge.toLocaleString()} px`));
+      if (known) {
+        details.append(detail('Loaded triangles', formatCount(known.stats.triangles)), detail('Runtime primitives', formatCount(known.stats.primitives)));
+        if (decision?.status === 'ready') {
+          const accepted = decision.attempts.at(-1)!;
+          details.append(detail('Texture cap', `${decision.requestedCap.toLocaleString()} px requested · ${decision.effectiveCap.toLocaleString()} px effective`));
+          details.append(detail('Texture payload', `${(accepted.gpuTextureBytes / 1048576).toFixed(2)} / ${(decision.budgetBytes / 1048576).toFixed(0)} MiB modeled`));
+          if (decision.budgetFallback) details.append(paragraph(`The texture budget reduced the selected cap to ${decision.selectedCap.toLocaleString()} px.`));
+          if (decision.deviceLimited) details.append(paragraph('The device texture limit constrains the effective cap.'));
+          const allocation = document.createElement('details');
+          allocation.className = 'allocation-details'; allocation.open = wasOpen;
+          const summary = document.createElement('summary'); summary.textContent = 'Allocation details';
+          const evidence = document.createElement('pre'); evidence.textContent = JSON.stringify(decision, null, 2);
+          allocation.append(summary, paragraph('Imported texture payload only; excludes frame targets, buffers, driver memory and overlapping scene allocations.'), evidence);
+          details.append(allocation);
+        } else details.append(detail('Texture upload cap', `${known.maxTextureDimension.toLocaleString()} px`));
+      } else details.append(paragraph('Runtime support and loaded counts are established after a successful import.'));
+    } else details.append(paragraph('Select a model to view its details.'));
+  }
   const limitations = element('limitations');
   limitations.replaceChildren();
   const notes = new Set([
-    'Textures are capped at 2048 px for this gallery. Importer warnings report resizing and unsupported content.',
-    'Lighting uses one directional light and ambient fill with material AO only. Imported GI and reflections are unavailable.',
+    'Texture caps are preflighted against the shared Core budget. Model details report the requested and effective caps; source images remain unchanged.',
+    'Lighting combines a directional light, ambient fill and optional distant environment illumination. Ambient and environment have no scene visibility, GI, local reflections or interior occlusion.',
     ...(state.settings.scenePreset === 'ground' && (known?.clips.length ?? 0) > 0 ? ['Ground stays at the rest-pose level; animated poses can cross it. Use Model only to inspect the full pose.'] : []),
-    ...(selected?.features.usedExtensions.includes('KHR_materials_unlit') ? ['Includes authored unlit materials. Their color may remain unchanged when scene lighting changes; ground and shadows can still respond.'] : []),
+    ...(selected?.features.usedExtensions.includes('KHR_materials_unlit') ? [state.settings.shading === 'authored' ? 'Includes authored unlit materials, whose color ignores scene lighting. Relight unlit explicitly interprets them as matte materials.' : 'Source unlit materials are explicitly relit as matte dielectrics with geometric normals; this is an interpretation, not recovered source material.'] : []),
     ...(selected?.notes ?? []), ...(known?.warnings ?? []), ...(known ? state.frame?.imported?.warnings ?? [] : []), ...(catalog?.diagnostics ?? []),
   ]);
   for (const note of notes) limitations.append(paragraph(note));
@@ -247,6 +288,12 @@ sceneSelect.addEventListener('change', () => run(() => runtime.setScenePreset(sc
 lightSelect.addEventListener('change', () => run(() => runtime.setLightingPreset(lightSelect.value as LightingPreset)), { signal: events.signal });
 debugSelect.addEventListener('change', () => run(() => runtime.setDebugView(debugSelect.value as DebugView)), { signal: events.signal });
 temporalToggle.addEventListener('change', () => run(() => runtime.setTemporal(temporalToggle.checked)), { signal: events.signal });
+shadingSelect.addEventListener('change', () => run(() => runtime.setShading(shadingSelect.value as GalleryShading)), { signal: events.signal });
+environmentSelect.addEventListener('change', () => run(() => runtime.setEnvironment({ preset: environmentSelect.value as GalleryEnvironment['preset'] })), { signal: events.signal });
+environmentIntensity.addEventListener('change', () => run(() => runtime.setEnvironment({ intensity: environmentIntensity.valueAsNumber })), { signal: events.signal });
+environmentRotation.addEventListener('change', () => run(() => runtime.setEnvironment({ rotationRadians: environmentRotation.valueAsNumber * Math.PI / 180 })), { signal: events.signal });
+for (const input of [environmentIntensity, environmentRotation]) input.addEventListener('blur', update, { signal: events.signal });
+textureSelect.addEventListener('change', () => run(() => runtime.setTextureCap(Number(textureSelect.value) as GalleryTextureCap)), { signal: events.signal });
 resolutionSelect.addEventListener('change', () => run(async () => {
   if (resolutionSelect.value === 'fit') {
     fixedViewport = false;
@@ -345,6 +392,9 @@ const api = {
   setLightingPreset: (id: LightingPreset) => runtime.setLightingPreset(id),
   setDebugView: (id: DebugView) => runtime.setDebugView(id),
   setTemporal: (enabled: boolean) => runtime.setTemporal(enabled),
+  setShading: (value: GalleryShading) => runtime.setShading(value),
+  setEnvironment: (value: Partial<GalleryEnvironment>) => runtime.setEnvironment(value),
+  setTextureCap: (value: GalleryTextureCap) => runtime.setTextureCap(value),
   setOrbit: (orbit: Partial<GalleryOrbit>) => runtime.setOrbit(orbit),
   resetCamera: () => runtime.resetCamera(),
   setAnimation: (animation: Partial<GalleryAnimation>) => runtime.setAnimation(animation),

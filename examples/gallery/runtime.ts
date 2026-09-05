@@ -1,11 +1,20 @@
-import { createEngine, type Engine, type FrameMetrics, type RenderOptions } from '@strata-engine/core';
-import { loadGltf } from '@strata-engine/core/gltf';
+import { createEngine, SceneCommitError, type Engine, type FrameMetrics, type RenderOptions, type SceneCommitReceipt } from '@strata-engine/core';
+import { estimateImportedTextureAllocation, loadGltf } from '@strata-engine/core/gltf';
 import type { GalleryAsset } from './catalog.js';
 import { fitOrbitToBounds, normalizeOrbit, orbitEye, type GalleryOrbit } from './orbit.js';
 import { GalleryMeasurements } from './state.js';
+import { chooseTextureCap, defaultGalleryTextureCap, galleryTextureCaps, type GalleryTextureCap, type TextureCapDecision } from './texture-policy.js';
+export type { GalleryTextureCap } from './texture-policy.js';
 
 type PreparedAsset = Awaited<ReturnType<typeof loadGltf>>;
 type ImportedControls = NonNullable<RenderOptions['imported']>;
+type TextureCandidate = { readonly asset: PreparedAsset; readonly decision: Extract<TextureCapDecision, { status: 'ready' }> };
+export type GalleryShading = NonNullable<ImportedControls['shading']>;
+export interface GalleryEnvironment {
+  readonly preset: 'off' | 'studio' | 'sky';
+  readonly intensity: number;
+  readonly rotationRadians: number;
+}
 export type GalleryPhase = 'initializing' | 'empty' | 'loading' | 'ready' | 'unsupported' | 'error' | 'disposed';
 export const scenePresets = { 'model-only': 'Model only', ground: 'Ground plane' } as const;
 export const lightingPresets = {
@@ -46,12 +55,16 @@ export class GalleryRuntime {
   #model: GalleryAsset | null = null;
   #requestedModel: GalleryAsset | null = null;
   #asset: PreparedAsset | null = null;
-  #sceneCommit: unknown = null;
+  #sceneCommit: SceneCommitReceipt | null = null;
   #viewRevision = 0;
   #scenePreset: ScenePreset = 'model-only';
   #lightingPreset: LightingPreset = 'studio';
   #debugView: DebugView = 'final';
   #temporal = true;
+  #shading: GalleryShading = 'authored';
+  #environment: GalleryEnvironment = { preset: 'off', intensity: 1, rotationRadians: 0 };
+  #textureCap: GalleryTextureCap = defaultGalleryTextureCap;
+  #textureDecision: TextureCapDecision | null = null;
   #orbit: GalleryOrbit = normalizeOrbit(initialOrbit, limits);
   #cameraIsFitted = false;
   #animation: GalleryAnimation = freshAnimation();
@@ -141,17 +154,22 @@ export class GalleryRuntime {
     this.#load = load;
     const timeout = setTimeout(() => load.abort(new Error('Model loading exceeded 120 seconds.')), 120_000);
     let sceneReplacementStarted = false;
+    let candidate: TextureCandidate | null = null;
     this.#phase = 'loading';
     this.#changed();
     try {
-      const asset = await loadGltf(model.entryUrl, { signal: load.signal, maxTextureDimension: 2048 });
+      const loaded = await loadGltf(model.entryUrl, { signal: load.signal, maxTextureDimension: this.#textureCap });
       if (load.signal.aborted || request !== this.#request) throw load.signal.reason ?? stopped('Model load was superseded.');
+      candidate = this.#prepareTexture(loaded, this.#textureCap, this.#healthy());
+      const { asset, decision } = candidate;
       sceneReplacementStarted = true;
       const commit = await this.#healthy().setScene({ renderer: 'imported', asset, signal: load.signal });
       if (load.signal.aborted || request !== this.#request) throw load.signal.reason ?? stopped('Model load was superseded.');
       this.#asset = asset;
       this.#model = model;
-      this.#sceneCommit = commit === undefined ? null : commit;
+      this.#sceneCommit = commit;
+      this.#textureDecision = decision;
+      this.#assertScene(this.#healthy(), commit);
       const idle = asset.clips.find(clip => /^(?:idle|f_idle|idle01)$/i.test(clip.name.trim()));
       this.#animation = idle ? { clipId: idle.id, timeSeconds: 0, loop: true, playing: true } : freshAnimation();
       // Fit the new rest bounds after applying the actual pending drawing-buffer
@@ -171,9 +189,13 @@ export class GalleryRuntime {
       this.#schedule();
     } catch (error) {
       if (this.#ownsRequest(request)) {
-        // A void-returning Core baseline cannot prove whether a rejected
-        // replacement committed before retiring its old resources.
-        if (sceneReplacementStarted) { this.#model = null; this.#asset = null; this.#sceneCommit = null; }
+        if (error instanceof SceneCommitError && candidate) {
+          // The new scene is already active even though retiring the old one failed.
+          this.#model = model; this.#asset = candidate.asset; this.#sceneCommit = error.committedScene;
+          this.#textureDecision = candidate.decision;
+        } else if (sceneReplacementStarted) {
+          this.#model = null; this.#asset = null; this.#sceneCommit = null; this.#textureDecision = null;
+        }
         this.#error = failure(error);
         this.#phase = /UNSUPPORTED/.test(this.#error.code) ? 'unsupported' : 'error';
         this.#changed();
@@ -188,8 +210,10 @@ export class GalleryRuntime {
   #controls(): ImportedControls {
     const light = lightingPresets[this.#lightingPreset];
     return {
+      shading: this.#shading,
       camera: { eye: orbitEye(this.#orbit), target: this.#orbit.target, verticalFov },
-      lighting: { directionToLight: light.directionToLight, color: light.color, intensity: light.intensity, ambient: light.ambient },
+      lighting: { directionToLight: light.directionToLight, color: light.color, intensity: light.intensity, ambient: light.ambient,
+        environment: this.#environment.preset === 'off' ? null : { ...this.#environment, preset: this.#environment.preset } },
       presentation: this.#scenePreset, background: light.background,
       animation: { clipId: this.#animation.clipId, timeSeconds: this.#animation.timeSeconds, loop: this.#animation.loop },
     };
@@ -279,6 +303,83 @@ export class GalleryRuntime {
   async setTemporal(value: boolean) {
     if (typeof value !== 'boolean') throw new Error('Temporal anti-aliasing must be a boolean.');
     await this.#change(() => { this.#temporal = value; }, true);
+  }
+  async setShading(value: GalleryShading) {
+    if (value !== 'authored' && value !== 'relit') throw new Error('Shading must be authored or relit.');
+    await this.#change(() => { this.#shading = value; });
+  }
+  async setEnvironment(value: Partial<GalleryEnvironment>) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).some(key => !['preset', 'intensity', 'rotationRadians'].includes(key))) throw new Error('Environment settings must contain only preset, intensity and rotationRadians.');
+    const next = { ...this.#environment, ...value };
+    if (!['off', 'studio', 'sky'].includes(next.preset) || !Number.isFinite(next.intensity) || next.intensity < 0 || next.intensity > 64
+      || !Number.isFinite(next.rotationRadians) || Math.abs(next.rotationRadians) > 1e6) throw new Error('Environment needs off/studio/sky, intensity 0–64, and finite rotation within +/-1e6 radians.');
+    await this.#change(() => { this.#environment = next; });
+  }
+  #prepareTexture(asset: PreparedAsset, cap: GalleryTextureCap, engine: Engine): TextureCandidate {
+    const decision = chooseTextureCap({ requestedCap: cap, estimate: requested => estimateImportedTextureAllocation(asset, {
+      maxTextureDimension: requested, maxTextureDimension2D: Math.min(16384, engine.info.maxTextureDimension2D),
+    }) });
+    if (decision.status !== 'ready') throw Object.assign(new Error('The model exceeds the texture budget at every supported upload cap.'), {
+      code: 'GALLERY_TEXTURE_BUDGET', textureDecision: decision,
+    });
+    // Core keeps CPU data caller-owned. Only replace the upload cap; retain encoded
+    // image bytes, geometry, material references and animation data without refetch.
+    return { asset: Object.freeze({ ...asset, maxTextureDimension: decision.selectedCap }), decision };
+  }
+  #sameScene(engine: Engine, receipt: SceneCommitReceipt | null) {
+    const current = engine.getTelemetry().scene.identity;
+    return receipt !== null && current.sceneGeneration === receipt.sceneGeneration && current.renderer === receipt.renderer
+      && current.sceneId === receipt.sceneId && current.sourceRevision === receipt.sourceRevision;
+  }
+  #assertScene(engine: Engine, receipt: SceneCommitReceipt) {
+    this.#healthy();
+    if (!this.#sameScene(engine, receipt)) throw new Error('The active scene changed while gallery settings were settling.');
+  }
+  async setTextureCap(value: GalleryTextureCap) {
+    if (!galleryTextureCaps.includes(value)) throw new Error('Gallery texture cap must be 2048, 4096 or 8192.');
+    const engine = this.#ready();
+    if (!this.#asset) throw new Error('A loaded model is required to change the texture cap.');
+    // All estimation and validation happen before stopping playback or changing state.
+    const candidate = this.#prepareTexture(this.#asset, value, engine);
+    const previous = this.#sceneCommit, request = ++this.#request;
+    const load = new AbortController();
+    const timeout = setTimeout(() => load.abort(new Error('Texture recreation exceeded 120 seconds.')), 120_000);
+    this.#load = load;
+    this.#busy = 'settings'; this.#stopFrames(); this.#changed();
+    let committed = false;
+    const adopt = (receipt: SceneCommitReceipt) => {
+      this.#asset = candidate.asset; this.#sceneCommit = receipt;
+      this.#textureCap = value; this.#textureDecision = candidate.decision;
+      this.#viewRevision += 1; committed = true;
+    };
+    try {
+      const receipt = await engine.setScene({ renderer: 'imported', asset: candidate.asset, signal: load.signal });
+      if (!this.#ownsRequest(request)) throw stopped('Texture recreation was canceled.');
+      adopt(receipt);
+      this.#assertScene(engine, receipt);
+      if (load.signal.aborted) throw load.signal.reason;
+      this.#applySize(); this.#submit(true);
+      await this.#settleFrames(engine, load.signal);
+      this.#assertScene(engine, receipt);
+    } catch (error) {
+      if (this.#ownsRequest(request)) {
+        if (!committed && error instanceof SceneCommitError) adopt(error.committedScene);
+        if (committed || engine.state !== 'ready' || engine.getTelemetry().gpuErrorCount > 0 || !this.#sameScene(engine, previous)) {
+          this.#fault(error);
+        } else if (this.#pendingSize) {
+          // A failed candidate leaves the old scene active; honor any viewport
+          // change queued during creation before resuming the old view.
+          try { this.#applySize(); this.#submit(true); await this.#settleFrames(engine); }
+          catch (resizeError) { this.#fault(resizeError); }
+        }
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      if (this.#load === load) this.#load = null;
+      this.#busy = null; this.#changed(); this.#schedule();
+    }
   }
   async setOrbit(value: Partial<GalleryOrbit>) {
     const next = normalizeOrbit({ ...this.#orbit, ...value }, limits);
@@ -370,7 +471,8 @@ export class GalleryRuntime {
       engineEpoch: this.#epoch, sceneCommit: this.#sceneCommit, viewRevision: this.#viewRevision,
       source: this.#model ? { entryUrl: this.#model.entryUrl, catalogGltfSha256: this.#model.sourceSha256 } : null,
       asset: asset ? { sourceUrl: asset.sourceUrl, bounds: asset.bounds, sourceBounds: asset.sourceBounds, normalization: asset.normalization, stats: asset.stats, warnings: asset.warnings, maxTextureDimension: asset.maxTextureDimension, clips: asset.clips.map(({ id, name, duration }) => ({ id, name, duration })) } : null,
-      settings: { scenePreset: this.#scenePreset, lightingPreset: this.#lightingPreset, debugView: this.#debugView, orbit: this.#orbit, animation: this.#animation, temporal: this.#temporal, effective: this.#controls() },
+      settings: { scenePreset: this.#scenePreset, lightingPreset: this.#lightingPreset, debugView: this.#debugView, orbit: this.#orbit, animation: this.#animation, temporal: this.#temporal,
+        shading: this.#shading, environment: this.#environment, textureCap: this.#textureCap, textureDecision: this.#textureDecision, effective: this.#controls() },
       live: this.#live, busy: this.#busy, viewport: { width: this.#canvas.width, height: this.#canvas.height },
       frame: this.#lastFrame, submittedView: this.#submittedView, measurements: this.#measurements.snapshot(this.#identity()),
       telemetry: this.#engine?.getTelemetry() ?? null, engineInfo: this.#engine?.info ?? null,

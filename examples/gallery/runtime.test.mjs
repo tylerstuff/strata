@@ -21,13 +21,21 @@ try {
         plugin.onResolve({ filter: /^@strata-engine\/core(?:\/gltf)?$/ }, args => ({ path: args.path, namespace: 'gallery-cpu' }));
         plugin.onLoad({ filter: /.*/, namespace: 'gallery-cpu' }, args => ({
           loader: 'js', contents: args.path.endsWith('/gltf')
-            ? `export const loadGltf = (...args) => globalThis[${JSON.stringify(hookKey)}].loadGltf(...args);`
-            : `export const createEngine = (...args) => globalThis[${JSON.stringify(hookKey)}].createEngine(...args);`,
+            ? `export const loadGltf = (...args) => globalThis[${JSON.stringify(hookKey)}].loadGltf(...args);
+               export const estimateImportedTextureAllocation = (...args) => globalThis[${JSON.stringify(hookKey)}].estimate(...args);`
+            : `export class SceneCommitError extends Error {
+                 constructor(committedScene, cause) { super('Scene committed but retirement failed.', {cause});
+                   this.name='SceneCommitError'; this.code='SCENE_LOAD_FAILED'; this.stage='retire'; this.commitOccurred=true; this.committedScene=committedScene; }
+               }
+               export const createEngine = (...args) => {
+                 globalThis[${JSON.stringify(hookKey)}].SceneCommitError = SceneCommitError;
+                 return globalThis[${JSON.stringify(hookKey)}].createEngine(...args);
+               };`,
         }));
       },
     }],
   });
-  assert.ok(Object.keys(result.metafile.inputs).every(path => path.startsWith('gallery-cpu:') || /(?:^|\/)examples\/gallery\/(?:runtime|orbit|state)\.ts$/.test(path)),
+  assert.ok(Object.keys(result.metafile.inputs).every(path => path.startsWith('gallery-cpu:') || /(?:^|\/)examples\/gallery\/(?:runtime|orbit|state|texture-policy)\.ts$/.test(path)),
     'CPU suite must not bundle real Core implementation code');
 } catch (error) {
   await rm(temporary, { recursive: true, force: true });
@@ -58,6 +66,7 @@ function asset(sourceUrl, clips = []) {
     version: 1, sourceUrl, bounds: { min: [-1, 0, -1], max: [1, 2, 1] },
     sourceBounds: { min: [-1, 0, -1], max: [1, 2, 1] }, normalization: { scale: 1, translation: [0, 0, 0] },
     maxTextureDimension: 2048, warnings: [], clips,
+    materials: [], images: [], primitives: [],
     stats: { meshInstances: 1, primitives: 1, vertices: 8, triangles: 12, materials: 1, images: 0,
       encodedBytes: 0, geometryBytes: 0, skinnedMeshInstances: 0, animationClips: clips.length },
   };
@@ -97,6 +106,8 @@ class FakeEngine {
   gpuErrorCount = 0;
   lastGpuError = null;
   scene = null;
+  sceneIdentity = { sceneGeneration: 0, renderer: 'clear', sceneId: null, sourceRevision: null };
+  sceneFailures = [];
   constructor(canvas) { this.canvas = canvas; }
   hold(queue) {
     const entry = { entered: deferred(), done: deferred() };
@@ -107,17 +118,21 @@ class FakeEngine {
   holdScene() { return this.hold(this.sceneQueue); }
   async setScene(options) {
     this.sceneCalls.push(options);
+    const sceneGeneration = this.sceneCalls.length, failure = this.sceneFailures.shift();
     const hold = this.sceneQueue.shift();
     if (hold) { hold.entered.resolve(); await hold.done.promise; }
+    if (failure?.stage === 'before') throw failure.error;
     // Deliberately resolve even after an abort: host guards must reject late work.
     this.scene = options.asset;
-    return { generation: this.sceneCalls.length, sourceUrl: options.asset.sourceUrl };
+    this.sceneIdentity = { sceneGeneration, renderer: 'imported', sceneId: null, sourceRevision: null };
+    if (failure?.stage === 'after') throw new globalThis[hookKey].SceneCommitError(this.sceneIdentity, failure.error);
+    return this.sceneIdentity;
   }
   render(options) {
     assert.equal(this.state, 'ready', 'Host must not submit after disposal/loss');
     const frameId = this.frames.length + 1;
-    this.frames.push({ frameId, sourceUrl: this.scene?.sourceUrl ?? null, options: structuredClone(options), width: this.canvas.width, height: this.canvas.height });
-    return { frameId, cpuSubmissionMs: 0.1, drawCalls: 1, dispatchCalls: 0, triangles: 12,
+    this.frames.push({ frameId, scene: this.sceneIdentity, sourceUrl: this.scene?.sourceUrl ?? null, options: structuredClone(options), width: this.canvas.width, height: this.canvas.height });
+    return { frameId, scene: this.sceneIdentity, cpuSubmissionMs: 0.1, drawCalls: 1, dispatchCalls: 0, triangles: 12,
       uploadBytes: 0, allocatedGpuBufferBytes: 0, allocatedGpuTextureBytes: 0, wasmMemoryBytes: 0 };
   }
   async waitForIdle() {
@@ -127,7 +142,8 @@ class FakeEngine {
   }
   async flushGpuTimings() { this.flushCalls++; }
   drainGpuTimings() { return this.gpuSamples.splice(0); }
-  getTelemetry() { return { submittedFrames: this.frames.length, gpuErrorCount: this.gpuErrorCount, lastGpuError: this.lastGpuError, source: 'CPU fake engine' }; }
+  getTelemetry() { return { submittedFrames: this.frames.length, gpuErrorCount: this.gpuErrorCount, lastGpuError: this.lastGpuError,
+    scene: { identity: this.sceneIdentity }, source: 'CPU fake engine' }; }
   resize(width, height) {
     assert.equal(this.state, 'ready');
     this.resizeCalls.push([width, height]); this.canvas.width = width; this.canvas.height = height;
@@ -136,10 +152,14 @@ class FakeEngine {
 }
 
 describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering proof', { concurrency: false, timeout: 5000 }, () => {
-  let canvas, engine, runtime, loadCalls, loadHook, onChanged, raf, nextRafId, savedGlobals;
+  let canvas, engine, runtime, loadCalls, loadHook, estimateCalls, estimateHook, onChanged, raf, nextRafId, savedGlobals;
   beforeEach(async () => {
     canvas = { width: 512, height: 512 }; engine = new FakeEngine(canvas);
     loadCalls = []; loadHook = async url => asset(url); onChanged = () => {};
+    estimateCalls = [];
+    estimateHook = (_asset, options) => ({ requestedMaxTextureDimension: options.maxTextureDimension,
+      effectiveMaxTextureDimension: Math.min(options.maxTextureDimension, options.maxTextureDimension2D),
+      gpuTextureBytes: 4096, textureBudgetBytes: 512 * 1024 * 1024, fitsBudget: true, textures: [] });
     raf = new Map(); nextRafId = 0;
     savedGlobals = new Map(['document', 'requestAnimationFrame', 'cancelAnimationFrame', hookKey].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
     const globals = {
@@ -149,6 +169,7 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
       [hookKey]: {
         createEngine: async options => { assert.equal(options.canvas, canvas); return engine; },
         loadGltf: (url, options) => { loadCalls.push({ url, options }); return loadHook(url, options); },
+        estimate: (asset, options) => { estimateCalls.push({ asset, options }); return estimateHook(asset, options); },
       },
     };
     for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
@@ -303,6 +324,226 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     assert.ok(engine.frames.slice(frameCount).every(frame => frame.options.temporal === false));
   });
 
+  test('shading and environment controls are explicit, preserve other controls, and match capture state', async () => {
+    await runtime.selectModel(model());
+    const original = runtime.getState(), scene = engine.scene;
+    assert.equal(original.settings.shading, 'authored');
+    assert.deepEqual(original.settings.environment, { preset: 'off', intensity: 1, rotationRadians: 0 });
+    assert.equal(original.settings.effective.lighting.environment, null);
+    await runtime.setShading('relit');
+    const environment = { preset: 'studio', intensity: 2, rotationRadians: Math.PI / 2 };
+    await runtime.setEnvironment(environment);
+    environment.intensity = 99;
+    const changed = runtime.getState();
+    assert.equal(changed.viewRevision, original.viewRevision + 2);
+    assert.deepEqual(changed.settings.effective, { ...original.settings.effective, shading: 'relit',
+      lighting: { ...original.settings.effective.lighting, environment: { preset: 'studio', intensity: 2, rotationRadians: Math.PI / 2 } } });
+    assert.deepEqual(changed.settings.orbit, original.settings.orbit);
+    assert.deepEqual(changed.settings.animation, original.settings.animation);
+    assert.equal(engine.frames.at(-1).options.cameraCut, true);
+    assert.equal(engine.scene, scene, 'Lighting and shading never recreate materials or the asset');
+    assert.equal(engine.sceneCalls.length, 1);
+    const receipt = await runtime.captureState(1);
+    assert.deepEqual(receipt.state.submittedView.controls, changed.settings.effective);
+    assert.deepEqual(receipt.state.settings.environment, changed.settings.environment);
+    await runtime.setEnvironment({ preset: 'off' });
+    assert.equal(engine.frames.at(-1).options.imported.lighting.environment, null);
+    await runtime.setEnvironment({ preset: 'sky' });
+    await runtime.setLightingPreset('daylight');
+    assert.deepEqual(engine.frames.at(-1).options.imported.lighting.environment, { preset: 'sky', intensity: 2, rotationRadians: Math.PI / 2 });
+    await runtime.selectModel(model('next'));
+    assert.equal(runtime.getState().settings.shading, 'relit');
+    assert.deepEqual(runtime.getState().settings.environment, { preset: 'sky', intensity: 2, rotationRadians: Math.PI / 2 });
+  });
+
+  test('invalid shading and environment values reject before touching a ready view', async () => {
+    await runtime.selectModel(model());
+    const before = runtime.getState();
+    for (const value of [undefined, null, 'unlit', {}, 0]) {
+      await assert.rejects(runtime.setShading(value), /authored or relit/);
+      assert.deepEqual(runtime.getState(), before);
+    }
+    for (const value of [null, [], { preset: 'hdr' }, { intensity: -1 }, { intensity: 65 }, { intensity: NaN },
+      { rotationRadians: Infinity }, { rotationRadians: 1e6 + 1 }, { intensity: undefined }, { uri: 'image.hdr' }]) {
+      await assert.rejects(runtime.setEnvironment(value));
+      assert.deepEqual(runtime.getState(), before);
+    }
+  });
+
+  test('texture recreation preflights fallback once, shares loaded bytes, and preserves the current view and playback', async () => {
+    engine.info.maxTextureDimension2D = 8192;
+    const loaded = asset(model().entryUrl, [{ id: 'walk', name: 'Walk', duration: 4 }]);
+    const bytes = new Uint8Array([1, 2, 3]);
+    loaded.images.push({ bytes, width: 8192, height: 8192 });
+    loaded.materials.push({ name: 'source material' });
+    loaded.primitives.push({ vertices: new Float32Array([1, 2, 3]) });
+    loadHook = async () => loaded;
+    await runtime.selectModel(model());
+    assert.equal(loadCalls[0].options.maxTextureDimension, 4096);
+    assert.equal(estimateCalls[0].options.maxTextureDimension, 4096);
+    assert.equal(runtime.getState().settings.textureDecision.selectedCap, 4096);
+    assert.equal(loaded.maxTextureDimension, 2048, 'Preparing the default cap does not mutate the loaded asset');
+    await runtime.setOrbit({ azimuth: 1.2, target: [1, 2, 3], distance: 8 });
+    await runtime.setAnimation({ clipId: 'walk', timeSeconds: 1.25, loop: false, playing: true });
+    await runtime.setTemporal(false); await runtime.setScenePreset('ground');
+    await runtime.setLightingPreset('daylight'); await runtime.setShading('relit');
+    await runtime.setEnvironment({ preset: 'sky', intensity: 2, rotationRadians: 1 });
+    const before = runtime.getState(), previousAsset = engine.scene;
+    const budget = 512 * 1024 * 1024;
+    estimateCalls.length = 0;
+    estimateHook = (_asset, options) => ({ requestedMaxTextureDimension: options.maxTextureDimension,
+      effectiveMaxTextureDimension: options.maxTextureDimension, textureBudgetBytes: budget,
+      gpuTextureBytes: options.maxTextureDimension === 8192 ? budget + 1 : budget - 1, fitsBudget: options.maxTextureDimension !== 8192 });
+    const creating = engine.holdScene(), fence = engine.holdFence();
+    const pending = runtime.setTextureCap(8192);
+    let settled = false; pending.then(() => { settled = true; }, () => { settled = true; });
+    await creating.entered.promise;
+    assert.deepEqual(estimateCalls.map(call => call.options.maxTextureDimension), [8192, 4096]);
+    assert.equal(engine.sceneCalls.length, 2, 'Budget fallback causes one candidate creation, not failed GPU attempts');
+    const candidate = engine.sceneCalls.at(-1).asset;
+    assert.ok(Object.isFrozen(candidate)); assert.notEqual(candidate, previousAsset);
+    for (const key of ['images', 'materials', 'primitives', 'clips', 'bounds']) assert.equal(candidate[key], loaded[key]);
+    assert.equal(candidate.images[0].bytes, bytes); assert.deepEqual([...bytes], [1, 2, 3]);
+    assert.equal(candidate.maxTextureDimension, 4096); assert.equal(previousAsset.maxTextureDimension, 4096);
+    assert.equal(raf.size, 0); assert.equal(runtime.getState().busy, 'settings');
+    await assert.rejects(runtime.setOrbit({ distance: 2 }), /ready and idle/);
+    await assert.rejects(runtime.captureState(1), /ready and idle/);
+    await assert.rejects(runtime.selectModel(model('blocked')), /still settling/);
+    creating.done.resolve(); await fence.entered.promise;
+    assert.equal(settled, false);
+    assert.deepEqual(engine.frames.at(-1).options.imported, before.settings.effective);
+    assert.equal(engine.frames.at(-1).options.temporal, false); assert.equal(engine.frames.at(-1).options.cameraCut, true);
+    fence.done.resolve(); await pending;
+    const after = runtime.getState();
+    assert.deepEqual(after.settings, { ...before.settings, textureCap: 8192, textureDecision: after.settings.textureDecision });
+    assert.equal(after.settings.textureDecision.budgetFallback, true);
+    assert.equal(after.settings.textureDecision.effectiveCap, 4096);
+    assert.equal(after.viewRevision, before.viewRevision + 1); assert.equal(after.live, true); assert.equal(raf.size, 1);
+    assert.equal(after.sceneCommit.sceneGeneration, before.sceneCommit.sceneGeneration + 1);
+    assert.deepEqual(after.frame.scene, after.sceneCommit); assert.equal(loadCalls.length, 1);
+    runtime.resize(288, 480);
+    assert.deepEqual(runtime.getState().settings.orbit, before.settings.orbit, 'Texture recreation preserves manual orbit mode');
+    const receipt = await runtime.captureState(1);
+    assert.equal(receipt.state.settings.textureCap, 8192); assert.equal(receipt.state.settings.textureDecision.selectedCap, 4096);
+    assert.deepEqual(receipt.state.frame.scene, receipt.state.sceneCommit);
+    await runtime.selectModel(model('next'));
+    assert.equal(loadCalls.at(-1).options.maxTextureDimension, 8192, 'Future models retain the requested cap, not the fallback cap');
+  });
+
+  test('texture preflight rejects invalid, throwing and over-budget requests without changing the old ready view', async () => {
+    await runtime.selectModel(model());
+    const before = runtime.getState(), oldAsset = engine.scene;
+    estimateCalls.length = 0;
+    for (const value of [undefined, null, 1024, 16384, '4096']) await assert.rejects(runtime.setTextureCap(value), /must be 2048/);
+    assert.equal(estimateCalls.length, 0);
+    const failure = new Error('invalid image metadata'); estimateHook = () => { throw failure; };
+    await assert.rejects(runtime.setTextureCap(8192), error => error === failure);
+    assert.equal(estimateCalls.length, 1, 'Estimator failure never triggers fallback');
+    estimateCalls.length = 0;
+    estimateHook = (_asset, options) => ({ requestedMaxTextureDimension: options.maxTextureDimension,
+      effectiveMaxTextureDimension: Math.min(options.maxTextureDimension, options.maxTextureDimension2D),
+      gpuTextureBytes: 101, textureBudgetBytes: 100, fitsBudget: false });
+    await assert.rejects(runtime.setTextureCap(4096), error => error.code === 'GALLERY_TEXTURE_BUDGET' && error.textureDecision.status === 'unsupported');
+    assert.deepEqual(estimateCalls.map(call => call.options.maxTextureDimension), [4096, 2048]);
+    assert.deepEqual(runtime.getState(), before); assert.equal(engine.scene, oldAsset);
+    assert.equal(engine.sceneCalls.length, 1); assert.equal(loadCalls.length, 1);
+  });
+
+  test('a healthy pre-commit texture failure retains the old generation, controls and live preference', async () => {
+    await runtime.selectModel(model()); runtime.setLive(true);
+    const before = runtime.getState(), oldAsset = engine.scene, frames = engine.frames.length;
+    const failure = new Error('candidate decoder failed');
+    engine.sceneFailures.push({ stage: 'before', error: failure });
+    await assert.rejects(runtime.setTextureCap(2048), error => error === failure);
+    const after = runtime.getState();
+    assert.equal(after.phase, 'ready'); assert.equal(after.error, null); assert.equal(after.busy, null); assert.equal(after.live, true);
+    assert.deepEqual(after.settings, before.settings); assert.deepEqual(after.sceneCommit, before.sceneCommit);
+    assert.equal(after.viewRevision, before.viewRevision); assert.equal(engine.scene, oldAsset);
+    assert.equal(engine.frames.length, frames); assert.equal(engine.sceneCalls.length, 2); assert.equal(loadCalls.length, 1); assert.equal(raf.size, 1);
+  });
+
+  test('a pre-commit texture rejection settles a queued portrait resize on the old fitted scene before returning', async () => {
+    await runtime.selectModel(model()); runtime.setLive(true);
+    const before = runtime.getState(), oldAsset = engine.scene, frames = engine.frames.length;
+    const failure = new Error('candidate decoder failed');
+    engine.sceneFailures.push({ stage: 'before', error: failure });
+    const creating = engine.holdScene();
+    const pending = runtime.setTextureCap(2048);
+    let settled = false; pending.then(() => { settled = true; }, () => { settled = true; });
+    const rejected = assert.rejects(pending, error => error === failure);
+    await creating.entered.promise;
+    runtime.resize(288, 480);
+    assert.deepEqual([canvas.width, canvas.height], [512, 512]);
+    const fence = engine.holdFence();
+    creating.done.resolve(); await fence.entered.promise;
+    assert.equal(settled, false, 'Rejected texture request must wait for the retained scene resize fence');
+    assert.equal(runtime.getState().busy, 'settings'); assert.equal(raf.size, 0);
+    assert.equal(engine.scene, oldAsset); assert.equal(engine.frames.length, frames + 1);
+    assert.deepEqual(engine.frames.at(-1).scene, before.sceneCommit);
+    assert.deepEqual([engine.frames.at(-1).width, engine.frames.at(-1).height], [288, 480]);
+    assertFrameFits(engine.frames.at(-1), oldAsset.bounds);
+    fence.done.resolve(); await rejected;
+    const after = runtime.getState();
+    assert.equal(after.phase, 'ready'); assert.equal(after.error, null); assert.equal(after.busy, null);
+    assert.equal(after.live, true); assert.equal(raf.size, 1);
+    assert.deepEqual(after.sceneCommit, before.sceneCommit);
+    assert.equal(after.settings.textureCap, before.settings.textureCap);
+    assert.deepEqual(after.settings.textureDecision, before.settings.textureDecision);
+    assert.equal(after.viewRevision, before.viewRevision + 1, 'Only the accepted resize advances the view revision');
+    assert.deepEqual(after.viewport, { width: 288, height: 480 });
+    assert.equal(after.frame.frameId, before.frame.frameId + 1); assert.deepEqual(after.frame.scene, before.sceneCommit);
+    assert.equal(engine.frames.length, frames + 1); assert.equal(engine.sceneCalls.length, 2); assert.equal(loadCalls.length, 1);
+  });
+
+  test('a post-commit retirement failure adopts the new cap and identity then faults without claiming rollback', async () => {
+    await runtime.selectModel(model());
+    const before = runtime.getState(), frames = engine.frames.length;
+    engine.sceneFailures.push({ stage: 'after', error: new Error('retirement failed') });
+    await assert.rejects(runtime.setTextureCap(2048), error => error.commitOccurred === true);
+    const after = runtime.getState();
+    assert.equal(after.phase, 'error'); assert.equal(after.live, false);
+    assert.equal(after.settings.textureCap, 2048); assert.equal(after.asset.maxTextureDimension, 2048);
+    assert.deepEqual(after.sceneCommit, engine.sceneIdentity); assert.equal(after.sceneCommit.sceneGeneration, before.sceneCommit.sceneGeneration + 1);
+    assert.equal(engine.frames.length, frames); assert.deepEqual(after.frame.scene, before.sceneCommit, 'Historical submitted frame is not relabeled as the unrendered candidate');
+    await assert.rejects(runtime.captureState(1), /ready and idle/);
+  });
+
+  for (const failureKind of ['device-loss', 'gpu-error', 'identity-mismatch']) {
+    test(`a rejected texture candidate cannot retain readiness after ${failureKind}`, async () => {
+      await runtime.selectModel(model());
+      const frames = engine.frames.length, hold = engine.holdScene();
+      engine.sceneFailures.push({ stage: 'before', error: new Error('candidate rejected') });
+      const pending = runtime.setTextureCap(2048), rejected = assert.rejects(pending);
+      await hold.entered.promise;
+      if (failureKind === 'device-loss') engine.state = 'lost';
+      else if (failureKind === 'gpu-error') { engine.gpuErrorCount = 1; engine.lastGpuError = 'GPU failure'; }
+      else engine.sceneIdentity = { ...engine.sceneIdentity, sceneGeneration: 99 };
+      hold.done.resolve(); await rejected;
+      assert.equal(runtime.getState().phase, 'error'); assert.equal(engine.frames.length, frames); assert.equal(raf.size, 0);
+    });
+  }
+
+  test('disposal during texture creation aborts it and prevents late adoption or submission', async () => {
+    await runtime.selectModel(model());
+    const frames = engine.frames.length, hold = engine.holdScene();
+    const pending = runtime.setTextureCap(2048), rejected = assert.rejects(pending, { name: 'AbortError' });
+    await hold.entered.promise;
+    runtime.dispose(); assert.equal(engine.sceneCalls.at(-1).signal.aborted, true);
+    hold.done.resolve(); await rejected;
+    assert.equal(runtime.getState().phase, 'disposed'); assert.equal(runtime.getState().asset, null);
+    assert.equal(runtime.getState().settings.textureCap, 4096); assert.equal(engine.frames.length, frames); assert.equal(raf.size, 0);
+  });
+
+  test('a failed fence after texture commitment keeps candidate metadata and faults', async () => {
+    await runtime.selectModel(model());
+    const hold = engine.holdFence();
+    const pending = runtime.setTextureCap(2048), rejected = assert.rejects(pending, /fence failed/);
+    await hold.entered.promise; hold.done.reject(new Error('fence failed')); await rejected;
+    const state = runtime.getState();
+    assert.equal(state.phase, 'error'); assert.equal(state.settings.textureCap, 2048);
+    assert.deepEqual(state.sceneCommit, state.frame.scene); assert.deepEqual(state.sceneCommit, engine.sceneIdentity);
+  });
+
   test('a superseded loader resolving late cannot commit, submit or relabel the newer model', async () => {
     const gate = deferred(), older = model('older'), newer = model('newer');
     loadHook = url => url === older.entryUrl ? gate.promise : Promise.resolve(asset(url));
@@ -427,12 +668,13 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     assert.notEqual(runtime.getState().settings.orbit.target[0], 99, 'Returned snapshots must not alias retained runtime data');
   });
 
-  for (const operation of ['load', 'settings', 'capture']) {
+  for (const operation of ['load', 'settings', 'capture', 'texture-cap']) {
     test(`resize queued during a ${operation} fence is submitted and fenced before return`, async () => {
       if (operation !== 'load') await runtime.selectModel(model());
       const first = engine.holdFence();
       const pending = operation === 'load' ? runtime.selectModel(model())
-        : operation === 'settings' ? runtime.setLightingPreset('daylight') : runtime.captureState(2);
+        : operation === 'settings' ? runtime.setLightingPreset('daylight')
+        : operation === 'texture-cap' ? runtime.setTextureCap(2048) : runtime.captureState(2);
       let settled = false; pending.then(() => { settled = true; }, () => { settled = true; });
       await first.entered.promise;
       runtime.resize(288, 480);

@@ -112,6 +112,9 @@ h1, h2 { font-weight: 600; }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 224px; gap: 25px; align-items: start; }
 .preview-panel { min-width: 0; }
 .view-controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+.quality-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.environment-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.quality-note { margin-bottom: 16px; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .control-field { min-width: 0; }
 .control-field label { display: block; margin-bottom: 7px; font-size: 11px; font-weight: 600; }
 .control-field select {
@@ -124,6 +127,10 @@ h1, h2 { font-weight: 600; }
   font-size: 12px;
   text-overflow: ellipsis;
 }
+.control-field input[type="number"] { width: 100%; min-height: 42px; padding: 9px 11px; border: 1px solid #d6dbcf; border-radius: 5px; color: var(--ink); background: var(--surface); font-size: 12px; }
+.allocation-details { margin-top: 10px; }
+.allocation-details summary { cursor: pointer; font-weight: 600; }
+.allocation-details pre { max-height: 240px; overflow: auto; padding: 10px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); font-size: 10px; line-height: 1.6; }
 .viewport-wrap { position: relative; width: 100%; min-height: 340px; height: clamp(340px, 52vh, 660px); overflow: hidden; border: 1px solid #303a33; border-radius: 8px; background: var(--stage); }
 #viewport { display: block; width: 100%; height: 100%; touch-action: none; }
 .viewport-label { position: absolute; top: 17px; left: 18px; display: flex; align-items: center; gap: 7px; pointer-events: none; color: #bbc6bd; font-size: 10px; letter-spacing: 0.4px; }
@@ -208,6 +215,8 @@ h1, h2 { font-weight: 600; }
 
 @media (max-width: 760px) {
   .view-controls { grid-template-columns: 1fr 1fr; }
+  .quality-controls { grid-template-columns: 1fr 1fr; }
+  .quality-controls > :last-child { grid-column: 1 / -1; }
   .gallery-shell { grid-template-columns: minmax(0, 1fr); }
   .catalog-panel { gap: 18px; padding: 20px; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { padding: 0; font-size: 26px; }
