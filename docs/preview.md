@@ -110,7 +110,8 @@ the session after the cleanup deadline and triggers teardown; late work never
 regains permission to mutate a fresh session. `dispose()` releases driver-owned
 resources exactly once and remains safe to call repeatedly.
 
-`npm run check:preview` builds authoring, typechecks/tests/builds preview and runs
+After `npm run build` produces Core's distribution, `npm run check:preview`
+builds authoring, typechecks/tests/builds preview and runs
 an isolated packed CPU consumer with Rust command guards. The suites cover
 supersession, deep snapshots, historical/current commit disagreement, readiness,
 stale tokens, explicit frame evidence, disposal, cancellation through publication,
