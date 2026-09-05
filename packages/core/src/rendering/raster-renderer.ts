@@ -7,6 +7,7 @@ import type { CameraFrame } from './raster-math.js';
 import { presentationShader, rasterShader } from './raster-shaders.js';
 import { TemporalResolve } from './temporal-resolve.js';
 import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from './raster-types.js';
+import type { RasterGeometryProvider } from './geometry-provider.js';
 
 const bufferUsage = { copyDestination: 0x8, index: 0x10, vertex: 0x20, uniform: 0x40 };
 const textureUsage = { copyDestination: 0x2, binding: 0x4, attachment: 0x10 };
@@ -14,7 +15,7 @@ const shadowSize = 2048;
 const materialSize = 64;
 const frameUniformBytes = 352;
 const presentationUniformBytes = 16;
-const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'] as const;
+const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage'] as const;
 
 export function normalizeRasterControls(controls: RasterControls = {}): Required<RasterControls> {
   if (!controls || typeof controls !== 'object'
@@ -50,9 +51,9 @@ interface Targets {
 interface StaticResources {
   readonly buffers: readonly GPUBuffer[];
   readonly textures: readonly GPUTexture[];
-  readonly vertices: GPUBuffer;
-  readonly indices: GPUBuffer;
-  readonly instances: GPUBuffer;
+  readonly vertices: GPUBuffer | undefined;
+  readonly indices: GPUBuffer | undefined;
+  readonly instances: GPUBuffer | undefined;
   readonly frameUniform: GPUBuffer;
   readonly presentationUniform: GPUBuffer;
   readonly shadowView: GPUTextureView;
@@ -82,10 +83,11 @@ export class RasterRenderer {
     private readonly temporal: TemporalResolve,
     private readonly instanceCount: number,
     private readonly halfExtent: number,
-  ) { this.lightMatrix = createLightMatrix(halfExtent); }
+    private readonly geometry?: RasterGeometryProvider,
+  ) { this.lightMatrix = geometry?.lightMatrix ?? createLightMatrix(halfExtent); }
 
-  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}): Promise<RasterRenderer> {
-    const data = buildProceduralScene(options);
+  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider): Promise<RasterRenderer> {
+    const data = geometry ? undefined : buildProceduralScene(options);
     if (device.limits.maxTextureDimension2D < shadowSize) {
       throw new StrataError('UNSUPPORTED_LIMIT', `Raster shadows require ${shadowSize}-pixel textures.`);
     }
@@ -117,12 +119,12 @@ export class RasterRenderer {
           { shaderLocation: 5, format: 'float32x4', offset: 32 },
         ] },
       ];
-      const module = device.createShaderModule({ label: 'Strata PBR and shadow shader', code: rasterShader });
+      const module = device.createShaderModule({ label: 'Strata PBR and shadow shader', code: rasterShader + (geometry?.shaderSource ?? '') });
       const presentModule = device.createShaderModule({ label: 'Strata tone mapping and debug shader', code: presentationShader });
       const [rasterPipeline, shadowPipeline, presentationPipeline] = await Promise.all([
         device.createRenderPipelineAsync({
           label: 'Strata PBR MRT pipeline', layout: 'auto',
-          vertex: { module, entryPoint: 'vertexMain', buffers: vertexBuffers },
+          vertex: { module, entryPoint: geometry?.vertexEntryPoint ?? 'vertexMain', buffers: geometry ? geometry.vertexBuffers ?? [] : vertexBuffers },
           fragment: { module, entryPoint: 'fragmentMain', targets: [
             { format: 'rgba16float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }, { format: 'rgba16float' },
           ] },
@@ -131,7 +133,7 @@ export class RasterRenderer {
         }),
         device.createRenderPipelineAsync({
           label: 'Strata directional shadow pipeline', layout: 'auto',
-          vertex: { module, entryPoint: 'shadowMain', buffers: vertexBuffers },
+          vertex: { module, entryPoint: geometry?.shadowEntryPoint ?? 'shadowMain', buffers: geometry ? geometry.vertexBuffers ?? [] : vertexBuffers },
           primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
           depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
         }),
@@ -142,14 +144,16 @@ export class RasterRenderer {
           primitive: { topology: 'triangle-list' },
         }),
       ]);
-      const vertices = buffer('Strata PBR vertices', data.vertices.byteLength, bufferUsage.vertex);
-      const indices = buffer('Strata PBR indices', data.indices.byteLength, bufferUsage.index);
-      const instances = buffer('Strata PBR instances', data.instances.byteLength, bufferUsage.vertex);
+      const vertices = data ? buffer('Strata PBR vertices', data.vertices.byteLength, bufferUsage.vertex) : undefined;
+      const indices = data ? buffer('Strata PBR indices', data.indices.byteLength, bufferUsage.index) : undefined;
+      const instances = data ? buffer('Strata PBR instances', data.instances.byteLength, bufferUsage.vertex) : undefined;
       const frameUniform = buffer('Strata current and previous transforms', frameUniformBytes, bufferUsage.uniform);
       const presentationUniform = buffer('Strata presentation settings', presentationUniformBytes, bufferUsage.uniform);
-      device.queue.writeBuffer(vertices, 0, data.vertices);
-      device.queue.writeBuffer(indices, 0, data.indices);
-      device.queue.writeBuffer(instances, 0, data.instances);
+      if (data) {
+        device.queue.writeBuffer(vertices!, 0, data.vertices);
+        device.queue.writeBuffer(indices!, 0, data.indices);
+        device.queue.writeBuffer(instances!, 0, data.instances);
+      }
       const material = createMaterialTextures(materialSize);
       const baseTexture = texture('Strata sRGB base-color fixture', materialSize, 'rgba8unorm-srgb', textureUsage.copyDestination | textureUsage.binding);
       const mrTexture = texture('Strata linear metallic-roughness fixture', materialSize, 'rgba8unorm', textureUsage.copyDestination | textureUsage.binding);
@@ -167,13 +171,14 @@ export class RasterRenderer {
         { binding: 3, resource: materialSampler }, { binding: 4, resource: shadowView }, { binding: 5, resource: shadowSampler },
       ] });
       temporal = await TemporalResolve.create(device);
-      const geometryBytes = data.vertices.byteLength + data.indices.byteLength + data.instances.byteLength;
+      geometry?.attachPipelines(rasterPipeline, shadowPipeline);
+      const geometryBytes = data ? data.vertices.byteLength + data.indices.byteLength + data.instances.byteLength : 0;
       return new RasterRenderer(device, {
         buffers, textures, vertices, indices, instances, frameUniform, presentationUniform,
         shadowView, shadowBindings, rasterBindings, rasterPipeline, shadowPipeline, presentationPipeline,
         bufferBytes: geometryBytes + frameUniformBytes + presentationUniformBytes,
         initialUploadBytes: geometryBytes + material.baseColor.byteLength + material.metallicRoughness.byteLength,
-      }, temporal, data.instanceCount, data.halfExtent);
+      }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry);
     } catch (cause) {
       temporal?.dispose();
       for (const resource of [...buffers, ...textures]) resource.destroy();
@@ -181,8 +186,8 @@ export class RasterRenderer {
     }
   }
 
-  get initialUploadBytes(): number { return this.resources.initialUploadBytes + this.temporal.initialUploadBytes; }
-  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes; }
+  get initialUploadBytes(): number { return this.resources.initialUploadBytes + this.temporal.initialUploadBytes + (this.geometry?.initialUploadBytes ?? 0); }
+  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes + (this.geometry?.gpuBufferBytes ?? 0); }
   get gpuTextureBytes(): number {
     if (this.disposed) return 0;
     return shadowSize * shadowSize * 4 + materialSize * materialSize * 8
@@ -193,8 +198,9 @@ export class RasterRenderer {
   get outputs(): RasterOutputs | undefined { return this.targets?.views; }
 
   passNames(controls: RasterControls = {}): readonly RasterPassName[] {
+    const geometryPass: RasterPassName[] = this.geometry?.selectionPass ? ['selection'] : [];
     return normalizeRasterControls(controls).temporal
-      ? ['shadow', 'raster', 'temporal', 'presentation'] : ['shadow', 'raster', 'presentation'];
+      ? [...geometryPass, 'shadow', 'raster', 'temporal', 'presentation'] : [...geometryPass, 'shadow', 'raster', 'presentation'];
   }
 
   private resize(width: number, height: number): Targets {
@@ -236,15 +242,17 @@ export class RasterRenderer {
     const state: RasterFrameState = { width, height, time: timeSeconds, temporal: settings.temporal, jitter: settings.temporal && settings.debugView === 'final' };
     const reset = mustResetHistory(this.previousState, state, settings.cameraCut);
     if (reset) { this.jitterIndex = 0; this.historyReady = false; }
-    const camera = createRasterCamera(width, height, timeSeconds, this.halfExtent, state.jitter ? cameraJitter(this.jitterIndex) : [0, 0]);
+    const jitter = state.jitter ? cameraJitter(this.jitterIndex) : [0, 0] as const;
+    const camera = this.geometry?.camera(width, height, timeSeconds, jitter) ?? createRasterCamera(width, height, timeSeconds, this.halfExtent, jitter);
     const previous = reset ? camera : this.previousCamera ?? camera;
     const previousTime = reset ? timeSeconds : this.previousState?.time ?? timeSeconds;
     const targets = this.resize(width, height);
+    const prepared = this.geometry?.prepare(encoder, camera, width, height, reset, settings, timestamps.selection);
     const frameData = new Float32Array(frameUniformBytes / 4);
     frameData.set(camera.viewProjection, 0); frameData.set(previous.viewProjection, 16);
     frameData.set(camera.view, 32); frameData.set(previous.view, 48);
     frameData.set(this.lightMatrix, 64); frameData.set([...camera.eye, timeSeconds], 80);
-    frameData.set([previousTime, camera.far, 0, 0], 84);
+    frameData.set([previousTime, camera.far, Math.max(0, debugViews.indexOf(settings.debugView) - 6), 0], 84);
     this.device.queue.writeBuffer(this.resources.frameUniform, 0, frameData);
     const presentationData = new ArrayBuffer(presentationUniformBytes);
     new Uint32Array(presentationData)[0] = debugViews.indexOf(settings.debugView);
@@ -252,8 +260,12 @@ export class RasterRenderer {
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
     const drawGeometry = (pass: GPURenderPassEncoder, pipeline: GPURenderPipeline, bindings: GPUBindGroup): void => {
       pass.setPipeline(pipeline); pass.setBindGroup(0, bindings);
-      pass.setVertexBuffer(0, this.resources.vertices); pass.setVertexBuffer(1, this.resources.instances);
-      pass.setIndexBuffer(this.resources.indices, 'uint16'); pass.drawIndexed(36, this.instanceCount); pass.end();
+      if (this.geometry) this.geometry.draw(pass, pipeline === this.resources.shadowPipeline ? 'shadow' : 'raster');
+      else {
+        pass.setVertexBuffer(0, this.resources.vertices!); pass.setVertexBuffer(1, this.resources.instances!);
+        pass.setIndexBuffer(this.resources.indices!, 'uint16'); pass.drawIndexed(36, this.instanceCount);
+      }
+      pass.end();
     };
     const shadow = encoder.beginRenderPass({ label: 'Strata directional shadow', colorAttachments: [],
       depthStencilAttachment: { view: this.resources.shadowView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
@@ -268,10 +280,10 @@ export class RasterRenderer {
     ...(timestamps.raster ? { timestampWrites: timestamps.raster } : {}) });
     drawGeometry(raster, this.resources.rasterPipeline, this.resources.rasterBindings);
     let resolved = targets.views.hdr;
-    let drawCalls = 3;
-    let dispatchCalls = 0;
-    let uploadBytes = frameUniformBytes + presentationUniformBytes;
-    let triangles = this.instanceCount * 24 + 1;
+    let drawCalls = (prepared?.drawCalls ?? 2) + 1;
+    let dispatchCalls = prepared?.dispatchCalls ?? 0;
+    let uploadBytes = frameUniformBytes + presentationUniformBytes + (prepared?.uploadBytes ?? 0);
+    let triangles = (prepared?.triangles ?? this.instanceCount * 24) + 1;
     if (settings.temporal) {
       const temporal = this.temporal.encode(encoder, { hdr: targets.views.hdr, motion: targets.views.motion }, width, height,
         this.historyReady && !reset, timestamps.temporal);
@@ -301,6 +313,7 @@ export class RasterRenderer {
     if (this.disposed) return;
     this.disposed = true;
     this.temporal.dispose();
+    this.geometry?.dispose();
     for (const resource of [...this.resources.buffers, ...this.resources.textures, ...(this.targets?.textures ?? [])]) resource.destroy();
     this.targets = undefined;
     this.previousCamera = undefined;

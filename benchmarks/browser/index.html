@@ -9,7 +9,9 @@
       body { margin: 0; padding: 20px; }
       header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 12px; }
       h1 { margin: 0; font-size: 22px; margin-right: auto; }
-      select, button { background: #263447; border: 1px solid #506579; color: inherit; padding: 8px 14px; border-radius: 6px; font: inherit; }
+      select, button, input[type="text"] { background: #263447; border: 1px solid #506579; color: inherit; padding: 8px 14px; border-radius: 6px; font: inherit; }
+      #geometry { margin-bottom: 12px; } #geometry label { display: inline-flex; gap: 8px; align-items: center; margin: 8px 12px 8px 0; }
+      #manifest { width: min(60vw, 620px); }
       button { cursor: pointer; } button:disabled { opacity: .45; }
       canvas { display: block; width: min(100%, 1280px); aspect-ratio: 16 / 9; background: #101927; }
       output { display: block; padding: 14px 0; color: #a7d9d0; font-size: 14px; }
@@ -20,13 +22,19 @@
   <body>
     <header>
       <h1>Strata / Renderer</h1>
-      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option></select>
-      <select id="debug" aria-label="Rendering view"><option value="final">Final</option><option value="direct">Direct light</option><option value="shadow">Shadows</option><option value="depth">Depth</option><option value="normal">Normals</option><option value="motion">Motion</option><option value="material">Materials</option></select>
+      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option><option value="virtual">Cooked terrain</option></select>
+      <select id="debug" aria-label="Rendering view"><option value="final">Final</option><option value="direct">Direct light</option><option value="shadow">Shadows</option><option value="depth">Depth</option><option value="normal">Normals</option><option value="motion">Motion</option><option value="material">Materials</option><option value="clusters">Clusters</option><option value="lod">LOD</option><option value="residency">Residency</option><option value="coverage">Coverage</option></select>
       <label><input id="temporal" type="checkbox" checked> Temporal AA</label>
       <select id="resolution" aria-label="Internal render resolution"><option value="1280x720">1280 × 720</option><option value="1920x1080">1920 × 1080</option></select>
       <button id="start">Run benchmark</button>
       <button id="download" disabled>Save results</button>
     </header>
+    <details id="geometry">
+      <summary>Cooked terrain settings</summary>
+      <label>Manifest URL <input id="manifest" type="text" value="/external-assets/terrain-v1-s1337-t8-c128/manifest.json"></label>
+      <label>Geometry <select id="geometry-mode"><option value="streamed">Streamed · 8 MiB pool</option><option value="resident-lod">Resident GPU LOD</option><option value="resident-full">Resident finest</option><option value="mesh-lod">Conventional mesh LOD</option></select></label>
+      <p>Serve locally cooked data through STRATA_BENCHMARK_ASSET_DIR. The terrain tour uses a 2-pixel error target. Results record the achieved error while pages are missing.</p>
+    </details>
     <canvas width="1280" height="720" aria-label="Deterministic procedural benchmark scene"></canvas>
     <output role="status">Ready. The default run warms up for 30 seconds, then measures for 60 seconds.</output>
     <p>Keep this tab visible. Results describe this scene and hardware; advanced rendering and the final performance target remain under development.</p>

@@ -42,4 +42,14 @@ describe('benchmark measurements', () => {
     }));
     expect(summarizeFrames(frames).maxTrackedGpuTextureBytes).toBe(1024);
   });
+
+  it('requires an explicit cooked asset and bounded streaming settings', () => {
+    expect(() => normalizeOptions({ renderer: 'virtual' })).toThrow(/manifestUrl/);
+    const options = { renderer: 'virtual', manifestUrl: '/external-assets/terrain/manifest.json' } as const;
+    expect(normalizeOptions(options).poolBytes).toBe(8 * 1024 ** 2);
+    expect(normalizeOptions({ ...options, geometryMode: 'mesh-lod' }).geometryMode).toBe('mesh-lod');
+    expect(() => normalizeOptions({ ...options, pixelError: 0 })).toThrow();
+    expect(() => normalizeOptions({ ...options, pageLoadDelayMs: Infinity })).toThrow();
+    expect(() => normalizeOptions({ ...options, poolBytes: 1 })).toThrow();
+  });
 });

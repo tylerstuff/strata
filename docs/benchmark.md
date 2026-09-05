@@ -40,3 +40,7 @@ Preserve the baseline scene and camera version. For a new path, record a separat
 Set `STRATA_BENCHMARK_ASSET_DIR=/absolute/external/collection` to expose a local collection through the loopback benchmark server. `/benchmark-config.json` reports whether it is available and the catalog URL. It does not expose the absolute path. The server streams from the external directory with path and symlink containment checks; it never copies source files. The current procedural scene does not import those assets.
 
 Read [the asset policy](benchmark-assets.md), then the collection's `README.md` and `catalog.json` before choosing model entry points. Models, textures, archives, derived/converted assets and cooked copies must remain outside the repository, Git LFS, releases and CI artifacts. The server refuses external asset roots in CI. No claim about those models follows from this procedural baseline.
+
+## Cooked geometry comparison
+
+The [virtual geometry protocol](virtual-geometry.md#local-measurements) extends this runner with external manifests, manifest hashes, a capped streaming pool, fully resident GPU modes and a conventional mesh/LOD reference. Keep source, camera, error target, shadows, temporal filtering and resolution fixed across comparisons. Report achieved error and delayed feedback alongside timing, because streamed fallback can preserve coverage while temporarily using less detail. `npm run test:geometry` exercises fresh temporary procedural fixtures on the actual browser GPU; it is functional validation, not performance evidence.

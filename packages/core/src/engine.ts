@@ -3,14 +3,15 @@ import { initializeCpuRuntime } from './internal/cpu-runtime.js';
 import { GpuProfiler } from './profiling/gpu-profiler.js';
 import type { SceneRenderer } from './rendering/scene-renderer.js';
 import type { RasterRenderer } from './rendering/raster-renderer.js';
+import type { VirtualRenderer } from './geometry/virtual-renderer.js';
 import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics, RenderOptions } from './types.js';
 
-type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer };
+type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer };
 
 // Module evaluation is intentionally safe without navigator, document or Worker.
 const ownedCanvases = new WeakSet<HTMLCanvasElement>();
 const defaultTimeoutMs = 30_000;
-const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'] as const;
+const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage'] as const;
 const defaultRenderOptions: RenderOptions = Object.freeze({});
 
 function validateRenderOptions(options: RenderOptions): void {
@@ -107,6 +108,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   let cpu: Awaited<ReturnType<typeof initializeCpuRuntime>> | undefined;
   let scene: OwnedScene | undefined;
   let sceneGeneration = 0;
+  let pendingSceneAbort: AbortController | undefined;
   let profiler: GpuProfiler | undefined;
   let submittedFrames = 0;
   let totalUploadBytes = 0;
@@ -125,6 +127,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
 
   function cleanup(): void {
     sceneGeneration++;
+    pendingSceneAbort?.abort();
+    pendingSceneAbort = undefined;
     const ownedScene = scene;
     scene = undefined;
     const ownedCpu = cpu;
@@ -308,6 +312,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         pendingGpuSamples: profiler?.pendingSamples ?? 0,
         droppedGpuSamples: profiler?.droppedSamples ?? 0,
         gpuErrorCount, lastGpuError,
+        ...(scene?.kind === 'virtual' ? { geometry: scene.value.geometryTelemetry } : {}),
       };
     }
 
@@ -323,16 +328,25 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       async setScene(sceneOptions) {
         assertReady();
         if (sceneOptions !== null && (!sceneOptions || typeof sceneOptions !== 'object' || Array.isArray(sceneOptions)
-          || (sceneOptions.renderer !== undefined && sceneOptions.renderer !== 'diffuse' && sceneOptions.renderer !== 'raster'))) {
-          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse or raster, or null to clear.');
+          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual'].includes(sceneOptions.renderer)))) {
+          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse, raster or virtual, or null to clear.');
         }
+        if (sceneOptions?.renderer === 'virtual' && sceneOptions.signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
         const generation = ++sceneGeneration;
+        pendingSceneAbort?.abort();
+        pendingSceneAbort = undefined;
         if (sceneOptions === null) {
           scene?.value.dispose();
           scene = undefined;
           return;
         }
         const snapshot = { ...sceneOptions };
+        const requestAbort = new AbortController();
+        pendingSceneAbort = requestAbort;
+        const userSignal = snapshot.renderer === 'virtual' ? snapshot.signal : undefined;
+        const abortRequest = () => requestAbort.abort(userSignal?.reason);
+        userSignal?.addEventListener('abort', abortRequest, { once: true });
+        if (snapshot.renderer === 'virtual') snapshot.manifestUrl = String(snapshot.manifestUrl);
         const ownedDevice = device!;
         const assertCurrentRequest = (): void => {
           assertReady();
@@ -342,7 +356,11 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         };
         let next: OwnedScene;
         try {
-          if (snapshot.renderer === 'raster') {
+          if (snapshot.renderer === 'virtual') {
+            const { VirtualRenderer } = await import('./geometry/virtual-renderer.js');
+            assertCurrentRequest();
+            next = { kind: 'virtual', value: await VirtualRenderer.create(ownedDevice, format, { ...snapshot, signal: requestAbort.signal }) };
+          } else if (snapshot.renderer === 'raster') {
             const { RasterRenderer } = await import('./rendering/raster-renderer.js');
             assertCurrentRequest();
             next = { kind: 'raster', value: await RasterRenderer.create(ownedDevice, format, snapshot) };
@@ -352,14 +370,19 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             next = { kind: 'diffuse', value: await SceneRenderer.create(ownedDevice, format, snapshot) };
           }
         } catch (cause) {
-          assertReady();
+          assertCurrentRequest();
+          if (requestAbort.signal.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.', { cause });
           if (cause instanceof StrataError) throw cause;
           throw new StrataError('SCENE_LOAD_FAILED', 'The scene could not be initialized.', { cause });
+        } finally {
+          userSignal?.removeEventListener('abort', abortRequest);
+          if (pendingSceneAbort === requestAbort) pendingSceneAbort = undefined;
         }
         totalUploadBytes += next.value.initialUploadBytes;
-        if (generation !== sceneGeneration || state !== 'ready' || gpuErrorCount) {
+        if (generation !== sceneGeneration || state !== 'ready' || gpuErrorCount || requestAbort.signal.aborted) {
           next.value.dispose();
           assertReady();
+          if (generation === sceneGeneration && requestAbort.signal.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
           throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
         }
         const previous = scene;
@@ -370,7 +393,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         assertReady();
         const requestedControls = renderOptions ?? defaultRenderOptions;
         validateRenderOptions(requestedControls);
-        const controls = forceRasterCameraCut && scene?.kind === 'raster'
+        const controls = forceRasterCameraCut && scene && scene.kind !== 'diffuse'
           ? { ...requestedControls, cameraCut: true } : requestedControls;
         const timeSeconds = renderOptions?.timeSeconds ?? 0;
         if (!Number.isFinite(timeSeconds)) {
@@ -378,7 +401,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         }
         const started = performance.now();
         const frameId = submittedFrames + 1;
-        const passNames = scene?.kind === 'raster' ? scene.value.passNames(controls) : scene ? 'procedural' : 'clear';
+        const passNames = scene && scene.kind !== 'diffuse' ? scene.value.passNames(controls) : scene ? 'procedural' : 'clear';
         const timing = profiler?.begin(frameId, passNames);
         try {
           const encoder = device!.createCommandEncoder({ label: 'Strata frame' });
@@ -387,7 +410,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           let dispatchCalls = 0;
           let triangles = 0;
           let uploadBytes = 0;
-          if (scene?.kind === 'raster') {
+          if (scene && scene.kind !== 'diffuse') {
             ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.value.encode(
               encoder, view, canvas.width, canvas.height, timeSeconds, controls, timing?.timestamps,
             ));
@@ -411,8 +434,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           totalUploadBytes += uploadBytes;
           if (timing) profiler!.resolve(encoder, timing);
           device!.queue.submit([encoder.finish()]);
-          if (scene?.kind === 'raster') forceRasterCameraCut = false;
+          if (scene && scene.kind !== 'diffuse') forceRasterCameraCut = false;
           submittedFrames++;
+          if (scene?.kind === 'virtual') scene.value.submitted(frameId);
           if (timing) profiler!.submitted(timing);
           const stats = telemetry();
           const metrics: FrameMetrics = {
@@ -421,11 +445,14 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             allocatedGpuBufferBytes: stats.allocatedGpuBufferBytes,
             allocatedGpuTextureBytes: stats.allocatedGpuTextureBytes,
             wasmMemoryBytes: stats.wasmMemoryBytes,
+            triangleCountSourceFrameId: scene?.kind === 'virtual' ? scene.value.geometryTelemetry.sourceFrameId : frameId,
+            ...(stats.geometry ? { geometry: stats.geometry } : {}),
           };
           return metrics;
         } catch (cause) {
           // Encoding can advance ping-pong histories before a later pass or submission fails.
           forceRasterCameraCut = true;
+          if (scene?.kind === 'virtual') scene.value.cancelFrame();
           if (timing) profiler!.cancel(timing);
           throw new StrataError('RENDER_FAILED', 'WebGPU frame submission failed.', { cause });
         }
@@ -435,7 +462,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       async flushGpuTimings(timeoutMs) {
         assertReady();
         try {
-          await profiler?.flush(timeoutMs);
+        await profiler?.flush(timeoutMs);
+        if (scene?.kind === 'virtual') await scene.value.flushFeedback(timeoutMs);
         } catch (cause) {
           assertReady();
           throw cause;

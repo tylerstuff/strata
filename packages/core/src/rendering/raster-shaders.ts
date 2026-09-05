@@ -52,6 +52,7 @@ struct VertexOutput {
   @location(6) viewDepths: vec2f,
   @location(7) @interpolate(flat) metallic: f32,
   @location(8) @interpolate(flat) roughness: f32,
+  @location(9) @interpolate(flat) debugColor: vec3f,
 };
 fn rotateY(value: vec3f, yaw: f32) -> vec3f {
   let c = cos(yaw); let s = sin(yaw);
@@ -81,6 +82,7 @@ fn worldPosition(input: VertexInput, time: f32) -> vec3f {
   output.viewDepths = vec2f(-(frame.view * vec4f(current, 1.0)).z, -(frame.previousView * vec4f(previous, 1.0)).z);
   output.metallic = select(0.0, 1.0, input.instance > 0u && input.instance % 3u == 0u);
   output.roughness = select(0.8, 0.28, output.metallic > 0.5);
+  output.debugColor = vec3f(0.0);
   return output;
 }
 fn shadowVisibility(world: vec3f) -> f32 {
@@ -131,6 +133,7 @@ struct GBufferOutput {
   let previousUV = input.previousClip.xy / input.previousClip.w * vec2f(0.5, -0.5) + vec2f(0.5);
   var output: GBufferOutput;
   output.hdr = vec4f(direct, shadow);
+  if (frame.parameters.z > 0.5) { output.hdr = vec4f(input.debugColor, 1.0); }
   output.normal = vec4f(normal, roughness);
   output.material = vec4f(base, metallic);
   output.motion = vec4f(previousUV - currentUV, input.viewDepths);
@@ -172,6 +175,7 @@ fn toneMap(value: vec3f) -> vec3f {
     case 4u: { color = select(vec3f(0.0), surface.xyz * 0.5 + 0.5, velocity.z > 0.0); }
     case 5u: { color = vec3f(clamp(velocity.xy * 64.0 + 0.5, vec2f(0.0), vec2f(1.0)), 0.5); }
     case 6u: { color = vec3f(mat.a, surface.a, 0.0); }
+    case 7u, 8u, 9u, 10u: { color = raw.rgb; }
     default: { color = linearToSrgb(toneMap(textureLoad(resolved, pixel, 0).rgb)); }
   }
   return vec4f(color, 1.0);

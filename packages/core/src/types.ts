@@ -2,6 +2,10 @@ export type { ProceduralSceneOptions } from './rendering/scene-renderer.js';
 import type { ProceduralSceneOptions } from './rendering/scene-renderer.js';
 export type { RasterControls } from './rendering/raster-types.js';
 import type { RasterControls } from './rendering/raster-types.js';
+export type { VirtualSceneOptions, GeometryTelemetry, GeometryMode } from './geometry/virtual-types.js';
+import type { VirtualSceneOptions, GeometryTelemetry } from './geometry/virtual-types.js';
+
+export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions;
 
 export interface RenderOptions extends RasterControls {
   /** Deterministic scene time, independent of wall-clock scheduling. */
@@ -64,6 +68,9 @@ export interface FrameMetrics {
   readonly drawCalls: number;
   readonly dispatchCalls: number;
   readonly triangles: number;
+  /** Virtual geometry counts are delayed; this identifies their GPU feedback frame. */
+  readonly triangleCountSourceFrameId?: number | null;
+  readonly geometry?: GeometryTelemetry;
   readonly uploadBytes: number;
   readonly allocatedGpuBufferBytes: number;
   /** Texture payload estimates exclude canvas/driver allocations and alignment. */
@@ -91,6 +98,7 @@ export interface EngineTelemetry {
   readonly gpuErrorCount: number;
   /** Most recent uncaptured GPU error, capped at 2048 characters. */
   readonly lastGpuError: string | null;
+  readonly geometry?: GeometryTelemetry;
 }
 
 export interface Engine {
@@ -99,7 +107,7 @@ export interface Engine {
   /** Set drawing-buffer dimensions in physical pixels, leaving CSS size unchanged. */
   resize(width: number, height: number): void;
   /** Replace the deterministic benchmark scene, or return to the clear-only baseline. */
-  setScene(options: ProceduralSceneOptions | null): Promise<void>;
+  setScene(options: SceneOptions | null): Promise<void>;
   /** Submit a frame; the host owns scheduling. timeSeconds is deterministic scene time. */
   render(options?: RenderOptions): FrameMetrics;
   getTelemetry(): EngineTelemetry;
