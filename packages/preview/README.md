@@ -93,7 +93,10 @@ frames and seven captures across sequential API and installed-CLI sessions. It
 checks visible transform/material edits, input snapshots, same-source commit
 generations, stale tokens, resize, PNG pixels and receipt identities, zero reported
 GPU errors, disposal and CLI output. This is procedural-box correctness evidence,
-not a performance or cross-device determinism claim. The prior workflow passed
-against external Core checkpoint `b17b8ac`; the final browser check after updating
-onto integrated Core candidate `ea877dc` remains pending. Captures and reports stay outside the
-repository.
+not a performance or cross-device determinism claim. The
+[integrated workflow passed](https://github.com/tylerstuff/strata/issues/8#issuecomment-5552354035)
+on frozen preview checkpoint `1289583`, using its built workspace Core from
+candidate `ea877dc`, headed Chrome 152.0.7977.82 and an Apple `metal-3` nonfallback
+adapter. The linked record identifies the executed source and archive hashes;
+later documentation edits are outside that checkpoint. Captures and reports stay
+outside the repository.
