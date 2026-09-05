@@ -83,6 +83,89 @@ test('invalid listening ports fail before opening a server', async () => {
   for (const port of [-1, 65536, 1.5, NaN]) await assert.rejects(createBenchmarkServer({ port, assetRoot: '' }), /Port/);
 });
 
+test('gallery catalog exposes bounded metadata and contained recommended entries without copying files', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'strata-gallery-catalog-'));
+  const assetRoot = join(directory, 'assets');
+  await mkdir(join(assetRoot, 'model with spaces'), { recursive: true });
+  await writeFile(join(assetRoot, 'model with spaces/scene.gltf'), '{"asset":{"version":"2.0"}}');
+  await writeFile(join(directory, 'private.gltf'), 'private sentinel');
+  await symlink(join(directory, 'private.gltf'), join(assetRoot, 'escape.gltf'));
+  const model = {
+    id: 'test-model', title: 'A <model>', recommended_gltf: 'model with spaces/scene.gltf',
+    source_url: 'https://example.com/model', license_url: 'https://creativecommons.org/licenses/by/4.0/',
+    archive_author_credit: 'Author', license: 'CC-BY-4.0', recommended_gltf_sha256: 'a'.repeat(64),
+    recommended_counts: { triangles_stored_mesh_primitives_once: 12, meshes: 1, skins: 0, animations: 0 },
+    recommended_texture_dimensions: ['2048x1024'], recommended_extensions_used: ['KHR_materials_emissive_strength'],
+    alpha_modes: ['OPAQUE'], caveats: ['Static test fixture.'],
+  };
+  await writeFile(join(assetRoot, 'catalog.json'), JSON.stringify({ assets: [model,
+    { ...model, id: 'escape', recommended_gltf: 'escape.gltf', source_url: 'javascript:alert(1)', license_url: 'https://user:pass@example.com/' },
+    { ...model, id: 'traversal', recommended_gltf: '../private.gltf' },
+    { ...model, id: 'missing', recommended_gltf: 'missing.gltf' },
+    { ...model, id: 'remote', recommended_gltf: 'https://example.com/scene.gltf' },
+    { ...model, id: 'test-model' }, { ...model, id: '../invalid' },
+  ] }));
+  const oldCi = process.env.CI;
+  delete process.env.CI;
+  let server;
+  try {
+    server = await createBenchmarkServer({ assetRoot });
+    const response = await fetch(`${server.url}/api/gallery/catalog`);
+    const body = await response.text();
+    assert.ok(!body.includes(directory));
+    assert.ok(!body.includes('private sentinel'));
+    const catalog = JSON.parse(body);
+    assert.equal(catalog.format, 'strata.gallery.catalog');
+    assert.equal(catalog.version, 1);
+    assert.equal(catalog.available, true);
+    assert.equal(catalog.assets.length, 5);
+    assert.equal(catalog.diagnostics.length, 2);
+    const first = catalog.assets[0];
+    assert.equal(first.entryUrl, '/external-assets/model%20with%20spaces/scene.gltf');
+    assert.equal(first.sourceSha256, 'a'.repeat(64));
+    assert.equal(first.title, 'A <model>');
+    assert.equal(first.triangles, 12);
+    assert.equal(first.meshCount, 1);
+    assert.equal(first.textureMaxEdge, 2048);
+    assert.deepEqual(first.features, { requiredExtensions: [], usedExtensions: ['KHR_materials_emissive_strength'],
+      alphaModes: ['OPAQUE'], skins: 0, animations: 0, morphTargets: 0 });
+    assert.equal((await fetch(`${server.url}${first.entryUrl}`)).status, 200);
+    for (const entry of catalog.assets.slice(1)) {
+      assert.equal(entry.entryUrl, null);
+      assert.ok(entry.unavailableReason);
+    }
+    assert.equal(catalog.assets[1].sourceUrl, null);
+    assert.equal(catalog.assets[1].licenseUrl, null);
+    const head = await fetch(`${server.url}/api/gallery/catalog`, { method: 'HEAD' });
+    assert.equal(head.headers.get('content-length'), String(Buffer.byteLength(body)));
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+    assert.equal((await fetch(`${server.url}/api/gallery/catalog`, { method: 'POST' })).status, 405);
+    for (const path of ['main.ts', 'catalog.ts', 'state.ts', '../README.md']) {
+      assert.equal((await fetch(`${server.url}/gallery/${path}`)).status, 404);
+    }
+    await writeFile(join(assetRoot, 'catalog.json'), '{');
+    const invalid = await (await fetch(`${server.url}/api/gallery/catalog`)).json();
+    assert.equal(invalid.available, false);
+    assert.deepEqual(invalid.assets, []);
+    assert.equal(invalid.diagnostics.length, 1);
+    assert.ok(!JSON.stringify(invalid).includes(directory));
+  } finally {
+    await server?.close();
+    if (oldCi === undefined) delete process.env.CI; else process.env.CI = oldCi;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('gallery without a configured collection reports an actionable empty state', async () => {
+  const server = await createBenchmarkServer({ assetRoot: '' });
+  try {
+    const result = await (await fetch(`${server.url}/api/gallery/catalog`)).json();
+    assert.equal(result.available, false);
+    assert.deepEqual(result.assets, []);
+    assert.match(result.diagnostics[0], /STRATA_BENCHMARK_ASSET_DIR/);
+  } finally { await server.close(); }
+});
+
 test('CI procedural route serves only bounded generated fixture paths with symlink containment', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'strata-geometry-fixture-'));
   const root = join(directory, 'cooked');

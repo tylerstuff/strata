@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readGalleryCatalog } from './gallery-catalog.mjs';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const mimeTypes = {
@@ -72,6 +73,7 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
   const roots = [
     ['/packages/core/dist/', resolve(canonicalRepository, 'packages/core/dist')],
     ['/benchmarks/browser/', resolve(canonicalRepository, 'benchmarks/browser')],
+    ['/gallery/', resolve(canonicalRepository, 'examples/gallery'), new Set(['index.html', 'gallery.css', 'app.js', 'app.js.map'])],
   ];
   // Canonicalizing the allowed roots prevents a symlink in a served file from
   // escaping its own package/fixture directory, including into the repository.
@@ -100,9 +102,15 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405);
     try {
       const url = new URL(request.url, 'http://127.0.0.1');
-      const path = decodeURIComponent(url.pathname === '/' ? '/benchmarks/browser/index.html' : url.pathname);
+      const path = decodeURIComponent(url.pathname === '/' ? '/benchmarks/browser/index.html'
+        : url.pathname === '/gallery/' ? '/gallery/index.html' : url.pathname);
       if (path.includes('\0') || path.includes('\\')) return fail(404);
       if (path === '/favicon.ico') return response.writeHead(204, headers).end();
+      if (path === '/api/gallery/catalog') {
+        const body = JSON.stringify(await readGalleryCatalog(canonicalAssets, containedFile));
+        response.writeHead(200, { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+        return response.end(request.method === 'HEAD' ? undefined : body);
+      }
       if (path === '/benchmark-config.json') {
         const body = JSON.stringify({ externalAssets: { available: catalogAvailable, catalogUrl: catalogAvailable ? '/external-assets/catalog.json' : null } });
         response.writeHead(200, { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
