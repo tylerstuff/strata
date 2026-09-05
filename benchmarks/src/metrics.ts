@@ -83,6 +83,7 @@ export interface BenchmarkOptions {
   traceProxyUrl?: string;
   terrainColor: 'green' | 'neutral';
   geometryMode: GeometryMode;
+  residencyPolicy: 'greedy' | 'retain-fallback';
   poolBytes: number;
   pixelError: number;
   pageLoadDelayMs: number;
@@ -118,6 +119,7 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     ...(input.traceProxyUrl === undefined ? {} : { traceProxyUrl: input.traceProxyUrl }),
     terrainColor: input.terrainColor ?? 'green',
     geometryMode: input.geometryMode ?? 'streamed',
+    residencyPolicy: input.residencyPolicy ?? 'greedy',
     poolBytes: input.poolBytes ?? (integrated ? 1 : 8) * 1024 * 1024,
     pixelError: input.pixelError ?? 2,
     pageLoadDelayMs: input.pageLoadDelayMs ?? 0,
@@ -150,6 +152,10 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     throw new RangeError('Unknown renderer, temporal setting, or debug view.');
   }
   if (result.renderer === 'diffuse' && result.debugView !== 'final') throw new RangeError('Debug views require the raster renderer.');
+  if (!['greedy', 'retain-fallback'].includes(result.residencyPolicy)
+    || (result.residencyPolicy !== 'greedy' && (!(result.renderer === 'virtual' || integrated) || result.geometryMode !== 'streamed'))) {
+    throw new RangeError('Fallback retention requires streamed virtual or integrated geometry.');
+  }
   if (result.renderer === 'virtual' || integrated) {
     if (!result.manifestUrl || typeof result.manifestUrl !== 'string') throw new RangeError('Virtual geometry requires manifestUrl.');
     if (!['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(result.geometryMode)

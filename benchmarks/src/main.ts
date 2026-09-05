@@ -42,11 +42,13 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
     const initializedAt = performance.now();
     await engine.setScene(options.renderer === 'virtual' ? {
       renderer: 'virtual', manifestUrl: options.manifestUrl!, geometryMode: options.geometryMode,
+      residencyPolicy: options.residencyPolicy,
       poolBytes: options.poolBytes, pixelError: options.pixelError,
       pageLoadDelayMs: options.pageLoadDelayMs, cameraMode: options.cameraMode as 'tour' | 'coverage',
     } : integrated ? {
       renderer: 'integrated', manifestUrl: options.manifestUrl!, traceProxyUrl: options.traceProxyUrl!,
       geometryMode: options.geometryMode, poolBytes: options.poolBytes, pixelError: options.pixelError,
+      residencyPolicy: options.residencyPolicy,
       pageLoadDelayMs: options.pageLoadDelayMs, cameraMode: options.cameraMode as 'tour' | 'receiver' | 'overview' | 'terrain-witness',
       terrainColor: options.terrainColor, probesPerUpdate: options.probesPerUpdate, raysPerProbe: options.raysPerProbe,
       resolutionScale: options.reflectionResolutionScale, maxRaysPerFrame: options.reflectionMaxRays, roughness: options.reflectionRoughness,
@@ -60,6 +62,9 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       throw new Error('A software/fallback adapter is only valid for smoke tests, not performance reports.');
     }
     const initialTelemetry = engine.getTelemetry();
+    if (options.residencyPolicy === 'retain-fallback' && initialTelemetry.geometry?.residencyPolicy !== 'retain-fallback') {
+      throw new Error('The requested fallback-retention policy was not activated by the runtime.');
+    }
     const frames: FrameSample[] = [];
     const samplesById = new Map<number, FrameSample>();
     let captureStart = 0;
@@ -185,14 +190,14 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
         cameraPath: integrated ? `integrated-${options.cameraMode}-v1` : gi ? `${reflections ? 'reflections' : 'gi'}-${options.cameraMode}-v1` : virtual ? geometry?.cameraPath : 'orbit-20s-v1',
         renderPath: integrated ? 'integrated-raster-streaming-gi-reflections-v1' : reflections ? 'world-space-selective-reflections-v1' : gi ? 'world-space-diffuse-gi-v1' : virtual ? 'virtual-pbr-shadow-temporal-v1' : options.renderer === 'diffuse' ? 'diffuse-raster-v1' : 'pbr-shadow-temporal-v1',
         renderer: options.renderer, temporal: options.renderer !== 'diffuse' && options.temporal, debugView: options.debugView,
-        externalAssetsUsed: virtual, ...(virtual ? { geometryMode: options.geometryMode, sourceTriangleCount: geometry?.sourceTriangleCount, uniqueCompiledBytes: geometry?.uniqueCompiledBytes } : {}),
+        externalAssetsUsed: virtual, ...(virtual ? { geometryMode: options.geometryMode, residencyPolicy: geometry?.residencyPolicy ?? 'greedy', sourceTriangleCount: geometry?.sourceTriangleCount, uniqueCompiledBytes: geometry?.uniqueCompiledBytes } : {}),
         ...(gi ? { giEnabled: options.giEnabled, giScenario: options.giScenario, sourceTriangleCount: integrated ? 131228 : reflections ? 156 : 132, ...(reflections ? { reflectionMode: options.reflectionMode } : {}) } : {}),
         ...(integrated ? { terrainSourceTriangleCount: 131072, rigidSourceTriangleCount: 156, traceTriangleCount: 2204, terrainColor: options.terrainColor } : {}),
       },
       quality: options.renderer !== 'diffuse' ? {
         shadowMapSize: 2048, shadowKernel: '3x3-comparison', materialFixture: integrated ? 'shared-courtyard-lambert-metallic-v1' : reflections ? 'shared-metallic-reflector-v1' : gi ? 'shared-flat-lambertian-v1' : virtual ? 'terrain-checker-v1' : 'checker-metal-rough-v1', exposure: 1,
         temporalFilter: 'depth-qualified-bilinear-clamped-v1', temporalHistoryWeight: 0.9, jitterSequenceLength: 8,
-        ...(virtual ? { geometryMode: options.geometryMode, poolBytes: options.poolBytes, pixelError: options.pixelError, pageLoadDelayMs: options.pageLoadDelayMs,
+        ...(virtual ? { geometryMode: options.geometryMode, residencyPolicy: options.residencyPolicy, poolBytes: options.poolBytes, pixelError: options.pixelError, pageLoadDelayMs: options.pageLoadDelayMs,
           shadowGeometry: 'selected-visible-lod-and-offscreen-roots', manifestUrl: options.manifestUrl } : {}),
         ...(integrated ? { traceProxyUrl: options.traceProxyUrl, terrainColor: options.terrainColor,
           representation: finalTelemetry.integrated, scenario: 'courtyard-60s-v1', dynamicResolution: false } : {}),
