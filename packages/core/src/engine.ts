@@ -140,6 +140,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   let forceRasterCameraCut = false;
   let gpuErrorCount = 0;
   let lastGpuError: string | null = null;
+  // Shared-primary queue failures invalidate its optional numerical epoch. The
+  // ordinary path retains its existing queue-failure behavior.
+  let sharedPrimaryWorkFailure: StrataError | undefined;
   let ownsCanvas = true;
   let initialized = false;
   let state: EngineState = 'ready';
@@ -222,9 +225,16 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     if (!ownsCanvas || state === 'disposed' || state === 'lost') return;
     gpuErrorCount++;
     lastGpuError = String(event.error?.message ?? 'Uncaptured GPU error').slice(0, 2048);
+    faultSharedPrimaryEpoch(new StrataError('GPU_VALIDATION_FAILED', 'Shared primary epoch received an uncaptured GPU error; dispose and recreate the engine.', { cause: lastGpuError }));
     if (!initialized) {
       cancel(new StrataError('GPU_VALIDATION_FAILED', 'WebGPU reported an error during initialization.', { cause: lastGpuError }));
     }
+  }
+
+  function faultSharedPrimaryEpoch(error: StrataError): boolean {
+    if (!ownsCanvas || state === 'disposed' || state === 'lost' || scene?.kind !== 'imported' || !scene.value.hasSharedPrimary) return false;
+    scene.value.faultIndirectEpoch(error);
+    return true;
   }
 
   try {
@@ -329,6 +339,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       if (gpuErrorCount) {
         throw new StrataError('GPU_VALIDATION_FAILED', 'WebGPU reported an uncaptured error. Dispose this engine before retrying.', { cause: lastGpuError });
       }
+      if (sharedPrimaryWorkFailure) throw sharedPrimaryWorkFailure;
     }
 
     function telemetry(): EngineTelemetry {
@@ -615,7 +626,20 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           timer = setTimeout(() => reject(new StrataError('GPU_WORK_TIMEOUT', `GPU work exceeded ${timeoutMs} ms.`)), timeoutMs);
         });
         try {
-          await Promise.race([device!.queue.onSubmittedWorkDone(), deadline]);
+          const fencedDevice = device!;
+          const hadSharedPrimary = scene?.kind === 'imported' && scene.value.hasSharedPrimary;
+          const fence = fencedDevice.queue.onSubmittedWorkDone().catch(cause => {
+            const error = new StrataError('GPU_WORK_FAILED', 'Shared primary GPU fence rejected; dispose and recreate the engine.', { cause });
+            // A timeout may have returned first. A later genuine rejection still
+            // faults this live device even if the fenced optional scene retired.
+            // Retire any current optional epoch too; disposed callbacks do nothing.
+            if (device === fencedDevice && ownsCanvas && state !== 'disposed' && state !== 'lost') {
+              const faultedCurrent = faultSharedPrimaryEpoch(error);
+              if (hadSharedPrimary || faultedCurrent) sharedPrimaryWorkFailure ??= error;
+            }
+            throw cause;
+          });
+          await Promise.race([fence, deadline]);
           assertReady();
           if (scene?.kind === 'imported' && scene.value.hasIndirect) {
             await Promise.race([scene.value.readIndirectProgress(), deadline]);

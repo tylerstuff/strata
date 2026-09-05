@@ -2,8 +2,9 @@ import type { ImportedVec3, ImportedVec4 } from './imported-types.js';
 
 /**
  * Internal static geometry. The caller MUST run validateImportedStaticBvh before
- * creating the effect; topology, attributes and triangle mappings are not rescanned
- * here. Arrays remain caller-owned; do not mutate during create().
+ * creating the effect; topology and triangle mappings are not rescanned here.
+ * The optional shared-primary baseline additionally scans consumed UV/COLOR
+ * attributes for its numerical domain. Arrays remain caller-owned; do not mutate during create().
  */
 export interface ImportedIndirectSource {
   readonly nodes: Uint8Array<ArrayBuffer>;
@@ -39,11 +40,22 @@ export interface ImportedIndirectEnvironment {
   readonly constantRadiance?: ImportedVec3;
 }
 export interface ImportedIndirectOptions {
+  /** Explicit presentation capability: seven storage bindings and a 65,536-pixel lifetime cap. */
+  readonly spatialDenoise?: boolean;
   readonly maxPixels?: number;
   readonly pixelBatch?: number;
   readonly maxSamples?: number;
   readonly maxVisits?: number;
   readonly seed?: number;
+}
+/** Numeric transport limits; presentation capability never participates in reset keys. */
+export type ImportedIndirectTraceOptions = Omit<ImportedIndirectOptions, 'spatialDenoise'>;
+export type ImportedIndirectDenoise = 'off' | 'spatial';
+export interface ImportedSpatialDiagnostics {
+  readonly filteredPixels: number;
+  readonly fallbackChannels: number;
+  readonly hdrFaultChannels: number;
+  readonly guideBypassPixels: number;
 }
 export interface ImportedIndirectCreateOptions {
   readonly source: ImportedIndirectSource;
@@ -54,9 +66,27 @@ export interface ImportedIndirectCreateOptions {
   readonly signal?: AbortSignal;
 }
 export interface ImportedIndirectProgress {
+  /** Optional shared-primary transport is a new numerical baseline, not legacy bit equivalence. */
+  readonly numericBaseline: 'legacy-inline-primary-v1' | 'shared-primary-v1';
+  readonly primary?: {
+    /** Invalidated by resets/cancellation/faults independently of submitted accumulation revision. */
+    readonly generation: number;
+    readonly state: 'empty' | 'queued-partial' | 'queued-complete' | 'faulted' | 'disposed';
+    /** Queue-ordered preparation, never a GPU validation receipt. Independent of batchCursor. */
+    readonly queuedPrimaryPixels: number;
+    readonly queuedPrimaryDispatches: number;
+    /** Scheduled pixels include background and pre-query rejection; actual queries need record readback. */
+    readonly actualPrimaryQueries: null;
+  };
   /** Changes only when a reset frame is submitted. */
   readonly revision: number;
   readonly submittedFrames: number;
+  /** Engine frame identity of the last submitted composition, never a sample count. */
+  readonly submittedFrameId: number | null;
+  readonly spatialDenoise: boolean;
+  readonly denoise: ImportedIndirectDenoise;
+  /** Changes on presentation control edits, without resetting transport. */
+  readonly presentationRevision: number;
   readonly batchCursor: number;
   readonly width: number;
   readonly height: number;
@@ -66,9 +96,11 @@ export interface ImportedIndirectProgress {
   readonly normalMode: 'geometric';
   readonly textureLod: 0;
   /** Scheduling limits, not measured samples per pixel. */
-  readonly limits: Required<ImportedIndirectOptions>;
+  readonly limits: Required<ImportedIndirectTraceOptions>;
 }
 export interface ImportedIndirectReadback extends ImportedIndirectProgress {
+  /** Per-composition diagnostics, tagged with this readback's mode/frame/revision. */
+  readonly spatialDiagnostics?: ImportedSpatialDiagnostics;
   /** GPU counters in this accumulation revision. Attempts are not accepted-only normalization. */
   readonly attempted: number;
   readonly completed: number;

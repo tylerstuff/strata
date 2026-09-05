@@ -1,4 +1,4 @@
-import type { ImportedIndirectOptions, ImportedIndirectProgress, ImportedIndirectReadback } from './imported-indirect-types.js';
+import type { ImportedIndirectDenoise, ImportedIndirectOptions, ImportedIndirectProgress, ImportedIndirectReadback } from './imported-indirect-types.js';
 
 /** Optional glTF inspection path. No virtual geometry or scene-traced reflections. */
 export type ImportedVec3 = readonly [number, number, number];
@@ -136,7 +136,7 @@ export interface ImportedEnvironment {
 }
 export interface ImportedControls {
   /** Requires a scene created with indirect options. Disabling retains the matching direct-only baseline. */
-  readonly indirect?: { readonly enabled: boolean };
+  readonly indirect?: { readonly enabled: boolean; readonly denoise?: ImportedIndirectDenoise };
   /** Authored is the default. Relit changes only unlit materials to geometric-normal matte dielectric (roughness .65). */
   readonly shading?: 'authored' | 'relit';
   /** verticalFov is in radians. Camera motion retains reprojection history. */
