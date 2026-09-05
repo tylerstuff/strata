@@ -13,5 +13,5 @@
     "paths": { "@strata-engine/core": ["./packages/core/src/index.ts"] },
     "noEmit": true
   },
-  "include": ["packages/core/src/**/*.ts", "benchmarks/src/**/*.ts"]
+  "include": ["packages/core/src/**/*.ts", "benchmarks/src/**/*.ts", "examples/gallery/**/*.ts"]
 }

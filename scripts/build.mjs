@@ -46,4 +46,5 @@ await build({
   external: ['@strata-engine/core'],
   sourcemap: true,
 });
+await import('./build-gallery.mjs');
 console.log('Built the ESM package, declarations, module worker, and precompiled WASM.');

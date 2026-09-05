@@ -31,6 +31,7 @@ jobs:
       - run: npm run test:rust
       - run: npm run test:unit
       - run: npm run test:benchmark-server
+      - run: npm run test:gallery:unit
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - name: Install the virtual display and software Vulkan runtime
@@ -109,6 +110,11 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - name: Install the virtual display and software Vulkan runtime
         run: sudo apt-get update && sudo apt-get install -y xvfb xauth libvulkan1 mesa-vulkan-drivers
+      - name: Validate the local gallery with generated animated fixtures
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:gallery
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
       - name: Validate integrated streaming, offscreen lighting, and lifecycle
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:integrated
         env:
