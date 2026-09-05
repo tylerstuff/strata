@@ -44,6 +44,9 @@ function validateScene(scene: GiSceneData): void {
     || scene.light.radiance.some(v => !Number.isFinite(v) || v < 0 || v > 1000)) invalid('invalid light.');
 }
 
+/** Shared value admission; incremental maintenance adds fixed-topology/shape checks. */
+export { validateScene as validateGiTraceScene };
+
 function copyStaticTriangles(scene: GiSceneData, input: readonly GiTriangle[]): readonly GiTriangle[] {
   if (!Array.isArray(input) || input.length + scene.boxes.length * 12 > giTraceLimits.triangles) invalid('static triangles exceed fixed primitive limits.');
   const vector = (value: GiVec3): GiVec3 => {

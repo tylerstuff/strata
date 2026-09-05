@@ -8,14 +8,14 @@ import type { ProbeBindings } from '../../packages/core/src/gi/probe-cache.js';
 import type { RasterControls, RasterOutputs } from '../../packages/core/src/rendering/raster-types.js';
 
 function fixture() {
-  const buffers: { descriptor: GPUBufferDescriptor; bytes: Uint8Array<ArrayBuffer>; destroy: ReturnType<typeof vi.fn> }[] = [];
+  const buffers: { descriptor: GPUBufferDescriptor; size: number; bytes: Uint8Array<ArrayBuffer>; destroy: ReturnType<typeof vi.fn> }[] = [];
   const textures: { descriptor: GPUTextureDescriptor; createView: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }[] = [];
   let failNextView = false;
   const pipeline = () => ({ getBindGroupLayout: vi.fn(() => ({})) });
   const device = {
     limits: { maxTextureDimension2D: 8192, maxBufferSize: 256 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024 },
     createBuffer: vi.fn((descriptor: GPUBufferDescriptor) => {
-      const buffer = { descriptor, bytes: new Uint8Array(descriptor.size), destroy: vi.fn() }; buffers.push(buffer); return buffer;
+      const buffer = { descriptor, size: descriptor.size, bytes: new Uint8Array(descriptor.size), destroy: vi.fn() }; buffers.push(buffer); return buffer;
     }),
     createTexture: vi.fn((descriptor: GPUTextureDescriptor) => {
       const failView = failNextView; failNextView = false;
@@ -29,9 +29,11 @@ function fixture() {
     createSampler: vi.fn(() => ({})), createBindGroup: vi.fn(() => ({})),
     createComputePipelineAsync: vi.fn(async () => pipeline()), createRenderPipelineAsync: vi.fn(async () => pipeline()),
     queue: {
-      writeBuffer: vi.fn((buffer: typeof buffers[number], offset: number, input: ArrayBuffer | ArrayBufferView<ArrayBuffer>) => {
+      writeBuffer: vi.fn((buffer: typeof buffers[number], offset: number, input: ArrayBuffer | ArrayBufferView<ArrayBuffer>, dataOffset = 0, size?: number) => {
         const bytes = ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : new Uint8Array(input);
-        buffer.bytes.set(bytes, offset);
+        const unit = 'BYTES_PER_ELEMENT' in input ? Number(input.BYTES_PER_ELEMENT) : 1;
+        const start = dataOffset * unit;
+        buffer.bytes.set(bytes.subarray(start, size === undefined ? undefined : start + size * unit), offset);
       }),
       writeTexture: vi.fn(), submit: vi.fn((_commands: readonly unknown[]) => undefined),
     },
@@ -79,6 +81,68 @@ describe('GI camera reconstruction', () => {
 });
 
 describe('GI scene and cache integration', () => {
+  it('uploads only light/material records, keeps initial uploads separate, and attributes the submitted trace source', async () => {
+    const gpu = fixture(); const renderer = await gpu.create();
+    const traceWrites = () => gpu.raw.queue.writeBuffer.mock.calls.filter(([buffer]) => buffer.descriptor.label?.startsWith('Strata GI trace data '));
+    expect(traceWrites()).toHaveLength(5);
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 0, traceQueuedUpdateCount: 0,
+      traceQueuedUploadBytes: 0, traceAttemptedWriteCalls: 0, traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: null });
+    expect(renderer.giTelemetry.traceMetadataBytes).toBeGreaterThan(0);
+    const encode = (gi: GiControls = {}) => renderer.encode(gpu.encoder, {} as GPUTextureView, 640, 360, 0, { gi, temporal: false });
+    encode(); gpu.raw.queue.submit([{}]); renderer.submitted(1);
+    const initial = traceWrites().length;
+    encode({ lightIntensity: 2 });
+    expect(traceWrites().slice(initial).map(([buffer]) => buffer.descriptor.label)).toEqual(['Strata GI trace data 4']);
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 1, traceQueuedUpdateCount: 1,
+      traceQueuedUploadBytes: 48, traceQueuedWriteCalls: 1, traceRegeneratedTriangleCount: 0,
+      tracePackedTriangleCount: 0, traceRefitLeafCount: 0, traceRefitAncestorCount: 0,
+      traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: 1 });
+    renderer.cancelFrame();
+    expect(renderer.giTelemetry.traceLastSubmittedUpdateCount).toBe(0);
+    const written = traceWrites().length; encode();
+    expect(traceWrites()).toHaveLength(written); // Queue writes survive encoder cancellation.
+    gpu.raw.queue.submit([{}]); renderer.submitted(2);
+    expect(renderer.giTelemetry).toMatchObject({ traceLastSubmittedUpdateCount: 1, traceLastSubmittedFrameId: 2 });
+    encode({ wallColor: 'neutral' }); gpu.raw.queue.submit([{}]); renderer.submitted(3);
+    expect(traceWrites().slice(written).map(([buffer]) => buffer.descriptor.label)).toEqual(['Strata GI trace data 3']);
+    expect(renderer.giTelemetry).toMatchObject({ traceQueuedUploadBytes: 80, traceQueuedWriteCalls: 2,
+      traceUpdateCount: 2, traceQueuedUpdateCount: 2, traceLastSubmittedUpdateCount: 2,
+      traceRegeneratedTriangleCount: 0, tracePackedTriangleCount: 0, traceRefitLeafCount: 0, traceRefitAncestorCount: 0 });
+    encode({ wallColor: 'neutral', lightIntensity: 2 }); gpu.raw.queue.submit([{}]); renderer.submitted(4);
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 2, traceQueuedUploadBytes: 80, traceLastSubmittedFrameId: 4 });
+    renderer.dispose(); expect(renderer.giTelemetry.traceMetadataBytes).toBe(0);
+    expect(renderer.giTelemetry.tracePendingUploadBytes).toBe(0);
+    expect(gpu.buffers.every(buffer => buffer.destroy.mock.calls.length === 1)).toBe(true);
+  });
+
+  it('keeps disabled CPU targets pending and retries a partially accepted trace upload against the latest target', async () => {
+    const gpu = fixture(); const renderer = await gpu.create();
+    const encode = (gi: GiControls = {}) => renderer.encode(gpu.encoder, {} as GPUTextureView, 640, 360, 0, { gi, temporal: false });
+    encode(); renderer.submitted(1);
+    encode({ enabled: false, doorOpen: false }); renderer.submitted(2);
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 1, traceQueuedUpdateCount: 0,
+      traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: 2, traceQueuedWriteCalls: 0 });
+    expect(renderer.giTelemetry.tracePendingUploadBytes).toBeGreaterThan(0);
+    const write = gpu.raw.queue.writeBuffer.getMockImplementation()!; let attempts = 0;
+    gpu.raw.queue.writeBuffer.mockImplementation((...args) => {
+      if (args[0].descriptor.label?.startsWith('Strata GI trace data ') && ++attempts === 2) throw Error('trace range failed');
+      write(...args);
+    });
+    expect(() => encode({ enabled: true })).toThrow('trace range failed'); renderer.cancelFrame();
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 1, traceQueuedUpdateCount: 0,
+      traceAttemptedWriteCalls: 2, traceQueuedWriteCalls: 1, traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: 2 });
+    expect(renderer.giTelemetry.traceQueuedUploadBytes).toBeGreaterThan(0);
+    expect(renderer.giTelemetry.tracePendingUploadBytes).toBeGreaterThan(0);
+    gpu.raw.queue.writeBuffer.mockImplementation(write);
+    encode({ lightIntensity: 2 }); gpu.raw.queue.submit([{}]); renderer.submitted(3);
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 2, traceQueuedUpdateCount: 2,
+      traceLastSubmittedUpdateCount: 2, traceLastSubmittedFrameId: 3, tracePendingRangeCount: 0, tracePendingUploadBytes: 0 });
+    const arrays = [renderer.traceData.nodeData, renderer.traceData.triangleData, renderer.traceData.boxData, renderer.traceData.materialData, renderer.traceData.uniformData];
+    arrays.forEach((bytes, index) => expect(gpu.buffers.find(buffer => buffer.descriptor.label === `Strata GI trace data ${index}`)!.bytes).toEqual(new Uint8Array(bytes)));
+    expect(renderer.currentScene.state).toMatchObject({ doorOpen: false, lightIntensity: 2 });
+    renderer.dispose();
+  });
+
   it('resets world epochs for material, light, door and explicit cache changes while camera and TAA changes preserve them', async () => {
     const gpu = fixture(); const renderer = await gpu.create(); let frameId = 0;
     const render = (controls: RasterControls & { gi?: GiControls } = {}) => {

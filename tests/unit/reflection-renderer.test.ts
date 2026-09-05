@@ -6,7 +6,7 @@ import type { RasterControls, RasterTimestamps } from '../../packages/core/src/r
 
 type Controls = RasterControls & { gi?: GiControls; reflections?: ReflectionControls };
 function fixture() {
-  const buffers: { descriptor: GPUBufferDescriptor; bytes: Uint8Array<ArrayBuffer>; destroy: ReturnType<typeof vi.fn> }[] = [];
+  const buffers: { descriptor: GPUBufferDescriptor; size: number; bytes: Uint8Array<ArrayBuffer>; destroy: ReturnType<typeof vi.fn> }[] = [];
   const textures: { descriptor: GPUTextureDescriptor; createView: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }[] = [];
   const groups: GPUBindGroupDescriptor[] = [];
   const passes: { type: 'render' | 'compute'; descriptor: GPURenderPassDescriptor | GPUComputePassDescriptor | undefined }[] = [];
@@ -15,7 +15,7 @@ function fixture() {
   const device = {
     limits: { maxTextureDimension2D: 8192, maxBufferSize: 256 * 1024 ** 2, maxStorageBufferBindingSize: 128 * 1024 ** 2 },
     createBuffer: vi.fn((descriptor: GPUBufferDescriptor) => {
-      const buffer = { descriptor, bytes: new Uint8Array(descriptor.size), destroy: vi.fn() }; buffers.push(buffer); return buffer;
+      const buffer = { descriptor, size: descriptor.size, bytes: new Uint8Array(descriptor.size), destroy: vi.fn() }; buffers.push(buffer); return buffer;
     }),
     createTexture: vi.fn((descriptor: GPUTextureDescriptor) => {
       const fail = failView; failView = false;
@@ -26,9 +26,11 @@ function fixture() {
     createSampler: vi.fn(() => ({})), createBindGroup: vi.fn((descriptor: GPUBindGroupDescriptor) => { groups.push(descriptor); return {}; }),
     createComputePipelineAsync: vi.fn(async () => pipeline()), createRenderPipelineAsync: vi.fn(async () => pipeline()),
     queue: { writeTexture: vi.fn(), submit: vi.fn((_commands: readonly unknown[]) => undefined),
-      writeBuffer: vi.fn((buffer: typeof buffers[number], offset: number, source: ArrayBuffer | ArrayBufferView<ArrayBuffer>) => {
+      writeBuffer: vi.fn((buffer: typeof buffers[number], offset: number, source: ArrayBuffer | ArrayBufferView<ArrayBuffer>, dataOffset = 0, size?: number) => {
         const bytes = ArrayBuffer.isView(source) ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength) : new Uint8Array(source);
-        buffer.bytes.set(bytes, offset);
+        const unit = 'BYTES_PER_ELEMENT' in source ? Number(source.BYTES_PER_ELEMENT) : 1;
+        const start = dataOffset * unit;
+        buffer.bytes.set(bytes.subarray(start, size === undefined ? undefined : start + size * unit), offset);
       }),
     },
   };
@@ -58,6 +60,59 @@ function frames(gpu: ReturnType<typeof fixture>, renderer: ReflectionRenderer) {
 }
 
 describe('reflection renderer integration', () => {
+  it('flushes only moving-box trace ranges while retaining buffer ownership and diffuse rolling refresh', async () => {
+    const gpu = fixture(); const renderer = await gpu.create(); const render = frames(gpu, renderer); render();
+    const source = gpu.buffers.filter(buffer => buffer.descriptor.label?.startsWith('Strata reflection trace data '));
+    const traceWrites = () => gpu.raw.queue.writeBuffer.mock.calls.filter(([buffer]) => source.includes(buffer));
+    const before = traceWrites().length;
+    const { result } = render({ reflections: { objectOffset: 0.4 } });
+    const writes = traceWrites().slice(before);
+    expect(new Set(writes.map(([buffer]) => buffer.descriptor.label))).toEqual(new Set([
+      'Strata reflection trace data 0', 'Strata reflection trace data 1', 'Strata reflection trace data 2',
+    ]));
+    const trace = renderer.giTelemetry;
+    expect(trace).toMatchObject({ traceUpdateCount: 1, traceQueuedUpdateCount: 1,
+      traceLastSubmittedUpdateCount: 1, traceLastSubmittedFrameId: 2, traceChangedBoxCount: 1,
+      traceRegeneratedTriangleCount: 12, tracePackedTriangleCount: 12, traceFullBufferFallbackCount: 0,
+      tracePendingRangeCount: 0, tracePendingUploadBytes: 0, cacheEpoch: 1, framesSinceReset: 2 });
+    expect(trace.traceRefitLeafCount).toBeGreaterThan(0); expect(trace.traceRefitAncestorCount).toBeGreaterThan(0);
+    expect(trace.traceQueuedUploadBytes).toBeLessThan(renderer.traceData.gpuBufferBytes);
+    expect(trace.traceQueuedWriteCalls).toBe(writes.length);
+    expect(result.uploadBytes).toBeGreaterThanOrEqual(Number(trace.traceQueuedUploadBytes));
+    expect(renderer.reflectionTelemetry).toMatchObject({ traceUpdateCount: 1, traceQueuedUpdateCount: 1,
+      traceLastSubmittedUpdateCount: 1, traceLastSubmittedFrameId: 2, cacheEpoch: 2 });
+    const arrays = [renderer.traceData.nodeData, renderer.traceData.triangleData, renderer.traceData.boxData, renderer.traceData.materialData, renderer.traceData.uniformData];
+    source.forEach((buffer, index) => expect(buffer.bytes).toEqual(new Uint8Array(arrays[index]!)));
+    const count = traceWrites().length; render(); expect(traceWrites()).toHaveLength(count);
+    expect(gpu.buffers.filter(buffer => buffer.descriptor.label?.startsWith('Strata reflection trace data '))).toEqual(source);
+    renderer.dispose(); expect(renderer.giTelemetry.traceMetadataBytes).toBe(0);
+    expect(source.every(buffer => buffer.destroy.mock.calls.length === 1)).toBe(true);
+  });
+
+  it('distinguishes rapid disabled CPU targets from the queued trace source acknowledged by submitted frames', async () => {
+    const gpu = fixture(); const renderer = await gpu.create(); const render = frames(gpu, renderer);
+    for (const [index, objectOffset] of [0.2, -0.4, 0.4].entries()) {
+      render({ temporal: false, gi: { enabled: false }, reflections: { mode: 'off', objectOffset } });
+      expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: index + 1, traceQueuedUpdateCount: 0,
+        traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: index + 1, traceQueuedWriteCalls: 0 });
+    }
+    expect(renderer.giTelemetry.tracePendingUploadBytes).toBeGreaterThan(0);
+    const encoded = renderer.encode(gpu.encoder, {} as GPUTextureView, 1280, 720, 0, { temporal: false, reflections: { mode: 'world' } });
+    expect(encoded.dispatchCalls).toBe(3);
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 3, traceQueuedUpdateCount: 3,
+      traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: 3, tracePendingUploadBytes: 0 });
+    renderer.cancelFrame();
+    const queuedWrites = renderer.giTelemetry.traceQueuedWriteCalls;
+    render({ temporal: false });
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 3, traceQueuedUpdateCount: 3,
+      traceLastSubmittedUpdateCount: 3, traceLastSubmittedFrameId: 4, traceQueuedWriteCalls: queuedWrites });
+    expect(renderer.currentScene.state.objectOffset).toBe(0.4);
+    const source = gpu.buffers.filter(buffer => buffer.descriptor.label?.startsWith('Strata reflection trace data '));
+    const arrays = [renderer.traceData.nodeData, renderer.traceData.triangleData, renderer.traceData.boxData, renderer.traceData.materialData, renderer.traceData.uniformData];
+    source.forEach((buffer, index) => expect(buffer.bytes).toEqual(new Uint8Array(arrays[index]!)));
+    renderer.dispose();
+  });
+
   it('matches actual pass submission and counters for every reflection, GI and TAA combination', async () => {
     for (const mode of ['off', 'probe-only', 'world'] as const) for (const gi of [false, true]) for (const temporal of [false, true]) {
       const gpu = fixture(); const renderer = await gpu.create(); const render = frames(gpu, renderer);
@@ -134,12 +189,17 @@ describe('reflection renderer integration', () => {
     const gpu = fixture(); const renderer = await gpu.create(); const render = frames(gpu, renderer); render();
     const reflection = renderer.reflectionCache.bindings; const probes = renderer.probeCache.bindings;
     renderer.encode(gpu.encoder, {} as GPUTextureView, 1280, 720, 1 / 60, { reflections: { objectOffset: -0.4 } });
+    const queuedTraceWrites = renderer.giTelemetry.traceQueuedWriteCalls;
+    expect(renderer.giTelemetry).toMatchObject({ traceUpdateCount: 1, traceQueuedUpdateCount: 1,
+      traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: 1 });
     gpu.raw.queue.submit.mockImplementationOnce(() => { throw new Error('submission failed'); });
     try { gpu.raw.queue.submit([{}]); } catch { renderer.cancelFrame(); }
     expect(renderer.reflectionCache.bindings).toBe(reflection); expect(renderer.probeCache.bindings).toEqual(probes);
     expect(renderer.reflectionCache.telemetry).toMatchObject({ cacheEpoch: 1, sourceFrameId: 1, submittedFrames: 1 });
     expect(renderer.probeCache.telemetry).toMatchObject({ cacheEpoch: 1, sourceFrameId: 1, submittedFrames: 1 });
+    expect(renderer.giTelemetry).toMatchObject({ traceLastSubmittedUpdateCount: 0, traceLastSubmittedFrameId: 1 });
     render({ cameraCut: true });
+    expect(renderer.giTelemetry).toMatchObject({ traceQueuedWriteCalls: queuedTraceWrites, traceLastSubmittedUpdateCount: 1, traceLastSubmittedFrameId: 2 });
     expect(renderer.reflectionTelemetry).toMatchObject({ cacheEpoch: 2, sourceFrameId: 2, submittedFrames: 2, framesSinceReset: 1 });
     expect(renderer.giTelemetry).toMatchObject({ cacheEpoch: 1, sourceFrameId: 2, submittedFrames: 2, refreshFrontier: 64 }); renderer.dispose();
   });
