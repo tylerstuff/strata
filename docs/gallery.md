@@ -30,8 +30,10 @@ presentation, explicit scene lighting, and only the debug views supported by the
 imported renderer. Model only is the default. The optional ground stays at the
 rest-pose level; animated poses can cross it. Use Model only to inspect the full
 pose. Lighting presets use a directional light and diffuse ambient fill; the
-separate environment controls add distant illumination. Imported GI, local
-reflections, virtual geometry and world streaming are outside this gallery's scope.
+separate environment controls add distant illumination. This ordinary mode remains
+the default. The experimental static progressive preview below has a narrower
+source contract; general imported GI, local reflections, virtual geometry and
+world streaming remain outside this gallery's scope.
 
 Material shading defaults to `authored`. Source unlit materials retain their base
 color when lighting changes. The explicit `relit` mode interprets only those unlit
@@ -44,8 +46,8 @@ The distant environment defaults to off. Studio and sky presets add generated
 illumination, with intensity and rotation controls. Environment intensity is a
 scene-linear multiplier from 0 to 64; rotation is about world +Y, shown in degrees
 in the panel and supplied in radians through the API.
-Directional, ambient and environment illumination are additive. This environment
-has no local visibility or interior occlusion and does not reflect surrounding
+In ordinary mode, directional, ambient and environment illumination are additive.
+This environment has no local visibility or interior occlusion and does not reflect surrounding
 scene geometry. Unrestricted distant light cannot account for light blocked by a
 room's walls. See the
 [imported material lighting guide](imported-lighting.md) for the authored/relit
@@ -57,7 +59,7 @@ runtime support. Unsupported animation or materials, texture resizing and other
 importer diagnostics remain visible in Preview limits.
 Root motion is preserved. Reset fits the rest-pose
 bounds, and a traveling clip can leave that framing. Scripts can reframe by setting
-the orbit target and distance. Available Idle, F_idle or idle01 clips play initially;
+the orbit target and distance. In ordinary mode, available Idle, F_idle or idle01 clips play initially;
 otherwise the gallery starts paused in the rest pose.
 Catalog triangle counts describe stored source primitives; they are separate from
 the runtime's actual submitted triangle count. The catalog's source SHA-256 covers
@@ -81,8 +83,99 @@ Fit viewport (native) sizes the drawing buffer from the canvas's CSS dimensions
 multiplied by the current device-pixel ratio, rounded to physical pixels. When a
 device dimension limit is reached, one shared scale preserves the aspect ratio.
 Layout, zoom and display-density changes update this size. Fixed render sizes
-remain explicit physical pixels. Temporal AA is enabled by default and can be
+remain explicit physical pixels. Ordinary temporal AA is enabled by default and can be
 disabled independently of render size and animation playback.
+
+## Static progressive preview
+
+Progressive preview is an explicit, experimental opt-in for a static model with
+exactly one used, lit, OPAQUE material and no rig, animation clips, deformation or
+ground. Unused material entries do not count. Relighting an unlit source does not
+make it eligible. Core validates and prepares the complete static source before
+the gallery can commit the preview. This is bounded progressive diffuse transport,
+not real-time GI or support for the whole catalog.
+
+Choose a small physical render size explicitly before activation: 640 × 360
+(230,400 pixels) or 320 × 180 (57,600 pixels) fits the default `maxPixels` limit of
+262,144. Other GPU limits still apply. The gallery must reject oversized admission
+or resizing; it does not silently shrink Fit or HD output to make the effect fit.
+The panel requires a deliberate fixed-size selection before activation and makes
+Fit/oversized choices unavailable while progressive mode is active. The window
+API also requires a fixed size and checks the physical pixel budget. Leaving progressive mode retains the
+current fixed size; it does not automatically restore HD output or Fit. The
+progressive size limits still apply while its indirect contribution is disabled.
+Render size and displayed CSS size remain separate, so use `getDisplay()` when
+recording a capture.
+
+Keep the camera, model and lighting stationary while submitting more frames to
+accumulate samples. Camera, resolution, lighting, environment or effect-option
+changes reset accumulation. Enabling the indirect contribution after a pause also
+resets it. Frame count records scheduled work, not convergence or accepted samples
+per pixel.
+
+The requested studio/sky environment becomes the incident radiance source for
+visibility-tested transport. Both the indirect-on view and its matched
+indirect-off comparison force temporal AA off and exclude ordinary raster ambient
+and environment lighting. Turning off the indirect contribution therefore shows
+the same direct baseline; it does not restore ordinary unoccluded fill. Returning
+to ordinary rendering requires a scene recreation. See
+[the progressive lighting contract](imported-progressive-gi.md) for the single
+secondary-surface diffuse approximation, geometric normals and texture LOD limits.
+
+Mode changes reuse loaded source bytes and retain the camera. Precommit rejection
+retains the prior ready view only when Core confirms that the active scene is
+unchanged. Texture-cap recreation carries the selected preview mode rather than
+silently returning to ordinary rendering. A failure after commit must remain
+visible as a fault; it is not a rollback to the prior scene.
+
+Core reports scheduling progress and GPU sample counters separately. The
+`attempted`, `completed`, `exhausted` and `invalid` counters carry their own
+accumulation revision and submitted-frame count. Missing readback is unavailable,
+not zero. Check the revision and pending-reset state before treating a snapshot as
+current. A readback may lag within the same revision; retain its own submitted
+count. Pair the accumulation revision with `engineEpoch` and
+`sceneCommit.sceneGeneration`, because scene recreation starts new accumulation.
+Unknown or traversal-exhausted paths are never counted as open sky: they
+mark that pixel's indirect estimate unknown until reset and leave it direct-only.
+These diagnostics belong with the scene/view identity and image in any comparison.
+
+After selecting an eligible static model, use the explicit scene mode and
+contribution controls:
+
+```js
+const gallery = window.strataGallery;
+await gallery.setViewport(640, 360);
+await gallery.setSceneMode('progressive');
+await gallery.setEnvironment({ preset: 'sky', intensity: 1, rotationRadians: 0 });
+await gallery.setIndirectEnabled(true);
+const indirectOn = await gallery.captureState(120);
+// Capture the canvas now and pair it with indirectOn.state and getDisplay().
+await gallery.setIndirectEnabled(false);
+const matchedDirect = await gallery.captureState(1);
+// Capture the same view with the indirect contribution off.
+await gallery.setSceneMode('ordinary');
+```
+
+The 120-frame batch is a work budget, not a convergence claim. Repeated batches in
+an unchanged progressive view continue its accumulation. `setSceneMode` accepts
+`ordinary` or `progressive`; `setIndirectEnabled` controls the contribution inside
+a progressive scene. `settings.sceneMode` defaults to `ordinary`, and the saved
+`settings.indirectEnabled` preference defaults to true. `settings.temporalRequested`
+retains the ordinary AA preference while `settings.temporal` reports the effective
+false value in progressive mode. Activation preserves the ordinary preference;
+exit restores it. While progressive is active, `setTemporal(true)` rejects before
+mutation, and an explicit `setTemporal(false)` also changes the saved preference.
+Ground is rejected rather than silently removed. The panel requires returning to
+ordinary rendering before selecting another model. Scripted model selection retains
+the selected mode and rejects incompatible sources. A rejection from a ready
+progressive scene retains that view when Core confirms the scene is unchanged;
+the caller can then return to ordinary mode to inspect rigged or animated models.
+
+`getState().progressive` exposes `maxPixels`, source/presentation/viewport
+`eligibility` reasons, Core `telemetry` or null, and `countersPending`. These checks do not
+establish device, memory or BVH admission; Core's scene creation is authoritative.
+Use the current Core telemetry collected by the fence for counter evidence;
+`state.frame` is the earlier submission snapshot and may precede GPU readback.
 
 ## Measurements and automation
 
@@ -139,13 +232,15 @@ the canvas down to fit the page. `getDisplay()` reports `mode` (`fit` or `fixed`
 as `render / (css * devicePixelRatio)` for each axis. Record these values and the screenshot
 scale with capture evidence; screenshot dimensions alone do not establish native
 render density. The page's Fit viewport option restores responsive native sizing.
-`setTemporal(boolean)` changes AA, and `getState().settings.temporal` records it.
+`setTemporal(boolean)` controls ordinary AA; its progressive-mode restrictions are
+described above. `getState().settings.temporal` records the effective setting.
+Progressive scenes always use false, including the matched indirect-off comparison.
 Explicit frame batches are bounded to 1–120 frames. `captureState` defaults to four
 frames and leaves rendering and animation paused. It returns state, not PNG bytes.
 
 State distinguishes requested and last confirmed model identity. A rejected
 texture-cap replacement retains the prior ready view only when Core evidence
-confirms that the scene is unchanged. A failed model selection stops rendering;
+confirms that the scene is unchanged. Ordinary model-selection failure stops rendering;
 replacement failure without a commit receipt leaves active model identity
 unknown. Failure after a commit can leave the candidate scene committed but the
 gallery faulted.
@@ -170,3 +265,12 @@ system. They do not establish the combined browser behavior of the gallery's
 material, environment and texture controls. Track validation of the exact gallery
 revision in [issue #33](https://github.com/tylerstuff/strata/issues/33); no
 performance or whole-VRAM guarantee follows from those functional checks.
+
+Progressive preview acceptance requires Core's generated/public-browser checks,
+combined gallery validation, and an actual-house witness with a fixed interior camera, verified source
+and texture identities, zero unexplained invalid/exhausted paths, and a visible
+blocked/offscreen transport comparison. CPU orchestration or successful static
+preparation alone does not establish rendered house lighting. Follow
+[issue #15](https://github.com/tylerstuff/strata/issues/15) and the
+[progressive validation boundary](imported-progressive-gi.md#validation-boundary)
+for that evidence; no new GPU or performance result is claimed here.

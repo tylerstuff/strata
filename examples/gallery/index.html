@@ -72,7 +72,7 @@
               </div>
               <div class="control-field">
                 <label for="resolution">Render size</label>
-                <select id="resolution" disabled aria-describedby="resolution-status"><option value="fit">Fit viewport (native)</option><option value="1280x720">1280 × 720 px</option><option value="1920x1080">1920 × 1080 px</option></select>
+                <select id="resolution" disabled aria-describedby="resolution-status"><option value="fit">Fit viewport (native)</option><option value="320x180">320 × 180 px · preview</option><option value="640x360">640 × 360 px · preview</option><option value="1280x720">1280 × 720 px</option><option value="1920x1080">1920 × 1080 px</option></select>
               </div>
             </div>
 
@@ -82,7 +82,7 @@
                 <select id="material-shading" aria-describedby="quality-status" disabled><option value="authored">Authored (source)</option><option value="relit">Relight unlit</option></select>
               </div>
               <div class="control-field">
-                <label for="environment-preset">Distant environment</label>
+                <label id="environment-label" for="environment-preset">Distant environment</label>
                 <select id="environment-preset" aria-describedby="quality-status" disabled><option value="off">Off</option><option value="studio">Studio</option><option value="sky">Sky</option></select>
               </div>
               <div class="control-field">
@@ -101,6 +101,27 @@
               </div>
             </div>
             <p id="quality-status" class="quality-note">Source-authored materials. Environment off.</p>
+
+            <details class="progressive-panel">
+              <summary>Static progressive diffuse preview <span id="progressive-mode-label">· off</span></summary>
+              <p class="progressive-note">Accumulates diffuse lighting while the view stays still. For static models with one used lit, opaque material.</p>
+              <div class="progressive-actions">
+                <button id="progressive-mode" class="button button-secondary" type="button" aria-pressed="false" aria-describedby="progressive-guidance" disabled>Start progressive preview</button>
+                <label class="animation-loop-label"><input id="indirect-enabled" type="checkbox" checked disabled />Include indirect lighting</label>
+              </div>
+              <p id="progressive-guidance" class="progressive-note">Choose a model and an explicit small render size to prepare this preview.</p>
+              <div id="progressive-diagnostics" hidden>
+                <p class="progressive-note">GPU sample counters</p>
+                <dl class="progressive-counts">
+                  <div><dt>Attempted</dt><dd id="progressive-attempted">—</dd></div>
+                  <div><dt>Completed</dt><dd id="progressive-completed">—</dd></div>
+                  <div><dt>Exhausted</dt><dd id="progressive-exhausted">—</dd></div>
+                  <div><dt>Invalid</dt><dd id="progressive-invalid">—</dd></div>
+                </dl>
+                <p id="progressive-counter-identity" class="progressive-note"></p>
+                <p id="progressive-counter-status" class="progressive-note"></p>
+              </div>
+            </details>
 
             <div id="viewport-wrap" class="viewport-wrap">
               <canvas id="viewport" aria-label="Interactive model preview" aria-describedby="orbit-guidance" tabindex="0">
