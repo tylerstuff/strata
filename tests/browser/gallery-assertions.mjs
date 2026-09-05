@@ -103,7 +103,39 @@ function pngSize(png) {
   return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
 }
 
-async function imagePixels(page, png) {
+async function captureGeometry(canvas) {
+  const geometry = await canvas.evaluate(element => {
+    const rect = element.getBoundingClientRect();
+    const viewportBox = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    const scroll = { x: window.scrollX, y: window.scrollY };
+    return {
+      intrinsic: { width: element.width, height: element.height },
+      viewportBox, scroll,
+      documentBox: { ...viewportBox, x: rect.x + scroll.x, y: rect.y + scroll.y },
+      deviceScaleFactor: window.devicePixelRatio,
+    };
+  });
+  assert.deepEqual(geometry.intrinsic, { width, height }, 'The drawing buffer must retain the requested physical dimensions.');
+  assert.equal(geometry.deviceScaleFactor, 1, 'The unscaled fixture capture requires deviceScaleFactor 1.');
+  assert.ok(Math.abs(geometry.viewportBox.width - width) < 1e-6 && Math.abs(geometry.viewportBox.height - height) < 1e-6,
+    `The canvas CSS content must be unscaled: ${JSON.stringify(geometry.viewportBox)}`);
+  // Playwright 1.63's element screenshot encloses the document-space rectangle
+  // after scrolling. Its epsilon removes floating-point noise at integer edges;
+  // actual fractional placement can contribute one outer pixel row or column.
+  const rect = geometry.documentBox;
+  const x = Math.floor(rect.x + 1e-3);
+  const y = Math.floor(rect.y + 1e-3);
+  const screenshotBox = {
+    x, y, width: Math.ceil(rect.x + rect.width - 1e-3) - x,
+    height: Math.ceil(rect.y + rect.height - 1e-3) - y,
+  };
+  assert.ok(screenshotBox.width >= width && screenshotBox.width <= width + 1
+    && screenshotBox.height >= height && screenshotBox.height <= height + 1,
+  'Only outward pixel enclosure may differ from the unscaled canvas size.');
+  return { ...geometry, screenshotBox };
+}
+
+async function imagePixels(page, png, expectedDimensions) {
   const decoded = await page.evaluate(async base64 => {
     const image = new Image();
     image.src = `data:image/png;base64,${base64}`;
@@ -116,8 +148,8 @@ async function imagePixels(page, png) {
     context.drawImage(image, 0, 0, canvas.width, canvas.height);
     return { width: image.naturalWidth, height: image.naturalHeight, pixels: Array.from(context.getImageData(0, 0, canvas.width, canvas.height).data) };
   }, png.toString('base64'));
-  assert.equal(decoded.width, width);
-  assert.equal(decoded.height, height);
+  assert.equal(decoded.width, expectedDimensions.width);
+  assert.equal(decoded.height, expectedDimensions.height);
   assert.equal(decoded.pixels.length, 64 * 36 * 4);
   const colors = new Set();
   let opaque = 0;
@@ -201,7 +233,7 @@ export async function runGalleryAssertions(page, { outputDirectory, firstModelId
   const report = {
     format: 'strata.gallery.workflow-validation', version: 1,
     startedAt: new Date().toISOString(), evidenceKind: 'functional browser workflow; not performance evidence',
-    viewport: { width, height }, captures: [], comparisons: [], pageErrors, passed: false,
+    viewport: { width, height }, captures: [], captureGeometry: [], comparisons: [], pageErrors, passed: false,
   };
   let failure;
   try {
@@ -273,15 +305,23 @@ export async function runGalleryAssertions(page, { outputDirectory, firstModelId
       const afterCallbacks = await page.evaluate(() => window.strataGallery.getState());
       assertReady(afterCallbacks, modelId);
       assertFrozen(before, afterCallbacks);
-      const png = await page.locator('canvas#viewport').screenshot({ type: 'png', scale: 'css', animations: 'disabled', timeout: 30_000 });
+      const canvas = page.locator('canvas#viewport');
+      await canvas.scrollIntoViewIfNeeded({ timeout: 30_000 });
+      const geometry = { label, before: await captureGeometry(canvas) };
+      report.captureGeometry.push(geometry);
+      const png = await canvas.screenshot({ type: 'png', scale: 'css', animations: 'disabled', timeout: 30_000 });
+      geometry.after = await captureGeometry(canvas);
+      geometry.pngDimensions = pngSize(png);
+      assert.deepEqual(geometry.after, geometry.before, 'Canvas layout or scroll changed during the screenshot.');
       const after = await page.evaluate(() => window.strataGallery.getState());
       assertReady(after, modelId);
       assertFrozen(before, after);
-      assert.deepEqual(pngSize(png), { width, height });
-      const decoded = await imagePixels(page, png);
+      const expectedDimensions = { width: geometry.before.screenshotBox.width, height: geometry.before.screenshotBox.height };
+      assert.deepEqual(geometry.pngDimensions, expectedDimensions, 'PNG dimensions must match the recorded outward-rounded CSS pixel enclosure.');
+      const decoded = await imagePixels(page, png, expectedDimensions);
       const filename = `${label}.png`;
       await writeFile(join(runDirectory, filename), png, { flag: 'wx' });
-      const evidence = { label, beforeCapture, receipt, beforeScreenshot: before, afterCallbacks, afterScreenshot: after, image: { file: filename, width, height, bytes: png.length, sha256: sha256(png), ...decoded.summary } };
+      const evidence = { label, beforeCapture, receipt, beforeScreenshot: before, afterCallbacks, afterScreenshot: after, geometry, image: { file: filename, ...geometry.pngDimensions, bytes: png.length, sha256: sha256(png), ...decoded.summary } };
       report.captures.push(evidence);
       assert.deepEqual(pageErrors, [], 'Uncaught browser errors occurred.');
       return { evidence, pixels: decoded.pixels };
