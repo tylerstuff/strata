@@ -87,7 +87,6 @@ jobs:
             ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/report.json
             ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/report.sha256
             ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/preparation.json
-            ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/geometry-initialization-validation.mjs
             ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/host-*.png
             ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/eager-*.png
           if-no-files-found: ignore
