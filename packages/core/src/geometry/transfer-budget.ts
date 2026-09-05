@@ -92,6 +92,12 @@ export interface GeometryInitialization<T> {
   readonly revision: number;
   advance(frame: GeometryUploadFrame): { readonly status: GeometryInitializationStatus; readonly uploadBytes: number };
   waitForChange(afterRevision: number): Promise<void>;
+  /**
+   * Wait for terminal ownership end and settlement of every retained async operation.
+   * A taken handle has transferred ownership; await the provider separately when retiring it.
+   * Does not dispose, advance initialization, or imply GPU execution completion.
+   */
+  whenDisposedAndSettled(): Promise<void>;
   takeReady(): T;
   dispose(): void;
 }

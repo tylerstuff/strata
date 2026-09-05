@@ -125,6 +125,11 @@ export class GeometryPageCache {
   private readonly roots: ReadonlySet<number>;
   private readonly clustersByPage: readonly (readonly GeometryCluster[])[];
   private readonly pending = new Map<number, Request>();
+  // Disposal clears scheduling state immediately; the original load/body/hash
+  // chains remain owned until their catch/finally cleanup has actually run.
+  private readonly requestOperations = new Set<Promise<void>>();
+  private disposalSettlement: Promise<void> | undefined;
+  private resolveDisposalSettlement: (() => void) | undefined;
   private readonly completed = new Map<number, Uint8Array<ArrayBuffer>>();
   private readonly completedLeases = new Map<number, GeometryRequestLease>();
   private readonly failures = new Map<number, Failure>();
@@ -201,12 +206,19 @@ export class GeometryPageCache {
     let error: unknown;
     let allocation = admission;
     let cache: GeometryPageCache | undefined;
+    let retiredCacheSettlement: Promise<void> | undefined;
+    let resolveSettlement!: () => void;
+    const settlement = new Promise<void>(resolve => { resolveSettlement = resolve; });
     const unsubscribe = budget.subscribe(() => changes.notify());
     const detach = () => { unsubscribe(); options.signal?.removeEventListener('abort', abort); };
     const cleanup = () => {
       detach();
-      if (cache) { cache.hostChanges = undefined; cache.dispose(); cache = undefined; }
-      else allocation?.release();
+      if (cache) {
+        cache.hostChanges = undefined; cache.dispose();
+        retiredCacheSettlement = cache.whenDisposedAndSettled();
+        void retiredCacheSettlement.then(resolveSettlement);
+        cache = undefined;
+      } else { allocation?.release(); if (!retiredCacheSettlement) resolveSettlement(); }
       allocation = undefined;
     };
     const fail = (cause: unknown) => { error = cause; status = 'failed'; cleanup(); changes.notify(); };
@@ -248,10 +260,12 @@ export class GeometryPageCache {
       waitForChange(afterRevision) {
         return status !== 'pending' ? Promise.resolve() : changes.wait(afterRevision);
       },
+      whenDisposedAndSettled() { return settlement; },
       takeReady() {
         if (status !== 'ready' || !cache) throw new StrataError('INVALID_OPTIONS', 'Geometry initialization is not ready for ownership transfer.');
         const result = cache; cache = undefined; allocation = undefined;
         result.hostChanges = undefined; status = 'taken'; detach(); changes.notify();
+        resolveSettlement();
         return result;
       },
       dispose() {
@@ -465,7 +479,7 @@ export class GeometryPageCache {
     this.pending.set(pageId, request);
     this.counts.requestsStarted++;
     const timer = setTimeout(() => request.controller.abort(), this.settings.timeoutMs);
-    void this.load(this.manifest.pages[pageId]!, request.controller.signal).then(bytes => {
+    const operation = this.load(this.manifest.pages[pageId]!, request.controller.signal).then(bytes => {
       request.finished = true;
       if (this.disposed || request.epoch !== this.epoch || request.cancelled || !this.wanted.has(pageId)) {
         this.counts.discardedCompletions++; return;
@@ -496,6 +510,14 @@ export class GeometryPageCache {
       this.notify();
       this.pump();
     });
+    this.requestOperations.add(operation);
+    const settled = (): void => {
+      this.requestOperations.delete(operation);
+      this.resolveSettlementIfDisposed();
+    };
+    // Observe both outcomes without replacing the original operation: even a
+    // failing cleanup must finish before the owner can report settlement.
+    void operation.then(settled, settled);
   }
 
   private async load(page: GeometryPage, signal: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
@@ -539,6 +561,17 @@ export class GeometryPageCache {
   private notify(): void { for (const resolve of this.waiters) resolve(); this.waiters.clear(); this.hostChanges?.notify(); }
   private assertLive(): void { if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'This geometry cache has been disposed.'); }
 
+  /** Waits for disposal and original request/body/hash/finally settlement, not GPU completion. */
+  whenDisposedAndSettled(): Promise<void> {
+    this.disposalSettlement ??= new Promise(resolve => { this.resolveDisposalSettlement = resolve; });
+    this.resolveSettlementIfDisposed();
+    return this.disposalSettlement;
+  }
+
+  private resolveSettlementIfDisposed(): void {
+    if (this.disposed && this.requestOperations.size === 0) this.resolveDisposalSettlement?.();
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true; this.epoch++;
@@ -555,5 +588,6 @@ export class GeometryPageCache {
     this.buffer.destroy();
     this.allocationLease?.release();
     this.notify();
+    this.resolveSettlementIfDisposed();
   }
 }
