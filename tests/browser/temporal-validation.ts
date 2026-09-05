@@ -115,9 +115,38 @@ export async function validateTemporalShader() {
     if (!(negativeMotion[0]! > 0.8 && negativeMotion[2]! < 0.1)) throw new Error(`Negative motion did not sample the left-hand history: ${negativeMotion}`);
     await step(asymmetric, false, 1, 0, index => index % 4 < 2 ? 1 : 2);
     const depthEdge = await step(current, true, 1, 0.0625);
-    if (!(depthEdge[0]! > 0.8 && depthEdge[2]! < 0.05)) throw new Error(`Bilinear history leaked a mismatched-depth tap: ${depthEdge}`);
+    // 3/4 of the central footprint is valid: feedback is .9*.75, not full .9.
+    if (!(Math.abs(depthEdge[0]! - 0.675) < 0.002 && Math.abs(depthEdge[1]! - 0.325) < 0.002 && depthEdge[2]! < 0.002)) {
+      throw new Error(`Depth-qualified history did not preserve its positive support: ${depthEdge}`);
+    }
+    const unrestrictedCurrent: Pixels = index => index === 5 ? [0, 0, 0, 1] : [16, 16, 16, 1];
+    const quadratic: Pixels = index => { const x = index % 4; return [x * x, 2 * x + 1, 4 - x, 1]; };
+    await step(quadratic, false);
+    const cubic = await step(unrestrictedCurrent, true, 1, 0.0625);
+    const cubicExpected = [1.25 ** 2 * 0.9, (2 * 1.25 + 1) * 0.9, (4 - 1.25) * 0.9];
+    if (cubicExpected.some((value, channel) => Math.abs(cubic[channel]! - value) > 0.003)) {
+      throw new Error(`Catmull-Rom did not reconstruct the analytic quadratic: ${cubic} vs ${cubicExpected}`);
+    }
+    // Only the negative-weight outer cubic tap is foreign; all central bilinear
+    // support is valid. Its extreme color must never enter a partial signed sum.
+    const foreignOuter: Pixels = index => index % 4 === 0 ? [100, 200, 300, 1] : quadratic(index);
+    await step(foreignOuter, false, 1, 0, index => index % 4 === 0 ? 2 : 1);
+    const cubicFallback = await step(unrestrictedCurrent, true, 1, 0.0625);
+    const fallbackExpected = [1.75 * 0.9, 3.5 * 0.9, 2.75 * 0.9];
+    if (fallbackExpected.some((value, channel) => Math.abs(cubicFallback[channel]! - value) > 0.003)) {
+      throw new Error(`Foreign outer depth did not select the positive bilinear fallback: ${cubicFallback} vs ${fallbackExpected}`);
+    }
+    await step(asymmetric, false, 1, 0, index => index % 4 < 2 ? 1 : 2);
+    const tinySupport = await step(current, true, 1, 0.99 / 4);
+    // The motion texture rounds .2475 UV to the exactly representable .24755859375.
+    // Therefore its pixel fraction is .990234375 and accepted feedback .0087890625.
+    const tinyExpected = 0.9 * (1 - 0.990234375);
+    if (!(Math.abs(tinySupport[0]! - tinyExpected) < 0.001 && Math.abs(tinySupport[1]! - (1 - tinyExpected)) < 0.001
+      && tinySupport[2]! < 0.001)) {
+      throw new Error(`Tiny accepted support carried too much stale history: ${tinySupport}`);
+    }
     if (errors.length) throw new Error(errors.join('; '));
-    return { ggx, reused, disoccluded, outside, reset, clamped, positiveMotion, negativeMotion, depthEdge };
+    return { ggx, reused, disoccluded, outside, reset, clamped, positiveMotion, negativeMotion, depthEdge, cubic, cubicFallback, tinySupport };
   } finally {
     temporal.dispose();
     hdr.destroy(); motion.destroy(); output.destroy(); readback.destroy(); device.destroy();

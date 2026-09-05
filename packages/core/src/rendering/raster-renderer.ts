@@ -1,4 +1,5 @@
 import { StrataError } from '../errors.js';
+import { normalizeExposureEV } from './exposure.js';
 import { buildProceduralScene, instanceStride, vertexStride } from './scene-data.js';
 import type { ProceduralSceneOptions } from './scene-data.js';
 import type { SceneFrameStats } from './scene-renderer.js';
@@ -25,7 +26,8 @@ export function normalizeRasterControls(controls: RasterControls = {}): Required
     || (controls.debugView !== undefined && !debugViews.includes(controls.debugView))) {
     throw new StrataError('INVALID_OPTIONS', 'Invalid raster controls.');
   }
-  return { temporal: controls.temporal ?? true, debugView: controls.debugView ?? 'final', cameraCut: controls.cameraCut ?? false };
+  return { temporal: controls.temporal ?? true, debugView: controls.debugView ?? 'final', cameraCut: controls.cameraCut ?? false,
+    exposureEV: normalizeExposureEV(controls.exposureEV) };
 }
 
 export interface RasterFrameState {
@@ -147,13 +149,14 @@ export class RasterRenderer {
             fragment: { module, entryPoint: provider?.fragmentEntryPoint ?? 'fragmentMain', targets: [
               { format: 'rgba16float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }, { format: 'rgba16float' },
             ] },
-            primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+            primitive: { topology: 'triangle-list', cullMode: provider?.cullMode ?? 'back', frontFace: 'ccw' },
             depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
           }),
           device.createRenderPipelineAsync({
             label: 'Strata directional shadow pipeline', layout: 'auto',
             vertex: { module, entryPoint: provider?.shadowEntryPoint ?? 'shadowMain', buffers: provider ? provider.vertexBuffers ?? [] : vertexBuffers },
-            primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+            ...(provider?.shadowFragmentEntryPoint ? { fragment: { module, entryPoint: provider.shadowFragmentEntryPoint, targets: [] } } : {}),
+            primitive: { topology: 'triangle-list', cullMode: provider?.cullMode ?? 'back', frontFace: 'ccw' },
             depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
           }),
         ]);
@@ -212,7 +215,8 @@ export class RasterRenderer {
   get gpuTextureBytes(): number {
     if (this.disposed) return 0;
     return shadowSize * shadowSize * 4 + materialSize * materialSize * 8
-      + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes + (this.gi?.gpuTextureBytes ?? 0);
+      + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes + (this.gi?.gpuTextureBytes ?? 0)
+      + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.gpuTextureBytes ?? 0), 0);
   }
   get allocatedBytes(): number { return this.gpuBufferBytes + this.gpuTextureBytes; }
   /** Internal views remain owned by this renderer and expire on resize/disposal. */
@@ -279,13 +283,13 @@ export class RasterRenderer {
     const frameData = new Float32Array(frameUniformBytes / 4);
     frameData.set(camera.viewProjection, 0); frameData.set(previous.viewProjection, 16);
     frameData.set(camera.view, 32); frameData.set(previous.view, 48);
-    frameData.set(this.lightMatrix, 64); frameData.set([...camera.eye, timeSeconds], 80);
+    frameData.set(this.geometry?.lightMatrix ?? this.lightMatrix, 64); frameData.set([...camera.eye, timeSeconds], 80);
     const debugIndex = debugViews.indexOf(settings.debugView);
     frameData.set([previousTime, camera.far, debugIndex >= 7 && debugIndex <= 10 ? debugIndex - 6 : 0, 0], 84);
     this.device.queue.writeBuffer(this.resources.frameUniform, 0, frameData);
     const presentationData = new ArrayBuffer(presentationUniformBytes);
     new Uint32Array(presentationData).set([debugIndex, this.gi?.active ? 1 : 0]);
-    new Float32Array(presentationData).set([camera.far, 1], 2);
+    new Float32Array(presentationData).set([camera.far, 2 ** settings.exposureEV], 2);
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
     const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow'): void => {
       for (const pair of this.resources.geometryPipelines) {
@@ -304,7 +308,7 @@ export class RasterRenderer {
       ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
     drawGeometry(shadow, 'shadow');
     const raster = encoder.beginRenderPass({ label: 'Strata PBR and shared geometry outputs', colorAttachments: [
-      { view: targets.views.hdr, clearValue: { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
+      { view: targets.views.hdr, clearValue: this.geometry?.background ? [...this.geometry.background, 1] : { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.normal, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.material, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.motion, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
@@ -355,8 +359,9 @@ export class RasterRenderer {
     if (this.disposed) return;
     this.disposed = true;
     this.temporal.dispose();
-    for (const pair of this.resources.geometryPipelines) pair.provider?.dispose();
+    // Indirect providers may borrow material views owned by geometry.
     this.gi?.dispose();
+    for (const pair of this.resources.geometryPipelines) pair.provider?.dispose();
     for (const resource of [...this.resources.buffers, ...this.resources.textures, ...(this.targets?.textures ?? [])]) resource.destroy();
     this.targets = undefined;
     this.previousCamera = undefined;

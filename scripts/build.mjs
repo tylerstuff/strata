@@ -21,7 +21,7 @@ await copyFile(
 );
 await build({
   absWorkingDir: root,
-  entryPoints: ['packages/core/src/index.ts', 'packages/core/src/worker.ts'],
+  entryPoints: ['packages/core/src/index.ts', 'packages/core/src/worker.ts', 'packages/core/src/gltf.ts'],
   outdir: fileURLToPath(dist),
   bundle: true,
   splitting: true,
@@ -46,4 +46,5 @@ await build({
   external: ['@strata-engine/core'],
   sourcemap: true,
 });
+await import('./build-gallery.mjs');
 console.log('Built the ESM package, declarations, module worker, and precompiled WASM.');

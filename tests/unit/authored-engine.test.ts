@@ -76,7 +76,7 @@ describe('authored engine commitment and frame lifecycle', () => {
   beforeEach(() => {
     vi.resetAllMocks(); created.length = 0; gpu = gpuFixture();
     vi.stubGlobal('navigator', { gpu: gpu.gpu });
-    vi.mocked(initializeCpuRuntime).mockResolvedValue({ info: { abiVersion: 1, memoryBytes: 65536 }, dispose: vi.fn() });
+    vi.mocked(initializeCpuRuntime).mockResolvedValue({ info: { abiVersion: 2, memoryBytes: 65536 }, buildStaticBvh: vi.fn(), waitForStaticBvhIdle: vi.fn(), dispose: vi.fn() });
     factories.authored.mockImplementation(async (_device, _format, scene: BoxSceneDescriptor) => {
       const value = sceneMock(scene); created.push(value); return value;
     });
@@ -247,7 +247,7 @@ describe('authored engine commitment and frame lifecycle', () => {
 
   it('rejects unsupported authored controls before encoding or submitting', async () => {
     const engine = await ready(); await engine.setScene({ renderer: 'authored-boxes', scene: descriptor() });
-    for (const controls of [{ temporal: true }, { debugView: 'normal' }, { gi: { enabled: false } }, { reflections: { mode: 'off' } }]) {
+    for (const controls of [{ exposureEV: 4 }, { exposureEV: -4 }, { temporal: true }, { debugView: 'normal' }, { gi: { enabled: false } }, { reflections: { mode: 'off' } }]) {
       expect(() => engine.render(controls as RenderOptions)).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_FEATURE' }));
     }
     expect(created[0]!.encode).not.toHaveBeenCalled(); expect(gpu.device.queue.submit).not.toHaveBeenCalled();
@@ -272,6 +272,18 @@ describe('authored engine commitment and frame lifecycle', () => {
     await engine.setScene({ renderer: 'diffuse' });
     expect(() => engine.render({ camera })).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_FEATURE' }));
     expect(diffuse.encode).not.toHaveBeenCalled(); expect(gpu.device.queue.submit).not.toHaveBeenCalled();
+  });
+
+  it('explicitly rejects nonzero exposure for clear and legacy diffuse without partial rendering', async () => {
+    const engine = await ready();
+    expect(() => engine.render({ exposureEV: 1 })).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_FEATURE' }));
+    const diffuse = { gpuBufferBytes: 0, gpuTextureBytes: 0, initialUploadBytes: 0, dispose: vi.fn(),
+      encode: vi.fn(() => ({ drawCalls: 1, dispatchCalls: 0, triangles: 12, uploadBytes: 0 })) };
+    factories.diffuse.mockResolvedValueOnce(diffuse); await engine.setScene({ renderer: 'diffuse' });
+    expect(() => engine.render({ exposureEV: -1 })).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_FEATURE' }));
+    expect(diffuse.encode).not.toHaveBeenCalled(); expect(gpu.device.createCommandEncoder).not.toHaveBeenCalled();
+    expect(gpu.device.queue.submit).not.toHaveBeenCalled();
+    engine.render({ exposureEV: 0 }); expect(diffuse.encode).toHaveBeenCalledOnce();
   });
 
   it('rejects unsupported descriptor keys without allocating a renderer', async () => {

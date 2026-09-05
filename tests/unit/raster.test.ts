@@ -101,7 +101,7 @@ describe('raster camera, shadow and material contracts', () => {
       expect(mustResetHistory(previous, { ...previous, ...change }, false)).toBe(true);
     }
     expect(mustResetHistory(previous, previous, true)).toBe(true);
-    expect(normalizeRasterControls()).toEqual({ temporal: true, cameraCut: false, debugView: 'final' });
+    expect(normalizeRasterControls()).toEqual({ temporal: true, cameraCut: false, debugView: 'final', exposureEV: 0 });
     expect(() => normalizeRasterControls({ temporal: 'yes' } as never)).toThrow();
     expect(() => normalizeRasterControls({ debugView: 'unknown' } as never)).toThrow();
   });
@@ -148,6 +148,35 @@ describe('raster frame orchestration and ownership', () => {
     } satisfies RasterGeometryProvider;
   }
 
+  it('changes only presentation exposure while preserving temporal history and resource ownership', async () => {
+    const gpu = fixture();
+    const renderer = await RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm');
+    const render = (exposureEV?: number) => renderer.encode(gpu.encoder as unknown as GPUCommandEncoder,
+      {} as GPUTextureView, 640, 360, 0, exposureEV === undefined ? {} : { exposureEV });
+    render();
+    const textures = gpu.textures.length, buffers = gpu.buffers.length;
+    for (const exposureEV of [-16, -0.5, 0, 4, 8, 12, 16]) render(exposureEV);
+    render(); // An omitted value resets the display compensation to zero for this frame.
+    const values = gpu.writes.filter(write => write.label === 'Strata presentation settings')
+      .map(write => new Float32Array(write.bytes.buffer)[3]);
+    expect(values).toEqual([1, 2 ** -16, Math.fround(2 ** -0.5), 1, 16, 256, 4096, 65536, 1]);
+    expect(values.every(value => Number.isFinite(value) && value! > 0)).toBe(true);
+    const historyFlags = gpu.writes.filter(write => write.label === 'Strata temporal options')
+      .map(write => new Uint32Array(write.bytes.buffer)[2]);
+    expect(historyFlags).toEqual([0, 1, 1, 1, 1, 1, 1, 1, 1]);
+    expect(gpu.textures).toHaveLength(textures); expect(gpu.buffers).toHaveLength(buffers);
+    const writeCount = gpu.writes.length, passCount = gpu.encoder.beginRenderPass.mock.calls.length;
+    for (const value of [NaN, Infinity, -Infinity, -16.01, 16.01, null, '4', true]) {
+      expect(() => render(value as number)).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+    }
+    expect(gpu.writes).toHaveLength(writeCount);
+    expect(gpu.encoder.beginRenderPass).toHaveBeenCalledTimes(passCount);
+    expect(gpu.textures).toHaveLength(textures); expect(gpu.buffers).toHaveLength(buffers);
+    render(0);
+    expect(new Uint32Array(gpu.writes.filter(write => write.label === 'Strata temporal options').at(-1)!.bytes.buffer)[2]).toBe(1);
+    renderer.dispose();
+  });
+
   it('batches separate provider pipelines into one camera, shadow map and MRT while summing actual work', async () => {
     const gpu = fixture();
     const a = provider('terrain', true, { triangles: 20, drawCalls: 2, dispatchCalls: 2, uploadBytes: 7 });
@@ -161,8 +190,8 @@ describe('raster frame orchestration and ownership', () => {
       { temporal: false }, { selection });
     expect(result).toMatchObject({ drawCalls: 9, triangles: 33, dispatchCalls: 2, uploadBytes: 386 });
     expect(group.camera).toHaveBeenCalledOnce(); expect(a.camera).not.toHaveBeenCalled(); expect(b.camera).not.toHaveBeenCalled();
-    expect(a.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false }, selection);
-    expect(b.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false }, undefined);
+    expect(a.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false, exposureEV: 0 }, selection);
+    expect(b.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false, exposureEV: 0 }, undefined);
     expect(gpu.encoder.beginRenderPass.mock.calls.map(([descriptor]) => descriptor.label)).toEqual([
       'Strata directional shadow', 'Strata PBR and shared geometry outputs', 'Strata tone mapping and debug presentation',
     ]);
