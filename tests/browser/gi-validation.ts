@@ -382,7 +382,7 @@ export async function validateGiProbeCache() {
       warm: { statistics: warm.statistics, irradiance: warm.irradiance, telemetry: warm.telemetry },
       lightOff: { statistics: lightOff.statistics, irradiance: lightOff.irradiance, telemetry: lightOff.telemetry },
       doorReset: { statistics: doorReset.statistics, irradiance: doorReset.irradiance, telemetry: doorReset.telemetry },
-      convergence: { unit: 'submitted frames, not a claimed display rate', samples: series }, gpuErrors: errors };
+      convergence: { unit: 'submitted frames, not a claimed display rate', qualification: 'Finite observation only; not radiometric convergence against an independent lighting reference.', samples: series }, gpuErrors: errors };
   } finally { cache?.dispose(); for (const buffer of buffers) buffer.destroy(); device.destroy(); }
 }
 
@@ -395,7 +395,7 @@ export async function validateGiRenderedScene() {
   let target = device.createTexture({ label: 'GI validation presentation', size: [width, height], format: 'rgba8unorm', usage: 0x10 });
   let renderer: GiRenderer | undefined;
   const progress: Record<string, unknown> = { stage: 'initialization' };
-  const convergenceSubmissions = 240; const tailSubmissions = 24;
+  const observationSubmissions = 240; const tailSubmissions = 24;
   type Controls = NonNullable<Parameters<GiRenderer['encode']>[5]>;
   type Roi = Awaited<ReturnType<typeof readGiLinearRoi>>;
   try {
@@ -449,7 +449,7 @@ export async function validateGiRenderedScene() {
     require(isColoredWallOffscreen(renderer!.currentScene, renderer!.currentCamera!.viewProjection),
       'The colored source wall must be completely offscreen before the first GI update.');
     require(coldRed.indirect!.mean.every(value => value < 1e-6), 'Fresh GI caches unexpectedly contained receiver lighting.');
-    const redSeries = await warm(convergenceSubmissions - 1); const red = tailMean(redSeries);
+    const redSeries = await warm(observationSubmissions - 1); const red = tailMean(redSeries);
     progress.stage = 'warm-red'; progress.redSeries = redSeries;
     require(red.some(value => value > 0.0001), 'An offscreen source did not affect the visible receiver from a cold cache.');
     require(coldRed.direct.mean.every(value => value < 0.00001), 'The receiver must be shadowed in the direct-only baseline.');
@@ -461,7 +461,7 @@ export async function validateGiRenderedScene() {
     require(Number(close.telemetry.cacheEpoch) === redEpoch + 1, 'Closing the rigid door did not invalidate old lighting.');
     require(close.indirect!.mean.every(value => value < 1e-6), 'Closed door reset retained old receiver irradiance.');
     const closedSeries = await warm(35); const closed = tailMean(closedSeries);
-    progress.stage = 'closed-door-convergence'; progress.closedSeries = closedSeries;
+    progress.stage = 'closed-door-stabilization'; progress.closedSeries = closedSeries;
     const openEnergy = red.reduce((sum, value) => sum + value, 0); const closedEnergy = closed.reduce((sum, value) => sum + value, 0);
     require(closedEnergy < openEnergy * 0.25, `Closed-door leakage is too large: closed/open=${closedEnergy / openEnergy}.`);
     const lightOff = await step({ gi: { lightIntensity: 0 } });
@@ -471,7 +471,7 @@ export async function validateGiRenderedScene() {
     require(paused.indirect === null && paused.stats.dispatchCalls === 0, 'GI disabled still dispatched tracing/update/shading.');
     const resumed = await step({ gi: { enabled: true, lightIntensity: 1, doorOpen: true } });
     require(resumed.indirect!.mean.every(value => value < 1e-6), 'Reenabled GI reused stale cache data.');
-    const reopenSeries = await warm(convergenceSubmissions - 1); const reopened = tailMean(reopenSeries);
+    const reopenSeries = await warm(observationSubmissions - 1); const reopened = tailMean(reopenSeries);
     progress.stage = 'reopened-door'; progress.reopenSeries = reopenSeries;
     require(reopened.reduce((sum, value) => sum + value, 0) > openEnergy * 0.25, 'Reopening the door did not restore receiver lighting.');
     const beforeResize = Number(renderer!.giTelemetry.cacheEpoch);
@@ -488,7 +488,7 @@ export async function validateGiRenderedScene() {
     progress.stage = 'cold-neutral'; progress.coldNeutral = coldNeutral;
     require(isColoredWallOffscreen(renderer!.currentScene, renderer!.currentCamera!.viewProjection), 'Neutral comparison source entered the camera view.');
     require(coldNeutral.indirect!.mean.every(value => value < 1e-6), 'Neutral comparison did not start from a cold cache.');
-    const neutralSeries = await warm(convergenceSubmissions - 1); const neutral = tailMean(neutralSeries);
+    const neutralSeries = await warm(observationSubmissions - 1); const neutral = tailMean(neutralSeries);
     progress.stage = 'warm-neutral'; progress.neutralSeries = neutralSeries;
     const redRatio = red[0]! / Math.max(red[1]!, 1e-8); const neutralRatio = neutral[0]! / Math.max(neutral[1]!, 1e-8);
     require(redRatio > neutralRatio + 0.2, `Offscreen material color did not affect receiver chroma: red R/G=${redRatio}, neutral=${neutralRatio}.`);
@@ -499,7 +499,7 @@ export async function validateGiRenderedScene() {
       redTailMean: red, neutralTailMean: neutral, redGreenRatio: { red: redRatio, neutral: neutralRatio },
       closedDoorTailMean: closed, closedOpenEnergyRatio: closedEnergy / openEnergy, reopenedDoorTailMean: reopened,
       lightOff: { direct: lightOff.direct, indirect: lightOff.indirect },
-      convergence: { unit: 'submitted frames, not a claimed display rate', observationSubmissions: convergenceSubmissions, tailSubmissions,
+      convergence: { unit: 'submitted frames, not a claimed display rate', qualification: 'Tail-relative stabilization only; not radiometric convergence against an independent lighting reference.', observationSubmissions, tailSubmissions,
         summaryDefinition: 'Retrospective response within the finite observation window; final tail mean is not a ground-truth error bound.',
         summaries: { red: summarizeResponse(redSeries), neutral: summarizeResponse(neutralSeries), closed: summarizeResponse(closedSeries), reopened: summarizeResponse(reopenSeries) },
         red: redSeries, neutral: neutralSeries, closed: closedSeries, reopened: reopenSeries },
