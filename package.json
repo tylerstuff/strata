@@ -42,7 +42,8 @@
     "test:probe-volume": "node scripts/test-probe-volume.mjs",
     "test:authored-boxes": "node scripts/test-authored-boxes.mjs",
     "test:imported": "node scripts/test-imported.mjs",
-    "test:imported-indirect": "node scripts/test-imported-indirect.mjs"
+    "test:imported-indirect": "node scripts/test-imported-indirect.mjs && npm run test:imported-progressive",
+    "test:imported-progressive": "node scripts/test-imported-progressive.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

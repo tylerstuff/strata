@@ -53,10 +53,14 @@ readback. Counters from an older revision are never published as current. A grou
 presentation is rejected because it is absent from the tracing source. Recreate the
 scene without `indirect` to return to the ordinary imported rendering path.
 
-The integration is under validation; CPU orchestration checks and the static-house
-preparation result do not establish correct rendered house transport. No gallery GI
-control should be presented as accepted until the generated GPU checks and a fixed
-interior witness pass.
+The generated public-engine path is checked by `npm run test:imported-progressive`
+(also included in `npm run test:imported-indirect` and `npm run check`). It exercises
+actual HTTP-loaded worker/WASM and optional shader chunks, perspective receiver
+agreement, sky convergence against an independent integral, baseline/emission
+exclusions, viewport admission, cancellation/replacement and disposal. These checks
+passed both hardware and software adapters. The static-house preparation and
+generated fixtures do not establish correct rendered house transport; a fixed
+interior witness remains a separate acceptance check before gallery promotion.
 
 `ImportedIndirectEffect` implements the existing `RasterGiProvider`. Root integration owns CPU preparation, material handles, controls and activation. It must disable raster TAA to provide an unjittered camera, zero ordinary ambient fill and exclude diffuse SH IBL while this effect is active. Interior correctness comparisons also keep specular IBL off. Both the GI-on and matched GI-off references need the same direct baseline. These exclusions prevent double counting or unoccluded fill from appearing through walls.
 

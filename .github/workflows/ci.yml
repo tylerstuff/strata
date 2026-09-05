@@ -135,7 +135,7 @@ jobs:
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
-      - name: Validate generated progressive imported diffuse transport
+      - name: Validate generated progressive transport and public engine integration
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:imported-indirect
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
