@@ -147,13 +147,14 @@ export class RasterRenderer {
             fragment: { module, entryPoint: provider?.fragmentEntryPoint ?? 'fragmentMain', targets: [
               { format: 'rgba16float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }, { format: 'rgba16float' },
             ] },
-            primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+            primitive: { topology: 'triangle-list', cullMode: provider?.cullMode ?? 'back', frontFace: 'ccw' },
             depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
           }),
           device.createRenderPipelineAsync({
             label: 'Strata directional shadow pipeline', layout: 'auto',
             vertex: { module, entryPoint: provider?.shadowEntryPoint ?? 'shadowMain', buffers: provider ? provider.vertexBuffers ?? [] : vertexBuffers },
-            primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+            ...(provider?.shadowFragmentEntryPoint ? { fragment: { module, entryPoint: provider.shadowFragmentEntryPoint, targets: [] } } : {}),
+            primitive: { topology: 'triangle-list', cullMode: provider?.cullMode ?? 'back', frontFace: 'ccw' },
             depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
           }),
         ]);
@@ -212,7 +213,8 @@ export class RasterRenderer {
   get gpuTextureBytes(): number {
     if (this.disposed) return 0;
     return shadowSize * shadowSize * 4 + materialSize * materialSize * 8
-      + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes + (this.gi?.gpuTextureBytes ?? 0);
+      + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes + (this.gi?.gpuTextureBytes ?? 0)
+      + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.gpuTextureBytes ?? 0), 0);
   }
   get allocatedBytes(): number { return this.gpuBufferBytes + this.gpuTextureBytes; }
   /** Internal views remain owned by this renderer and expire on resize/disposal. */
@@ -279,7 +281,7 @@ export class RasterRenderer {
     const frameData = new Float32Array(frameUniformBytes / 4);
     frameData.set(camera.viewProjection, 0); frameData.set(previous.viewProjection, 16);
     frameData.set(camera.view, 32); frameData.set(previous.view, 48);
-    frameData.set(this.lightMatrix, 64); frameData.set([...camera.eye, timeSeconds], 80);
+    frameData.set(this.geometry?.lightMatrix ?? this.lightMatrix, 64); frameData.set([...camera.eye, timeSeconds], 80);
     const debugIndex = debugViews.indexOf(settings.debugView);
     frameData.set([previousTime, camera.far, debugIndex >= 7 && debugIndex <= 10 ? debugIndex - 6 : 0, 0], 84);
     this.device.queue.writeBuffer(this.resources.frameUniform, 0, frameData);
@@ -304,7 +306,7 @@ export class RasterRenderer {
       ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
     drawGeometry(shadow, 'shadow');
     const raster = encoder.beginRenderPass({ label: 'Strata PBR and shared geometry outputs', colorAttachments: [
-      { view: targets.views.hdr, clearValue: { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
+      { view: targets.views.hdr, clearValue: this.geometry?.background ? [...this.geometry.background, 1] : { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.normal, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.material, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.motion, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },

@@ -15,7 +15,10 @@ import type { IntegratedSceneOptions, IntegratedTelemetry } from './integrated/i
 import type { AuthoredBoxSceneOptions, AuthoredFrameMetadata, BoxCamera } from './rendering/authored-box-types.js';
 export type { AuthoredBoxSceneOptions, AuthoredFrameMetadata, BoxCamera, BoxSceneDescriptor, AuthoredBox, BoxVec3, BoxQuaternion } from './rendering/authored-box-types.js';
 
-export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions | ReflectionSceneOptions | IntegratedSceneOptions | AuthoredBoxSceneOptions;
+export type { ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip } from './imported/imported-types.js';
+import type { ImportedSceneOptions, ImportedControls, ImportedTelemetry } from './imported/imported-types.js';
+
+export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions | ReflectionSceneOptions | IntegratedSceneOptions | AuthoredBoxSceneOptions | ImportedSceneOptions;
 
 export interface RenderOptions extends Omit<RasterControls, 'debugView'> {
   debugView?: RasterControls['debugView'] | 'base-color';
@@ -25,12 +28,13 @@ export interface RenderOptions extends Omit<RasterControls, 'debugView'> {
   timeSeconds?: number;
   gi?: GiControls;
   reflections?: ReflectionControls;
+  imported?: ImportedControls;
 }
 
 /** Immutable engine-local commitment identity, not a content hash or presentation receipt. */
 export interface SceneCommitReceipt {
   readonly sceneGeneration: number;
-  readonly renderer: 'clear' | 'diffuse' | 'raster' | 'virtual' | 'gi' | 'reflections' | 'integrated' | 'authored-boxes';
+  readonly renderer: 'clear' | 'diffuse' | 'raster' | 'virtual' | 'gi' | 'reflections' | 'integrated' | 'authored-boxes' | 'imported';
   readonly sceneId: string | null;
   /** Opaque caller correlation, never verified against an authoring document by Core. */
   readonly sourceRevision: string | null;
@@ -101,6 +105,7 @@ export interface FrameMetrics {
   readonly gi?: GiTelemetry;
   readonly reflections?: ReflectionTelemetry;
   readonly integrated?: IntegratedTelemetry;
+  readonly imported?: ImportedTelemetry;
   readonly uploadBytes: number;
   readonly allocatedGpuBufferBytes: number;
   /** Texture payload estimates exclude canvas/driver allocations and alignment. */
@@ -140,6 +145,7 @@ export interface EngineTelemetry {
   readonly gi?: GiTelemetry;
   readonly reflections?: ReflectionTelemetry;
   readonly integrated?: IntegratedTelemetry;
+  readonly imported?: ImportedTelemetry;
 }
 
 export interface Engine {

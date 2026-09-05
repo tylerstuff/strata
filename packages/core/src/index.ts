@@ -11,4 +11,5 @@ export type {
   IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode,
   SceneCommitReceipt, AuthoredBoxSceneOptions, AuthoredFrameMetadata, BoxCamera,
   BoxSceneDescriptor, AuthoredBox, BoxVec3, BoxQuaternion,
+  ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip,
 } from './types.js';

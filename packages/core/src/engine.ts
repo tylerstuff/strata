@@ -10,10 +10,11 @@ import type { RasterRenderer } from './rendering/raster-renderer.js';
 import type { VirtualRenderer } from './geometry/virtual-renderer.js';
 import type { IntegratedRenderer } from './integrated/integrated-renderer.js';
 import type { ReflectionRenderer } from './reflections/reflection-renderer.js';
+import type { ImportedRenderer } from './imported/imported-renderer.js';
 import type { GiRenderer } from './gi/gi-renderer.js';
 import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics, RenderOptions, SceneCommitReceipt } from './types.js';
 
-type OwnedScene = { kind: 'authored-boxes'; value: AuthoredBoxRenderer; descriptor: BoxSceneDescriptor } | { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer } | { kind: 'gi'; value: GiRenderer } | { kind: 'reflections'; value: ReflectionRenderer } | { kind: 'integrated'; value: IntegratedRenderer };
+type OwnedScene = { kind: 'authored-boxes'; value: AuthoredBoxRenderer; descriptor: BoxSceneDescriptor } | { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer } | { kind: 'gi'; value: GiRenderer } | { kind: 'reflections'; value: ReflectionRenderer } | { kind: 'integrated'; value: IntegratedRenderer } | { kind: 'imported'; value: ImportedRenderer };
 
 // Module evaluation is intentionally safe without navigator, document or Worker.
 const ownedCanvases = new WeakSet<HTMLCanvasElement>();
@@ -339,6 +340,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         ...(scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated' ? { gi: scene.value.giTelemetry } : {}),
         ...(scene?.kind === 'reflections' || scene?.kind === 'integrated' ? { reflections: scene.value.reflectionTelemetry } : {}),
         ...(scene?.kind === 'integrated' ? { integrated: scene.value.integratedTelemetry } : {}),
+        ...(scene?.kind === 'imported' ? { imported: scene.value.importedTelemetry } : {}),
       };
     }
 
@@ -354,14 +356,14 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       async setScene(sceneOptions) {
         assertReady();
         if (sceneOptions !== null && (!sceneOptions || typeof sceneOptions !== 'object' || Array.isArray(sceneOptions)
-          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual', 'gi', 'reflections', 'integrated', 'authored-boxes'].includes(sceneOptions.renderer)))) {
+          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual', 'gi', 'reflections', 'integrated', 'authored-boxes', 'imported'].includes(sceneOptions.renderer)))) {
           throw new StrataError('INVALID_OPTIONS', 'Use a supported scene renderer, or null to clear.');
         }
         // Validate and take ownership of authored JSON before an asynchronous phase
         // or superseding an already valid pending request.
         const snapshot = sceneOptions === null ? null : sceneOptions.renderer === 'authored-boxes'
           ? { ...sceneOptions, scene: validateAuthoredBoxScene(sceneOptions.scene) } : { ...sceneOptions };
-        const userSignal = snapshot?.renderer === 'virtual' || snapshot?.renderer === 'integrated' || snapshot?.renderer === 'authored-boxes'
+        const userSignal = snapshot?.renderer === 'virtual' || snapshot?.renderer === 'integrated' || snapshot?.renderer === 'authored-boxes' || snapshot?.renderer === 'imported'
           ? snapshot.signal : undefined;
         if (userSignal !== undefined && (!userSignal || typeof userSignal.aborted !== 'boolean'
           || typeof userSignal.addEventListener !== 'function' || typeof userSignal.removeEventListener !== 'function')) {
@@ -409,6 +411,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             const { AuthoredBoxRenderer } = await import('./rendering/authored-box-renderer.js');
             assertCurrentRequest();
             return { kind: 'authored-boxes', descriptor: snapshot!.scene, value: await AuthoredBoxRenderer.create(ownedDevice, format, snapshot!.scene) };
+          } else if (snapshot!.renderer === 'imported') {
+            const { ImportedRenderer } = await import('./imported/imported-renderer.js');
+            assertCurrentRequest();
+            return { kind: 'imported', value: await ImportedRenderer.create(ownedDevice, format, { ...snapshot!, signal: requestAbort.signal }) };
           } else if (snapshot!.renderer === 'integrated') {
             const { IntegratedRenderer } = await import('./integrated/integrated-renderer.js');
             assertCurrentRequest();
@@ -462,6 +468,13 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         assertReady();
         const requestedControls = renderOptions ?? defaultRenderOptions;
         validateRenderOptions(requestedControls);
+        if (requestedControls.imported !== undefined && scene?.kind !== 'imported') {
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Imported controls require an imported scene.');
+        }
+        if (scene?.kind === 'imported' && (requestedControls.gi !== undefined || requestedControls.reflections !== undefined
+          || (requestedControls.debugView !== undefined && !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material'].includes(requestedControls.debugView)))) {
+          throw new StrataError('UNSUPPORTED_FEATURE', 'Imported scenes support raster diagnostics without GI or traced reflections.');
+        }
         if (scene?.kind === 'authored-boxes') {
           if (requestedControls.temporal === true || requestedControls.gi !== undefined || requestedControls.reflections !== undefined
             || (requestedControls.debugView !== undefined && requestedControls.debugView !== 'final' && requestedControls.debugView !== 'base-color')) {
@@ -526,7 +539,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           submittedFrames++;
           firstSubmittedFrameId ??= frameId;
           lastSubmittedFrameId = frameId;
-          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated') scene.value.submitted(frameId);
+          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated' || scene?.kind === 'imported') scene.value.submitted(frameId);
           if (timing) profiler!.submitted(timing);
           const stats = telemetry();
           const metrics: FrameMetrics = {
@@ -540,12 +553,13 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             ...(stats.gi ? { gi: stats.gi } : {}),
             ...(stats.reflections ? { reflections: stats.reflections } : {}),
             ...(stats.integrated ? { integrated: stats.integrated } : {}),
+            ...(stats.imported ? { imported: stats.imported } : {}),
           };
           return metrics;
         } catch (cause) {
           // Encoding can advance ping-pong histories before a later pass or submission fails.
           forceRasterCameraCut = true;
-          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated') scene.value.cancelFrame();
+          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated' || scene?.kind === 'imported') scene.value.cancelFrame();
           if (timing) profiler!.cancel(timing);
           throw new StrataError('RENDER_FAILED', 'WebGPU frame submission failed.', { cause });
         }

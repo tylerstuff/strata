@@ -6,6 +6,8 @@ export interface RasterGeometryGroup {
   readonly providers: readonly RasterGeometryProvider[];
   readonly halfExtent: number;
   readonly lightMatrix: Float32Array<ArrayBuffer>;
+  /** Linear HDR clear color; the existing raster fixture keeps its default. */
+  readonly background?: readonly [number, number, number];
   camera(width: number, height: number, time: number, jitter: readonly [number, number]): CameraFrame;
 }
 
@@ -14,6 +16,8 @@ export interface RasterGeometryProvider {
   readonly shaderSource: string;
   readonly vertexEntryPoint: string;
   readonly shadowEntryPoint: string;
+  readonly shadowFragmentEntryPoint?: string;
+  readonly cullMode?: GPUCullMode;
   readonly fragmentEntryPoint?: string;
   readonly usesMaterialTextures?: boolean;
   readonly halfExtent: number;
@@ -21,6 +25,8 @@ export interface RasterGeometryProvider {
   readonly vertexBuffers?: GPUVertexBufferLayout[];
   readonly lightMatrix: Float32Array<ArrayBuffer>;
   readonly gpuBufferBytes: number;
+  readonly gpuTextureBytes?: number;
+  readonly background?: readonly [number, number, number];
   readonly initialUploadBytes: number;
   camera(width: number, height: number, time: number, jitter: readonly [number, number]): CameraFrame;
   attachPipelines(raster: GPURenderPipeline, shadow: GPURenderPipeline): void;

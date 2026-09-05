@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEngine, StrataError, type Engine } from '../../packages/core/src/index.js';
 import { initializeCpuRuntime } from '../../packages/core/src/internal/cpu-runtime.js';
 import type { IntegratedRenderer as IntegratedRendererType } from '../../packages/core/src/integrated/integrated-renderer.js';
+import type { ImportedRenderer as ImportedRendererType } from '../../packages/core/src/imported/imported-renderer.js';
+import type { ImportedAsset } from '../../packages/core/src/imported/imported-types.js';
 
 vi.mock('../../packages/core/src/internal/cpu-runtime.js', () => ({
   initializeCpuRuntime: vi.fn(),
@@ -171,6 +173,48 @@ describe('engine lifecycle', () => {
     await expect(engine.setScene({ renderer: 'integrated', manifestUrl, traceProxyUrl: proxyUrl, signal: abort.signal }))
       .rejects.toMatchObject({ code: 'SCENE_LOAD_ABORTED' });
     expect(load).toHaveBeenCalledOnce();
+  });
+
+  it('loads imported scenes lazily, forwards controls and reports their owned resources', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const importedTelemetry = { sourceUrl: 'https://fixtures.test/a.gltf', primitives: 2, triangles: 4, warnings: [], textures: [],
+      animation: { clipId: 'test', timeSeconds: 0.25, loop: false } };
+    const value = { gpuBufferBytes: 512, gpuTextureBytes: 1024, initialUploadBytes: 768, importedTelemetry,
+      passNames: vi.fn(() => ['raster']), encode: vi.fn((..._args: unknown[]) => ({ drawCalls: 5, dispatchCalls: 0, triangles: 9, uploadBytes: 64 })),
+      submitted: vi.fn(), cancelFrame: vi.fn(), dispose: vi.fn() };
+    const load = vi.spyOn(ImportedRenderer, 'create').mockResolvedValue(value as unknown as ImportedRendererType);
+    const engine = await ready(); const abort = new AbortController(); const asset = {} as ImportedAsset;
+    await engine.setScene({ renderer: 'imported', asset, signal: abort.signal });
+    expect(load).toHaveBeenCalledWith(fixture.device, 'bgra8unorm', expect.objectContaining({ asset, signal: expect.any(AbortSignal) }));
+    const controls = { imported: { animation: { clipId: 'test', timeSeconds: 0.25, loop: false } }, temporal: false };
+    const frame = engine.render(controls);
+    expect(value.encode.mock.calls[0]?.[5]).toEqual(controls);
+    expect(frame).toMatchObject({ imported: importedTelemetry, triangles: 9, triangleCountSourceFrameId: 1,
+      allocatedGpuBufferBytes: 512, allocatedGpuTextureBytes: 1024 });
+    expect(value.submitted).toHaveBeenCalledWith(1);
+    fixture.device.queue.submit.mockImplementationOnce(() => { throw new Error('submission failed'); });
+    expect(() => engine.render(controls)).toThrow(); expect(value.cancelFrame).toHaveBeenCalledOnce();
+    await engine.setScene(null); expect(value.dispose).toHaveBeenCalledOnce();
+    abort.abort();
+    await expect(engine.setScene({ renderer: 'imported', asset, signal: abort.signal })).rejects.toMatchObject({ code: 'SCENE_LOAD_ABORTED' });
+    expect(load).toHaveBeenCalledOnce();
+  });
+
+  it('aborts a superseded imported load and disposes a late result without installing it', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const result = deferred<ImportedRendererType>();
+    const load = vi.spyOn(ImportedRenderer, 'create').mockReturnValue(result.promise);
+    const engine = await ready();
+    const waiting = engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset });
+    const rejected = expect(waiting).rejects.toMatchObject({ code: 'SCENE_LOAD_SUPERSEDED' });
+    await flushMicrotasks();
+    expect(load).toHaveBeenCalledOnce();
+    const signal = load.mock.calls[0]![2].signal!;
+    await engine.setScene(null); expect(signal.aborted).toBe(true);
+    const late = { initialUploadBytes: 10, dispose: vi.fn() };
+    result.resolve(late as unknown as ImportedRendererType); await rejected;
+    expect(late.dispose).toHaveBeenCalledOnce();
+    expect(engine.getTelemetry().imported).toBeUndefined();
   });
 
   it('reports missing browser WebGPU without touching the canvas or CPU', async () => {
