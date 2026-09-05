@@ -1,4 +1,5 @@
 import { createEnvironmentResources, environmentUniform, importedEnvironmentShader } from '../../packages/core/src/imported/imported-environment.js';
+import { createImportedEnvironmentCubeCases } from './imported-environment-cube-cases.js';
 
 type V3 = readonly [number, number, number];
 const unit = (v: V3): V3 => { const length = Math.hypot(...v); return [v[0] / length, v[1] / length, v[2] / length]; };
@@ -34,7 +35,7 @@ export async function validateImportedEnvironment(device: GPUDevice) {
       { binding: 1, visibility: 0x4, buffer: { type: 'storage' } },
     ] });
     const environmentLayout = device.createBindGroupLayout({ entries: [
-      { binding: 12, visibility: 0x4, texture: { sampleType: 'float', viewDimension: 'cube-array' } },
+      { binding: 12, visibility: 0x4, texture: { sampleType: 'float', viewDimension: '2d-array' } },
       { binding: 13, visibility: 0x4, texture: { sampleType: 'float', viewDimension: '2d' } },
       { binding: 14, visibility: 0x4, sampler: { type: 'filtering' } },
       { binding: 15, visibility: 0x4, buffer: { type: 'uniform' } },
@@ -42,7 +43,7 @@ export async function validateImportedEnvironment(device: GPUDevice) {
     const layout = device.createPipelineLayout({ bindGroupLayouts: [queryLayout, environmentLayout] });
     const pipeline = await device.createComputePipelineAsync({ layout, compute: { module, entryPoint: 'environmentProbe' } });
     const binding = device.createBindGroup({ layout: pipeline.getBindGroupLayout(1), entries: [
-      { binding: 12, resource: resources.cube.createView({ dimension: 'cube-array', arrayLayerCount: 12 }) },
+      { binding: 12, resource: resources.cube.createView({ dimension: '2d-array', arrayLayerCount: 12 }) },
       { binding: 13, resource: resources.dfg.createView() }, { binding: 14, resource: resources.sampler },
       { binding: 15, resource: { buffer: resources.uniform } },
     ] });
@@ -66,6 +67,15 @@ export async function validateImportedEnvironment(device: GPUDevice) {
     }
     // Save actual generated-preset outputs before replacing our private textures with analytical fixtures.
     const axis: V3[] = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1], unit([2, 1, -3])];
+    // Signed seams vary the third coordinate, so the spatial RGB field below
+    // detects reversed adjacent border rows as well as wrong neighbor faces.
+    for (let a = 0; a < 3; a++) for (let b = a + 1; b < 3; b++) {
+      for (const x of [-1, 1]) for (const y of [-1, 1]) for (const third of [-.37, .37]) {
+        const direction: [number, number, number] = [0, 0, 0]; direction[a] = x; direction[b] = y; direction[3 - a - b] = third;
+        axis.push(unit(direction));
+      }
+    }
+    for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) axis.push(unit([x, y, z]));
     const metallicQueries = axis.map(normal => ({ normal, view: normal, base: [1, 1, 1] as V3, roughness: .06, metallic: 1 }));
     const studioUniform = environmentUniform({ preset: 'studio', intensity: 1, rotationRadians: 0 }, 'authored');
     const studio = await run(metallicQueries, studioUniform);
@@ -134,6 +144,50 @@ export async function validateImportedEnvironment(device: GPUDevice) {
         errors.push(near(value.map((v, channel) => v - diffuse[index * 2 + 1]![channel]!), rotated.map(v => (1 + .2 * 2 / 3 * v) * .96), .001, 'Affine irradiance and diffuse-only material AO'));
       });
     }
-    return { evaluations, maximumAbsoluteError: Math.max(...errors), controls: ['presets', 'off', 'linear-intensity', 'single-scatter-furnace', 'independent-DFG', 'removed-specular-negative', 'cube-orientation', 'inverse-yaw', 'affine-irradiance', 'diffuse-AO'] };
+    const reversedRowShader = importedEnvironmentShader.replace('importedCubeLoad(direction, adjacent.face, edge, level, preset)',
+      'importedCubeLoad(vec3f(direction.x, -direction.y, direction.z), adjacent.face, edge, level, preset)');
+    require(reversedRowShader !== importedEnvironmentShader, 'Reversed-border-row mutation must apply.');
+    const reversedRow = await device.createComputePipelineAsync({ layout, compute: { module: device.createShaderModule({ code: reversedRowShader + probe }), entryPoint: 'environmentProbe' } });
+    const seamDirection = unit([1, .37, 1]);
+    const rowResult = await run([{ normal: seamDirection, view: seamDirection, base: [1, 1, 1], roughness: .06, metallic: 1 }], studioUniform, reversedRow);
+    let rowRejected = false; try { near(rowResult[0]!, seamDirection.map(v => 1 + .2 * v), .002, 'Signed gradient adjacent row'); } catch { rowRejected = true; }
+    require(rowRejected, 'Reversed adjacent border row was accepted.');
+
+    // Independent exact face/mip colors exercise all signed seams, all corners,
+    // unequal edge weights and fractional LOD without reproducing the sampler.
+    const cubeFixture = createImportedEnvironmentCubeCases();
+    for (const { level, edge, data } of cubeFixture.mipLevels) {
+      device.queue.writeTexture({ texture: resources.cube, mipLevel: level }, data,
+        { bytesPerRow: edge * 8, rowsPerImage: edge }, [edge, edge, 12]);
+    }
+    const cubeProbe = probe.replace('importedEnvironmentLight(q.base.xyz, q.parameters.x, q.parameters.y,\n    q.normal.xyz, q.view.xyz, q.parameters.z)',
+      'importedCubeRadiance(q.normal.xyz, q.parameters.x, i32(q.parameters.y))');
+    require(cubeProbe !== probe, 'Cube probe must call the production cube filter.');
+    async function cubePipeline(shader: string) {
+      return device.createComputePipelineAsync({ layout, compute: { module: device.createShaderModule({ code: shader + cubeProbe }), entryPoint: 'environmentProbe' } });
+    }
+    const cube = await cubePipeline(importedEnvironmentShader);
+    const query = (q: (typeof cubeFixture.queries)[number]): Query => ({ normal: q.direction, view: [0, 0, 1], base: [1, 1, 1], roughness: q.lod, metallic: q.preset });
+    for (let offset = 0; offset < cubeFixture.queries.length; offset += 128) {
+      const batch = cubeFixture.queries.slice(offset, offset + 128);
+      const output = await run(batch.map(query), constant, cube);
+      output.forEach((rgb, index) => errors.push(near(rgb, batch[index]!.expected, .00001, batch[index]!.label)));
+    }
+    // A same-face clamp can preserve a constant source while losing its neighbor's
+    // color. This mutation must fail the very same nonuniform seam assertion.
+    const clampedEdgeShader = importedEnvironmentShader.replace('return importedCubeLoad(direction, adjacent.face, edge, level, preset);',
+      'return textureLoad(importedEnvironmentCube, clamp(pixel, vec2i(0), vec2i(edge - 1)), preset * 6 + face, level).rgb;');
+    require(clampedEdgeShader !== importedEnvironmentShader, 'Clamped-edge mutation must apply.');
+    const seam = cubeFixture.queries.find(q => q.label.includes('seam'))!;
+    const clampedEdge = await run([query(seam)], constant, await cubePipeline(clampedEdgeShader));
+    let edgeRejected = false; try { near(clampedEdge[0]!, seam.expected, .00001, seam.label); } catch { edgeRejected = true; }
+    require(edgeRejected, 'Discarded adjacent-face color was accepted.');
+    const nearestLodShader = importedEnvironmentShader.replace('return mix(a, importedCubeLevel(address, lower + 1, preset), weight);', 'return a;');
+    require(nearestLodShader !== importedEnvironmentShader, 'Nearest-LOD mutation must apply.');
+    const fractional = cubeFixture.queries.find(q => !Number.isInteger(q.lod))!;
+    const nearestLod = await run([query(fractional)], constant, await cubePipeline(nearestLodShader));
+    let lodRejected = false; try { near(nearestLod[0]!, fractional.expected, .00001, fractional.label); } catch { lodRejected = true; }
+    require(lodRejected, 'Discarded fractional LOD was accepted.');
+    return { evaluations, cubeQueries: cubeFixture.queries.length, maximumAbsoluteError: Math.max(...errors), controls: ['presets', 'off', 'linear-intensity', 'single-scatter-furnace', 'independent-DFG', 'removed-specular-negative', 'cube-orientation', 'inverse-yaw', 'affine-irradiance', 'diffuse-AO', 'gradient-seams', 'reversed-row-negative', 'nonuniform-seams-corners-lod', 'clamped-edge-negative', 'nearest-lod-negative'] };
   } finally { for (const buffer of buffers) buffer.destroy(); resources.uniform.destroy(); resources.cube.destroy(); resources.dfg.destroy(); }
 }

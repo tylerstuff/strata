@@ -1,6 +1,7 @@
 import { StrataError } from '../errors.js';
 import type { ImportedEnvironment } from './imported-types.js';
 import { environmentCubeData, environmentDfgData, environmentMetadata } from './imported-environment-data.js';
+import { importedEnvironmentFilter } from './imported-environment-filter.js';
 export { importedEnvironmentTextureBytes as environmentTextureBytes } from './imported-limits.js';
 
 export const environmentUniformBytes = 176;
@@ -60,10 +61,11 @@ export function createEnvironmentResources(device: GPUDevice): {
 
 export const importedEnvironmentShader = /* wgsl */ `
 struct ImportedEnvironmentSettings { parameters: vec4f, modes: vec4f, sh: array<vec4f, 9>, };
-@group(1) @binding(12) var importedEnvironmentCube: texture_cube_array<f32>;
+@group(1) @binding(12) var importedEnvironmentCube: texture_2d_array<f32>;
 @group(1) @binding(13) var importedEnvironmentDfg: texture_2d<f32>;
 @group(1) @binding(14) var importedEnvironmentSampler: sampler;
 @group(1) @binding(15) var<uniform> importedEnvironmentSettings: ImportedEnvironmentSettings;
+${importedEnvironmentFilter}
 fn importedEnvironmentDirection(world: vec3f) -> vec3f {
   let c = importedEnvironmentSettings.parameters.y; let s = importedEnvironmentSettings.parameters.z;
   return vec3f(c * world.x - s * world.z, world.y, s * world.x + c * world.z);
@@ -86,8 +88,7 @@ fn importedEnvironmentLight(base: vec3f, roughness: f32, metallic: f32, normal: 
   let f0 = mix(vec3f(0.04), base, metallic);
   let specularEnergy = clamp(f0 * dfg.x + dfg.y, vec3f(0.0), vec3f(1.0));
   let reflection = importedEnvironmentDirection(reflect(-view, normal));
-  let radiance = textureSampleLevel(importedEnvironmentCube, importedEnvironmentSampler, reflection,
-    i32(importedEnvironmentSettings.parameters.w), roughnessCoordinate * 6.0).rgb;
+  let radiance = importedCubeRadiance(reflection, roughnessCoordinate * 6.0, i32(importedEnvironmentSettings.parameters.w));
   let irradiance = importedEnvironmentIrradiance(importedEnvironmentDirection(normal));
   // Energy-bounded diffuse partition, a declared split-sum approximation. SH contains irradiance, not irradiance/pi.
   // Material AO affects diffuse only; specular has no geometry visibility/occlusion approximation.
