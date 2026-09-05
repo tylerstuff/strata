@@ -10,7 +10,8 @@
     "exactOptionalPropertyTypes": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": false,
+    "paths": { "@strata-engine/core": ["./packages/core/src/index.ts"] },
     "noEmit": true
   },
-  "include": ["packages/core/src/**/*.ts"]
+  "include": ["packages/core/src/**/*.ts", "benchmarks/src/**/*.ts"]
 }

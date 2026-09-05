@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Strata · Benchmark</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0c1119; color: #e6edf7; }
+      body { margin: 0; padding: 20px; }
+      header { display: flex; align-items: center; gap: 16px; margin-bottom: 12px; }
+      h1 { margin: 0; font-size: 22px; margin-right: auto; }
+      select, button { background: #263447; border: 1px solid #506579; color: inherit; padding: 8px 14px; border-radius: 6px; font: inherit; }
+      button { cursor: pointer; } button:disabled { opacity: .45; }
+      canvas { display: block; width: min(100%, 1280px); aspect-ratio: 16 / 9; background: #101927; }
+      output { display: block; padding: 14px 0; color: #a7d9d0; font-size: 14px; }
+      p { color: #97a8bf; font-size: 13px; }
+    </style>
+    <script type="importmap">{"imports":{"@strata-engine/core":"/packages/core/dist/index.js"}}</script>
+  </head>
+  <body>
+    <header>
+      <h1>Strata / Procedural baseline</h1>
+      <select id="resolution" aria-label="Internal render resolution"><option value="1280x720">1280 × 720</option><option value="1920x1080">1920 × 1080</option></select>
+      <button id="start">Run benchmark</button>
+      <button id="download" disabled>Save results</button>
+    </header>
+    <canvas width="1280" height="720" aria-label="Deterministic procedural benchmark scene"></canvas>
+    <output role="status">Ready. The default run warms up for 30 seconds, then measures for 60 seconds.</output>
+    <p>Keep this tab visible. Results describe this scene and hardware; advanced rendering and the final performance target remain under development.</p>
+    <script type="module" src="/benchmarks/browser/app.js"></script>
+  </body>
+</html>

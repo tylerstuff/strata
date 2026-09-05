@@ -1,0 +1,686 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tylerstuff/strata/benchmarks/result.schema.json",
+  "title": "Strata procedural browser benchmark session v1",
+  "description": "RAF callback cadence, CPU submission and optional GPU pass timings are separate. All units are milliseconds or bytes. Additional metadata is permitted. A session includes one or more runs.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "kind",
+    "createdAt",
+    "mode",
+    "host",
+    "source",
+    "browser",
+    "runs"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "kind": {
+      "const": "strata-local-benchmark-session"
+    },
+    "createdAt": {
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "performance",
+        "sustained",
+        "smoke"
+      ]
+    },
+    "host": {
+      "type": "object"
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "commit",
+        "dirty"
+      ],
+      "properties": {
+        "commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "browser": {
+      "type": "object"
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/run"
+      }
+    }
+  },
+  "$defs": {
+    "distribution": {
+      "type": "object",
+      "required": [
+        "count",
+        "min",
+        "mean",
+        "p50",
+        "p95",
+        "p99",
+        "max"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "mean": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "p50": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "p95": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "p99": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "frame": {
+      "type": "object",
+      "required": [
+        "frameId",
+        "elapsedMs",
+        "frameIntervalMs",
+        "cpuSubmissionMs",
+        "drawCalls",
+        "dispatchCalls",
+        "triangles",
+        "uploadBytes",
+        "allocatedGpuBufferBytes",
+        "allocatedGpuTextureBytes",
+        "gpuMs"
+      ],
+      "properties": {
+        "frameId": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "elapsedMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "frameIntervalMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cpuSubmissionMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "drawCalls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dispatchCalls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "triangles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "uploadBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "allocatedGpuBufferBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "allocatedGpuTextureBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gpuMs": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "startedAt",
+        "completedAt",
+        "mode",
+        "workload",
+        "resolution",
+        "capture",
+        "browser",
+        "adapter",
+        "capabilities",
+        "profiling",
+        "coldStart",
+        "assetTraffic",
+        "allocations",
+        "summary",
+        "gpuPasses",
+        "metadata",
+        "limitations",
+        "frames"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "completedAt": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "performance",
+            "sustained",
+            "smoke"
+          ]
+        },
+        "workload": {
+          "type": "object",
+          "required": [
+            "id",
+            "seed",
+            "instanceCount",
+            "cameraPath",
+            "renderPath",
+            "externalAssetsUsed"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "instanceCount": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cameraPath": {
+              "type": "string"
+            },
+            "renderPath": {
+              "type": "string"
+            },
+            "externalAssetsUsed": {
+              "const": false
+            }
+          }
+        },
+        "resolution": {
+          "type": "object",
+          "required": [
+            "width",
+            "height",
+            "devicePixelRatio",
+            "cssWidth",
+            "cssHeight",
+            "screenWidth",
+            "screenHeight"
+          ],
+          "properties": {
+            "width": {
+              "enum": [
+                1280,
+                1920
+              ]
+            },
+            "height": {
+              "enum": [
+                720,
+                1080
+              ]
+            },
+            "devicePixelRatio": {
+              "type": "number",
+              "minimum": 0
+            },
+            "cssWidth": {
+              "type": "number",
+              "minimum": 0
+            },
+            "cssHeight": {
+              "type": "number",
+              "minimum": 0
+            },
+            "screenWidth": {
+              "type": "number",
+              "minimum": 0
+            },
+            "screenHeight": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "capture": {
+          "type": "object",
+          "required": [
+            "warmupSeconds",
+            "requestedDurationSeconds",
+            "actualDurationMs",
+            "frameCount",
+            "visibilityChanges"
+          ],
+          "properties": {
+            "warmupSeconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "requestedDurationSeconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "actualDurationMs": {
+              "type": "number",
+              "minimum": 0
+            },
+            "frameCount": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "visibilityChanges": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "atMs",
+                  "state"
+                ],
+                "properties": {
+                  "atMs": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "state": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "browser": {
+          "type": "object",
+          "required": [
+            "userAgent",
+            "hardwareConcurrency",
+            "crossOriginIsolated",
+            "secureContext"
+          ],
+          "properties": {
+            "userAgent": {
+              "type": "string"
+            },
+            "hardwareConcurrency": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "crossOriginIsolated": {
+              "type": "boolean"
+            },
+            "secureContext": {
+              "type": "boolean"
+            }
+          }
+        },
+        "adapter": {
+          "type": "object",
+          "required": [
+            "vendor",
+            "architecture",
+            "device",
+            "description",
+            "isFallbackAdapter"
+          ],
+          "properties": {
+            "vendor": {
+              "type": "string"
+            },
+            "architecture": {
+              "type": "string"
+            },
+            "device": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "isFallbackAdapter": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        },
+        "capabilities": {
+          "type": "object",
+          "required": [
+            "adapterFeatures",
+            "adapterLimits",
+            "deviceLimits"
+          ],
+          "properties": {
+            "adapterFeatures": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "adapterLimits": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "deviceLimits": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "profiling": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "gpuTimestampAvailable",
+            "reason",
+            "timestampPrecision",
+            "capturedGpuSamples",
+            "droppedGpuSamples",
+            "pendingGpuSamples"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "gpuTimestampAvailable": {
+              "type": "boolean"
+            },
+            "reason": {
+              "enum": [
+                "disabled",
+                "available",
+                "timestamp-query-unavailable",
+                "timestamp-query-device-request-failed"
+              ]
+            },
+            "timestampPrecision": {
+              "const": "browser-dependent"
+            },
+            "capturedGpuSamples": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "droppedGpuSamples": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "pendingGpuSamples": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "coldStart": {
+          "type": "object",
+          "required": [
+            "initializeMs",
+            "sceneSetupMs",
+            "uploadBytes"
+          ],
+          "properties": {
+            "initializeMs": {
+              "type": "number",
+              "minimum": 0
+            },
+            "sceneSetupMs": {
+              "type": "number",
+              "minimum": 0
+            },
+            "uploadBytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "assetTraffic": {
+          "type": "object",
+          "required": [
+            "externalAssetsUsed",
+            "steadyUploadBytes",
+            "documentResourceTransferBytes",
+            "documentResourceDecodedBytes",
+            "note"
+          ],
+          "properties": {
+            "externalAssetsUsed": {
+              "const": false
+            },
+            "steadyUploadBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "documentResourceTransferBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "documentResourceDecodedBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "allocations": {
+          "type": "object",
+          "required": [
+            "submittedFrames",
+            "totalUploadBytes",
+            "allocatedGpuBufferBytes",
+            "allocatedGpuTextureBytes",
+            "wasmMemoryBytes",
+            "pendingGpuSamples",
+            "droppedGpuSamples",
+            "note"
+          ],
+          "properties": {
+            "submittedFrames": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "totalUploadBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "allocatedGpuBufferBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "allocatedGpuTextureBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "wasmMemoryBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "pendingGpuSamples": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "droppedGpuSamples": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "required": [
+            "frameIntervalMs",
+            "cpuSubmissionMs",
+            "gpuPassMs",
+            "meanCallbackCadenceFps",
+            "framesAbove20Ms",
+            "targetFrameIntervalMs",
+            "drawCalls",
+            "dispatchCalls",
+            "uploadBytes",
+            "maxTrackedGpuBufferBytes",
+            "maxTrackedGpuTextureBytes"
+          ],
+          "properties": {
+            "frameIntervalMs": {
+              "$ref": "#/$defs/distribution"
+            },
+            "cpuSubmissionMs": {
+              "$ref": "#/$defs/distribution"
+            },
+            "gpuPassMs": {
+              "$ref": "#/$defs/distribution"
+            },
+            "meanCallbackCadenceFps": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "framesAbove20Ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "targetFrameIntervalMs": {
+              "type": "number",
+              "minimum": 0
+            },
+            "drawCalls": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "dispatchCalls": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "uploadBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxTrackedGpuBufferBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxTrackedGpuTextureBytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "gpuPasses": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "sampleCount",
+              "totalMs"
+            ],
+            "properties": {
+              "sampleCount": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "totalMs": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "frames": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/frame"
+          }
+        }
+      }
+    }
+  }
+}

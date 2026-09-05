@@ -1,6 +1,6 @@
 # Runtime foundation
 
-The initial package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, one clear render pass, physical-pixel resizing, and disposal. It does not yet implement scenes, game systems, geometry rendering, lighting, or an editor. No performance target has been validated.
+The package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, clear or procedural diffuse scene rendering, CPU/GPU telemetry, physical-pixel resizing, and disposal. PBR, indirect lighting, game systems and the editor remain planned. The final graphics performance target is unverified.
 
 ## Build and run
 
@@ -45,7 +45,7 @@ engine.dispose();
 
 The application owns the canvas element, its CSS layout, and its animation/resize callbacks. Strata exclusively owns the canvas's WebGPU configuration while an engine is active, creates and owns its GPU device, and owns one CPU worker with unshared WASM memory. A second concurrent engine cannot claim the same canvas. Do not reconfigure that canvas or change its backing dimensions behind the engine.
 
-`resize(width, height)` takes positive integer physical pixels, subject to the requested device's maximum texture dimension. The application chooses resolution and pixel ratio. `render()` submits one clear pass; it creates no animation loop or persistent scene resources. `dispose()` is synchronous and idempotent: it unconfigures the canvas, destroys the device, terminates the worker, and releases the canvas claim. The application may initialize a new engine on the same canvas afterward.
+`resize(width, height)` takes positive integer physical pixels, subject to the requested device's maximum texture dimension. The application chooses resolution and pixel ratio. `render()` submits a clear pass when no scene is selected. `await engine.setScene({seed: 1337, instanceCount: 512})` installs the procedural diffuse baseline; `render({timeSeconds})` then renders its deterministic camera path. `setScene(null)` releases scene resources and returns to clear rendering. Scene replacement is atomic and superseded asynchronous requests fail explicitly. The application owns the animation loop. `dispose()` is synchronous and idempotent: it unconfigures the canvas, destroys the device, terminates the worker, and releases the canvas claim. The application may initialize a new engine on the same canvas afterward.
 
 Initialization failures release partially created resources. A device request that resolves after cancellation is destroyed when it arrives. Aborting the initialization signal after successful creation does not dispose a running engine; call `dispose()` explicitly.
 
@@ -76,8 +76,14 @@ npm run check
 
 The checks cover type declarations, Rust formatting/Clippy/tests, actual WASM loading, browser/worker lifecycle and failure cleanup, and installation of a packed archive into isolated plain HTML and Vite consumers. Consumer tests verify ordinary hosting without cross-origin isolation, worker termination, real WebGPU clear-frame pixels, and SSR import without touching browser globals.
 
-`npm run test:consumers` expects an existing build. It saves screenshots and browser/adapter details in `test-results/consumers/`. Linux CI explicitly uses a software WebGPU adapter with `STRATA_TEST_SOFTWARE_GPU=1` and headed Chromium on an Xvfb virtual display for canvas presentation; that validates functionality, not hardware performance. Real performance measurement belongs to GitHub issue #2.
+`npm run test:consumers` expects an existing build. It saves screenshots and browser/adapter details in `test-results/consumers/`. Linux CI explicitly uses a software WebGPU adapter with `STRATA_TEST_SOFTWARE_GPU=1` and headed Chromium on an Xvfb virtual display for canvas presentation; that validates functionality, not hardware performance. The benchmark smoke test validates real geometry pixels and JSON contracts; its screenshots/reports stay outside the repository and CI artifacts. Read [the benchmark protocol](benchmark.md) for hardware performance runs.
 
 If downloading the Playwright browser is unavailable, select installed Chrome with `STRATA_TEST_BROWSER_CHANNEL=chrome npm run check`. This uses a separate temporary browser profile.
 
 Platform references: [WebGPU adapter creation](https://developer.mozilla.org/en-US/docs/Web/API/GPU/requestAdapter), [device loss](https://developer.mozilla.org/en-US/docs/Web/API/GPUDevice/lost), [Vite asset handling](https://vite.dev/guide/assets), and [Rust's browser WASM target](https://doc.rust-lang.org/rustc/platform-support/wasm32-unknown-unknown.html).
+
+## Profiling
+
+Pass `profiling: true` to request optional timestamp queries. An unsupported optional feature falls back to CPU/counter telemetry with an explicit reason in `engine.info.profiling`; explicitly required features never silently fall back. `render` returns per-frame CPU submission time, draw/dispatch/triangle counts, upload bytes and requested GPU buffer/texture bytes. `getTelemetry()` reports cumulative counters, WASM memory, GPU readback drops and uncaptured GPU errors. Uncaptured errors prevent further rendering; dispose and recreate the engine.
+
+`drainGpuTimings()` returns completed `{frameId, pass, gpuMs}` values without waiting. Call it regularly to avoid overflowing the bounded result queue. `flushGpuTimings(timeoutMs?)` waits for pending samples only at capture boundaries, with a 5-second default deadline. GPU measurements can be quantized to zero. Missing samples must remain unavailable. Profiling overhead is part of the selected configuration; tracked buffers/textures are not total VRAM. Adapter features, adapter/device limits and available browser adapter strings are preserved in `engine.info`.

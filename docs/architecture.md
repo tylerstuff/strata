@@ -1,6 +1,6 @@
 # Strata architecture
 
-Status: accepted direction. The lifecycle and package foundation is implemented; rendering systems and performance remain to be demonstrated. See [the runtime guide](runtime.md) for the current implementation boundary.
+Status: accepted direction. The lifecycle, package and procedural benchmark foundation is implemented; advanced rendering systems and their performance remain to be demonstrated. See [the runtime guide](runtime.md) for the current implementation boundary.
 
 ## Product boundary
 
@@ -8,7 +8,7 @@ Strata is a standalone browser game engine built from scratch for WebGPU. It is 
 
 The deployment target is the browser. There are no planned native graphics backends or WebGL fallback. WebGPU availability and required device limits must be checked at startup, with a clear unsupported-device result. Hosting should work without mandatory cross-origin isolation or special shared-memory headers.
 
-The name `@strata-engine/core` is a proposed package name. It has not been reserved or published. Public API examples describe future design, not an implemented or installable API.
+The name `@strata-engine/core` is a proposed package name. It has not been reserved or published. The runtime guide describes the current API; the broader systems described here remain design direction.
 
 ## Runtime responsibilities
 

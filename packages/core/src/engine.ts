@@ -1,10 +1,26 @@
 import { StrataError } from './errors.js';
 import { initializeCpuRuntime } from './internal/cpu-runtime.js';
-import type { CreateEngineOptions, Engine, EngineInfo, EngineState } from './types.js';
+import { GpuProfiler } from './profiling/gpu-profiler.js';
+import type { SceneRenderer } from './rendering/scene-renderer.js';
+import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics } from './types.js';
 
 // Module evaluation is intentionally safe without navigator, document or Worker.
 const ownedCanvases = new WeakSet<HTMLCanvasElement>();
 const defaultTimeoutMs = 30_000;
+
+function snapshotLimits(limits: GPUSupportedLimits): Readonly<Record<string, number>> {
+  const result: Record<string, number> = {};
+  // WebIDL values normally live on prototype getters, unlike the test adapters.
+  let current: object | null = limits;
+  while (current && current !== Object.prototype) {
+    for (const key of Object.getOwnPropertyNames(current)) {
+      const value = (limits as unknown as Record<string, unknown>)[key];
+      if (typeof value === 'number') result[key] = value;
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return Object.freeze(result);
+}
 
 function validateSize(width: number, height: number, maximum: number): void {
   if (!Number.isInteger(width) || !Number.isInteger(height)
@@ -45,6 +61,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   if (!options || typeof options !== 'object') {
     throw new StrataError('INVALID_OPTIONS', 'createEngine requires a canvas and an options object.');
   }
+  if (options.profiling !== undefined && typeof options.profiling !== 'boolean') {
+    throw new StrataError('INVALID_OPTIONS', 'profiling must be a boolean.');
+  }
   const timeoutMs = options.initializationTimeoutMs ?? defaultTimeoutMs;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
     throw new StrataError('INVALID_OPTIONS', 'initializationTimeoutMs must be positive and at most 2147483647.');
@@ -72,6 +91,13 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   let context: GPUCanvasContext | undefined;
   let contextConfigured = false;
   let cpu: Awaited<ReturnType<typeof initializeCpuRuntime>> | undefined;
+  let scene: SceneRenderer | undefined;
+  let sceneGeneration = 0;
+  let profiler: GpuProfiler | undefined;
+  let submittedFrames = 0;
+  let totalUploadBytes = 0;
+  let gpuErrorCount = 0;
+  let lastGpuError: string | null = null;
   let ownsCanvas = true;
   let initialized = false;
   let state: EngineState = 'ready';
@@ -83,10 +109,16 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
   void cancelled.catch(() => undefined);
 
   function cleanup(): void {
+    sceneGeneration++;
+    const ownedScene = scene;
+    scene = undefined;
     const ownedCpu = cpu;
     cpu = undefined;
     const ownedDevice = device;
     device = undefined;
+    try { ownedDevice?.removeEventListener('uncapturederror', handleGpuError); } catch { /* Continue cleanup. */ }
+    try { ownedScene?.dispose(); } catch { /* Continue releasing profiler/device resources. */ }
+    try { profiler?.dispose(); } catch { /* Continue releasing the canvas and worker. */ }
     if (contextConfigured) {
       contextConfigured = false;
       try { context?.unconfigure(); } catch { /* Continue releasing other resources. */ }
@@ -139,6 +171,15 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     cleanup();
   }
 
+  function handleGpuError(event: GPUUncapturedErrorEvent): void {
+    if (!ownsCanvas || state === 'disposed' || state === 'lost') return;
+    gpuErrorCount++;
+    lastGpuError = String(event.error?.message ?? 'Uncaptured GPU error').slice(0, 2048);
+    if (!initialized) {
+      cancel(new StrataError('GPU_VALIDATION_FAILED', 'WebGPU reported an error during initialization.', { cause: lastGpuError }));
+    }
+  }
+
   try {
     try {
       context = (canvas.getContext('webgpu') as GPUCanvasContext | null) ?? undefined;
@@ -163,17 +204,28 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       throw new StrataError('ADAPTER_UNAVAILABLE', 'No suitable WebGPU adapter is available.');
     }
     validateRequirements(adapter, options);
+    const requiredFeatures = [...new Set(options.requiredFeatures ?? [])];
+    const optionalTimestamp = options.profiling === true
+      && adapter.features.has('timestamp-query') && !requiredFeatures.includes('timestamp-query');
+    let timestampRequestFailed = false;
     try {
-      device = await phase(adapter.requestDevice({
-        label: 'Strata device',
-        requiredFeatures: [...(options.requiredFeatures ?? [])],
-        requiredLimits: { ...options.requiredLimits },
+      const request = (features: GPUFeatureName[]): Promise<GPUDevice> => phase(adapter.requestDevice({
+        label: 'Strata device', requiredFeatures: features, requiredLimits: { ...options.requiredLimits },
       }), (lateDevice) => lateDevice.destroy());
+      try {
+        device = await request(optionalTimestamp ? [...requiredFeatures, 'timestamp-query'] : requiredFeatures);
+      } catch (cause) {
+        if (cancellation || !optionalTimestamp) throw cause;
+        // Profiling is optional; an explicitly required timestamp feature never falls back.
+        timestampRequestFailed = true;
+        device = await request(requiredFeatures);
+      }
     } catch (cause) {
       if (cancellation) throw cancellation;
       throw new StrataError('DEVICE_REQUEST_FAILED', 'The WebGPU device could not be created.', { cause });
     }
     if (cancellation) throw cancellation;
+    device.addEventListener('uncapturederror', handleGpuError);
     void device.lost.then(handleDeviceLoss, handleDeviceLoss);
     validateSize(canvas.width, canvas.height, device.limits.maxTextureDimension2D);
 
@@ -192,10 +244,31 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     } catch (cause) {
       throw new StrataError('CANVAS_UNAVAILABLE', 'The WebGPU canvas could not be configured.', { cause });
     }
+    const profilingEnabled = options.profiling === true;
+    const gpuTimestampAvailable = profilingEnabled && device.features.has('timestamp-query') && !timestampRequestFailed;
+    if (gpuTimestampAvailable) profiler = new GpuProfiler(device);
+    const adapterInfo = adapter.info;
     const info: EngineInfo = Object.freeze({
       format,
       features: Object.freeze([...device.features]),
       maxTextureDimension2D: device.limits.maxTextureDimension2D,
+      adapter: Object.freeze({
+        vendor: adapterInfo?.vendor ?? '',
+        architecture: adapterInfo?.architecture ?? '',
+        device: adapterInfo?.device ?? '',
+        description: adapterInfo?.description ?? '',
+        isFallbackAdapter: adapterInfo?.isFallbackAdapter ?? null,
+      }),
+      adapterFeatures: Object.freeze([...adapter.features]),
+      adapterLimits: snapshotLimits(adapter.limits),
+      deviceLimits: snapshotLimits(device.limits),
+      profiling: Object.freeze({
+        enabled: profilingEnabled,
+        gpuTimestampAvailable,
+        reason: !profilingEnabled ? 'disabled' : timestampRequestFailed ? 'timestamp-query-device-request-failed'
+          : gpuTimestampAvailable ? 'available' : 'timestamp-query-unavailable',
+        timestampPrecision: 'browser-dependent',
+      }),
       cpu: Object.freeze({ abiVersion: cpu.info.abiVersion, memoryBytes: cpu.info.memoryBytes }),
     });
 
@@ -206,6 +279,21 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       if (state === 'lost') {
         throw new StrataError('DEVICE_LOST', 'The WebGPU device was lost. Create a new engine to recover.', { cause: loss });
       }
+      if (gpuErrorCount) {
+        throw new StrataError('GPU_VALIDATION_FAILED', 'WebGPU reported an uncaptured error. Dispose this engine before retrying.', { cause: lastGpuError });
+      }
+    }
+
+    function telemetry(): EngineTelemetry {
+      return {
+        submittedFrames, totalUploadBytes,
+        allocatedGpuBufferBytes: device ? (scene?.gpuBufferBytes ?? 0) + (profiler?.allocatedBufferBytes ?? 0) : 0,
+        allocatedGpuTextureBytes: scene?.gpuTextureBytes ?? 0,
+        wasmMemoryBytes: cpu?.info.memoryBytes ?? 0,
+        pendingGpuSamples: profiler?.pendingSamples ?? 0,
+        droppedGpuSamples: profiler?.droppedSamples ?? 0,
+        gpuErrorCount, lastGpuError,
+      };
     }
 
     const engine: Engine = {
@@ -217,24 +305,101 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         if (canvas.width !== width) canvas.width = width;
         if (canvas.height !== height) canvas.height = height;
       },
-      render() {
+      async setScene(sceneOptions) {
         assertReady();
+        const generation = ++sceneGeneration;
+        if (sceneOptions === null) {
+          scene?.dispose();
+          scene = undefined;
+          return;
+        }
+        const ownedDevice = device!;
+        let next: SceneRenderer;
+        try {
+          const { SceneRenderer } = await import('./rendering/scene-renderer.js');
+          assertReady();
+          if (generation !== sceneGeneration) {
+            throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
+          }
+          next = await SceneRenderer.create(ownedDevice, format, sceneOptions);
+        } catch (cause) {
+          assertReady();
+          if (cause instanceof StrataError) throw cause;
+          throw new StrataError('SCENE_LOAD_FAILED', 'The scene could not be initialized.', { cause });
+        }
+        totalUploadBytes += next.initialUploadBytes;
+        if (generation !== sceneGeneration || state !== 'ready' || gpuErrorCount) {
+          next.dispose();
+          assertReady();
+          throw new StrataError('SCENE_LOAD_SUPERSEDED', 'A newer scene request superseded this request.');
+        }
+        const previous = scene;
+        scene = next;
+        previous?.dispose();
+      },
+      render(renderOptions) {
+        assertReady();
+        const timeSeconds = renderOptions?.timeSeconds ?? 0;
+        if (!Number.isFinite(timeSeconds)) {
+          throw new StrataError('INVALID_OPTIONS', 'timeSeconds must be finite.');
+        }
+        const started = performance.now();
+        const frameId = submittedFrames + 1;
+        const timing = profiler?.begin(frameId, scene ? 'procedural' : 'clear');
         try {
           const encoder = device!.createCommandEncoder({ label: 'Strata frame' });
-          const pass = encoder.beginRenderPass({
-            label: 'Strata clear',
-            colorAttachments: [{
-              view: context!.getCurrentTexture().createView(),
-              clearValue: { r: 0.04, g: 0.06, b: 0.09, a: 1 },
-              loadOp: 'clear',
-              storeOp: 'store',
-            }],
-          });
-          pass.end();
+          const view = context!.getCurrentTexture().createView();
+          let drawCalls = 0;
+          let dispatchCalls = 0;
+          let triangles = 0;
+          let uploadBytes = 0;
+          if (scene) {
+            ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.encode(
+              encoder, view, canvas.width, canvas.height, timeSeconds, timing?.timestampWrites,
+            ));
+          } else {
+            const pass = encoder.beginRenderPass({
+              label: 'Strata clear',
+              ...(timing ? { timestampWrites: timing.timestampWrites } : {}),
+              colorAttachments: [{
+                view,
+                clearValue: { r: 0.04, g: 0.06, b: 0.09, a: 1 },
+                loadOp: 'clear',
+                storeOp: 'store',
+              }],
+            });
+            pass.end();
+          }
+          totalUploadBytes += uploadBytes;
+          if (timing) profiler!.resolve(encoder, timing);
           device!.queue.submit([encoder.finish()]);
+          submittedFrames++;
+          if (timing) profiler!.submitted(timing);
+          const stats = telemetry();
+          const metrics: FrameMetrics = {
+            frameId, cpuSubmissionMs: performance.now() - started,
+            drawCalls, dispatchCalls, triangles, uploadBytes,
+            allocatedGpuBufferBytes: stats.allocatedGpuBufferBytes,
+            allocatedGpuTextureBytes: stats.allocatedGpuTextureBytes,
+            wasmMemoryBytes: stats.wasmMemoryBytes,
+          };
+          return metrics;
         } catch (cause) {
+          if (timing) profiler!.cancel(timing);
           throw new StrataError('RENDER_FAILED', 'WebGPU frame submission failed.', { cause });
         }
+      },
+      getTelemetry: telemetry,
+      drainGpuTimings() { return profiler?.drain() ?? []; },
+      async flushGpuTimings(timeoutMs) {
+        assertReady();
+        try {
+          await profiler?.flush(timeoutMs);
+        } catch (cause) {
+          assertReady();
+          throw cause;
+        }
+        assertReady();
       },
       dispose() {
         if (state === 'disposed') return;

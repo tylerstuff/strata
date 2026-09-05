@@ -29,6 +29,8 @@ function gpuFixture() {
     limits: { maxTextureDimension2D: 4096 },
     lost: loss.promise,
     destroy: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
     queue: { submit: vi.fn() },
     createCommandEncoder: vi.fn(() => encoder),
   };
@@ -86,7 +88,7 @@ describe('engine lifecycle', () => {
   it('initializes the GPU and CPU, submits only requested frames, and releases resources once', async () => {
     const engine = await ready();
     expect(engine.state).toBe('ready');
-    expect(engine.info).toEqual({
+    expect(engine.info).toMatchObject({
       format: 'bgra8unorm', features: ['timestamp-query'], maxTextureDimension2D: 4096,
       cpu: { abiVersion: 1, memoryBytes: 65536 },
     });

@@ -28,12 +28,18 @@ jobs:
       - run: npm run typecheck
       - run: npm run test:rust
       - run: npm run test:unit
+      - run: npm run test:benchmark-server
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - name: Install the virtual display and software Vulkan runtime
         run: sudo apt-get update && sudo apt-get install -y xvfb xauth libvulkan1 mesa-vulkan-drivers
       - name: Test packed HTML and Vite consumers
         run: xvfb-run -a -s '-screen 0 1280x720x24' npm run test:consumers
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate the procedural benchmark on software WebGPU
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
