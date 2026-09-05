@@ -62,6 +62,14 @@ passed both hardware and software adapters. The static-house preparation and
 generated fixtures do not establish correct rendered house transport; a fixed
 interior witness remains a separate acceptance check before gallery promotion.
 
+The first actual-house interior capture on 2026-09-05 did not pass visual
+acceptance: sky-only and directional-only views remained almost black at 64
+samples per pixel despite zero invalid/exhausted paths or GPU errors. A separately
+recorded asset-request event failure also leaves that run's report failed. The
+original report and captures are retained externally; source/material, visibility
+and sampling diagnostics are in progress in issue #15. Completed sample counters
+and passing generated fixtures do not clear this gallery promotion hold.
+
 `ImportedIndirectEffect` implements the existing `RasterGiProvider`. Root integration owns CPU preparation, material handles, controls and activation. It must disable raster TAA to provide an unjittered camera, zero ordinary ambient fill and exclude diffuse SH IBL while this effect is active. Interior correctness comparisons also keep specular IBL off. Both the GI-on and matched GI-off references need the same direct baseline. These exclusions prevent double counting or unoccluded fill from appearing through walls.
 
 `prepare()` and `compose()` encode work; the owner must call `submitted()` only after successful queue submission, or `cancelFrame()` on failure. Camera, resolution, lighting, environment and option changes reset accumulation. Enabling after a pause also resets it. A failed frame forces a reset before reuse. Composing adds only accumulated indirect radiance to the current direct HDR, preserving direct-light and texture detail.

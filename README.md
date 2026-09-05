@@ -22,7 +22,7 @@ Run `npm run benchmark` for the hardware browser baseline or read [the benchmark
 
 For the procedural lighting experiment, run `npm run benchmark -- --renderer gi` or see [the GI guide](docs/gi.md) for offscreen color transfer, door/light controls, quality budgets and limitations. For the selected mirror, use `npm run benchmark -- --renderer reflections`; the [reflection guide](docs/reflections.md) describes its controls and limits. The [integrated courtyard](docs/integrated.md) combines these paths in one image and documents its explicit raster, tracing and collision limits.
 
-For local imported models and animation, configure `STRATA_BENCHMARK_ASSET_DIR` and run `npm run gallery`. The [gallery guide](docs/gallery.md) covers lighting, playback and scripted captures. Models and derived files remain outside Git; the gallery is an inspection tool, with explicit import limits and no imported GI or reflections.
+For local imported models and animation, configure `STRATA_BENCHMARK_ASSET_DIR` and run `npm run gallery`. The [gallery guide](docs/gallery.md) covers lighting, playback and scripted captures. Models and derived files remain outside Git. An experimental static progressive diffuse preview has a narrow source contract and has not passed actual-house visual acceptance; general imported GI and reflections remain unimplemented.
 
 ## Product requirements
 
