@@ -1,6 +1,7 @@
 import { ImportedRenderer } from '../../packages/core/src/imported/imported-renderer.js';
 import { loadGltf } from '../../packages/core/src/imported/gltf-loader.js';
 import { validateImportedEnvironment } from './imported-environment-validation.js';
+import { validateImportedTransforms } from './imported-transform-validation.js';
 import type { ImportedAsset, ImportedControls, ImportedImage, ImportedMaterial, ImportedPrimitive, ImportedVec3 } from '../../packages/core/src/imported/imported-types.js';
 import type { RasterOutputs } from '../../packages/core/src/rendering/raster-types.js';
 
@@ -111,6 +112,7 @@ export async function validateImportedRendering() {
     } finally { renderer.dispose(); }
   }
   try {
+    cases.push({ name: 'normal-tangent-transform-numeric', ...await validateImportedTransforms(device) });
     const base = await image('base', 2, 2); const normal = await image('normal', 2, 2); const mask = await image('mask', 4, 4); const large = await image('large', 8, 4);
     const texture = (image: number) => ({ image, sampler });
     const color = [0.8, 0.5, 1, 0.95];
@@ -210,6 +212,48 @@ export async function validateImportedRendering() {
       cases.push({ name: mirrored ? 'gltf-negative-determinant' : 'gltf-affine-normal', ...result });
     }
 
+    // Exercise the real rigid and skin entry points, not only the compute probe.
+    // Large local coordinates keep the projected quad visible while the palette
+    // retains a 1e-5 scale, where the former cofactor cutoff lost its rotation.
+    const smallScale = Math.fround(1e-5), smallRotation = Math.fround(smallScale / Math.SQRT2);
+    const smallMatrix = new Float32Array([
+      smallRotation, 0, -smallRotation, 0, 0, smallScale, 0, 0,
+      smallRotation, 0, smallRotation, 0, 0, 1, 0, 1,
+    ]);
+    for (const mode of ['rigid', 'skin'] as const) {
+      const localQuad = quad(0, 0, 100_000, -100_000, 100_000);
+      const worldVertices = localQuad.vertices.slice();
+      for (let offset = 0; offset < worldVertices.length; offset += 16) {
+        const x = localQuad.vertices[offset]!, y = localQuad.vertices[offset + 1]!, z = localQuad.vertices[offset + 2]!;
+        // Independent transformed positions; the normal oracle below uses
+        // triangle edges, never the production cofactor or pose evaluator.
+        worldVertices.set([smallRotation * (x + z), 1 + smallScale * y, smallRotation * (z - x)], offset);
+      }
+      const point = (vertex: number): Vec3 => [worldVertices[vertex * 16]!, worldVertices[vertex * 16 + 1]!, worldVertices[vertex * 16 + 2]!];
+      const edge = sub(point(1), point(0));
+      const expectedNormal = unit(cross(edge, sub(point(2), point(0))));
+      const expectedTangent = unit(edge);
+      for (let offset = 0; offset < worldVertices.length; offset += 16) {
+        worldVertices.set(expectedNormal, offset + 3); worldVertices.set([...expectedTangent, 1], offset + 8);
+      }
+      const oneHotJoints = new Uint32Array(16), oneHotWeights = new Float32Array(16);
+      for (let vertex = 0; vertex < 4; vertex++) oneHotWeights[vertex * 4] = 1;
+      const primitive: ImportedPrimitive = { ...localQuad, name: `Generated small ${mode} transform`, vertices: worldVertices,
+        deformation: { node: 0, vertices: localQuad.vertices,
+          ...(mode === 'skin' ? { skin: 0, joints: oneHotJoints, weights: oneHotWeights } : {}) } };
+      const base = asset([primitive], [material()]);
+      const input: ImportedAsset = { ...base, rig: {
+        nodes: [{ parent: null, translation: [0, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1], matrix: smallMatrix }],
+        skins: mode === 'skin' ? [{ joints: [0], inverseBindMatrices: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) }] : [],
+      }, stats: { ...base.stats, skinnedMeshInstances: Number(mode === 'skin') } };
+      const interiorPixel = pixel([0, 1, 0]);
+      const result = await render(input, controls, [interiorPixel]);
+      require(result.samples[0]!.depth < 1, `Small ${mode} transform must cover the known interior pixel.`);
+      near(result.samples[0]!.normal.slice(0, 3), expectedNormal, 0.002, `Small ${mode} vertex path must preserve the rotated geometric normal`);
+      cases.push({ name: `small-${mode}-transform-gbuffer-normal`, matrix: [...smallMatrix], localHalfExtent: 100_000,
+        interiorPixel, expectedNormal, ...result });
+    }
+
     // Palette index162 is deliberately used: a64-joint uniform palette cannot
     // accidentally pass. Joints and mesh are on separate hierarchy branches.
     const local = quad(1, 0, 0.5, 0.5, 1.5);
@@ -272,7 +316,7 @@ export async function validateImportedRendering() {
     await device.queue.onSubmittedWorkDone(); require(errors.length === 0, `Imported GPU errors: ${errors.join('; ')}`);
     return { status: 'passed', size, cases, gpuErrors: errors, adapter: { vendor: adapter!.info.vendor, architecture: adapter!.info.architecture,
       device: adapter!.info.device, description: adapter!.info.description, isFallbackAdapter: adapter!.info.isFallbackAdapter ?? null },
-      scope: 'Generated material/affine and one-hot163-joint fixtures; raw linear MRT/depth checks, not general animation or visual/performance acceptance.' };
+      scope: 'Generated material/affine and one-hot163-joint fixtures, plus production WGSL normal/tangent numerical transforms; raw linear MRT/depth checks, not general animation or visual/performance acceptance.' };
   } finally { target.destroy(); destroying = true; device.removeEventListener('uncapturederror', onError); device.destroy(); }
 }
 

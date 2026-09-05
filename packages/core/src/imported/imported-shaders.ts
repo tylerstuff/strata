@@ -1,8 +1,10 @@
 import { importedEnvironmentShader } from './imported-environment.js';
+import { importedTransformShader } from './imported-transform.js';
 
 /** Appended to the production raster shader; frame, shadow and GGX code are shared. */
 export const importedShader = /* wgsl */ `
 ${importedEnvironmentShader}
+${importedTransformShader}
 struct ImportedMaterial {
   base: vec4f,
   emissive: vec4f,
@@ -84,16 +86,9 @@ fn importedPreviousSkinMatrix(skin: ImportedSkinInput) -> mat4x4f {
 }
 fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous: mat4x4f) -> ImportedVertexOutput {
   let a = mat3x3f(current[0].xyz, current[1].xyz, current[2].xyz);
-  let cofactors = mat3x3f(cross(a[1], a[2]), cross(a[2], a[0]), cross(a[0], a[1]));
-  let determinant = dot(a[0], cofactors[0]);
-  // Exact inverse transpose up to normalization, including determinant sign.
-  // A collapsing animated transform has no unique normal; retain a finite local fallback.
-  let transformed = cofactors * input.normal * select(-1.0, 1.0, determinant >= 0.0);
-  let normal = normalize(select(input.normal, transformed, dot(transformed, transformed) > 1e-16));
-  let tangentRaw = a * input.tangent.xyz;
-  let tangent = normalize(select(input.tangent.xyz, tangentRaw, dot(tangentRaw, tangentRaw) > 1e-16));
+  let basis = importedTransformFrame(a, input.normal, input.tangent);
   return importedVertex(input, (current * vec4f(input.position, 1.0)).xyz, (previous * vec4f(input.position, 1.0)).xyz,
-    normal, vec4f(tangent, input.tangent.w * select(-1.0, 1.0, determinant >= 0.0)));
+    basis.normal, basis.tangent);
 }
 @vertex fn importedRigidVertexMain(input: ImportedVertexInput) -> ImportedVertexOutput {
   return importedDeformedVertex(input, importedCurrentTransforms[importedDeformation.node], importedPreviousTransforms[importedDeformation.node]);
@@ -123,8 +118,9 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let unlit = importedMaterial.alpha.w > 0.5 && !relit;
   let roughness = select(clamp(mr.g * importedMaterial.factors.y, 0.06, 1.0), 0.65, relit);
   let metallic = select(clamp(mr.b * importedMaterial.factors.x, 0.0, 1.0), 0.0, relit);
-  let n = normalize(input.normal);
-  let t = normalize(input.tangent.xyz - n * dot(n, input.tangent.xyz));
+  let basis = importedSurfaceFrame(input.normal, input.tangent);
+  let n = basis.normal;
+  let t = basis.tangent.xyz;
   let b = cross(n, t) * input.tangent.w;
   let mapped = normalize(vec3f(normalSample.xy * importedMaterial.factors.z, normalSample.z));
   // glTF flips the shaded normal on a double-sided backface, including normal mapping.

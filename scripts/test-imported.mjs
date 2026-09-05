@@ -49,21 +49,25 @@ function gltf(name, xScale) {
 }
 gltf('affine', 2); gltf('mirrored', -2);
 const modules = {};
+const harnessModules = {};
 const bundle = await build({ absWorkingDir: root, entryPoints: ['tests/browser/imported-validation.ts'], bundle: true, write: false,
   format: 'esm', platform: 'browser', target: 'es2022', plugins: [{ name: 'record-imported-runtime', setup(builder) {
-    builder.onLoad({ filter: /packages\/core\/src\/.*\.ts$/ }, async ({ path }) => {
-      const contents = await readFile(path); modules[relative(root, path)] = hash(contents); return { contents, loader: 'ts' };
+    builder.onLoad({ filter: /(?:packages\/core\/src|tests\/browser)\/.*\.ts$/ }, async ({ path }) => {
+      const contents = await readFile(path); const name = relative(root, path);
+      (name.startsWith('tests/browser/') ? harnessModules : modules)[name] = hash(contents);
+      return { contents, loader: 'ts' };
     });
   } }] });
 const output = join(homedir(), 'Downloads/Strata-Benchmark-Results', `${new Date().toISOString().replaceAll(':', '-')}-imported-validation`);
 await mkdir(output, { recursive: true });
 const report = { kind: 'strata-imported-generated-functional', status: 'running', performanceEvidence: false,
-  source: source(), modules, harnessSha256: hash(await readFile(join(root, 'tests/browser/imported-validation.ts'))),
+  source: source(), modules, harnessModules, harnessSha256: hash(await readFile(join(root, 'tests/browser/imported-validation.ts'))),
   runnerSha256: hash(await readFile(fileURLToPath(import.meta.url))), bundleSha256: hash(bundle.outputFiles[0].contents),
   fixtures: [...fixtures].map(([name, bytes]) => ({ name, bytes: bytes.length, sha256: hash(bytes) })),
   softwareGpu: process.env.STRATA_TEST_SOFTWARE_GPU === '1', browserErrors: [], cleanupErrors: [],
   limitations: ['Generated fixtures only. No downloaded model, external asset or derived data is copied into the repository.',
-    'Functional MRT/depth and lifecycle proof; no frame-performance claim. Animation covers one-hot joint162 and deterministic scale/translation only.'] };
+    'Functional MRT/depth, lifecycle and production WGSL normal/tangent numeric checks; no frame-performance claim.',
+    'Numeric affine/scale/handedness and collapsed-frame probes do not establish general animation coverage. Rendered animation covers one-hot joint162 and deterministic scale/translation only.'] };
 let browser; let server; let timer;
 try {
   server = await createBenchmarkServer({ assetRoot: '' });
@@ -108,6 +112,8 @@ try {
   report.sourceAfter = source(); assert.deepEqual(report.sourceAfter, report.source, 'Source changed during generated import validation.');
   const after = Object.fromEntries(await Promise.all(Object.keys(modules).map(async path => [path, hash(await readFile(join(root, path)))])));
   assert.deepEqual(after, modules, 'Imported runtime bytes changed during validation.');
+  const harnessAfter = Object.fromEntries(await Promise.all(Object.keys(harnessModules).map(async path => [path, hash(await readFile(join(root, path)))])));
+  assert.deepEqual(harnessAfter, harnessModules, 'Browser harness or numeric fixture bytes changed during validation.');
   await Promise.all(pendingModules);
   for (const record of loaded) assert.equal(hash(await readFile(join(root, record.path.slice(1)))), record.sha256, `Built public module changed: ${record.path}`);
   report.publicLoadedModules = loaded;
