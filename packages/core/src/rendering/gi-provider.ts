@@ -13,7 +13,7 @@ export interface RasterGiProvider {
     timeSeconds: number, timestamps: RasterTimestamps): { dispatchCalls: number; uploadBytes: number };
   compose(encoder: GPUCommandEncoder, outputs: RasterOutputs, camera: CameraFrame, width: number, height: number,
     timeSeconds: number, controls: RasterControls, timestamps: RasterTimestamps): {
-      view: GPUTextureView; dispatchCalls: number; uploadBytes: number;
+      view: GPUTextureView; dispatchCalls: number; uploadBytes: number; skippedGpuPasses?: readonly RasterPassName[];
     };
   dispose(): void;
 }

@@ -2,7 +2,7 @@
 
 Strata is a browser game engine being designed for high-quality real-time graphics through a simple JavaScript/TypeScript package.
 
-**Status: rendering, geometry and lighting experiments.** The package initializes WebGPU and a Rust/WASM worker, renders diffuse or textured PBR scenes, and records CPU/GPU telemetry. Directional shadows, temporal anti-aliasing and bounded static-terrain streaming are implemented. The terrain prototype includes a Rust cooker, GPU LOD selection and conventional mesh comparisons; it does not yet handle arbitrary imported meshes. A separate two-room experiment adds one-bounce world-space diffuse GI through software BVH tracing and a budgeted probe cache. A selected-mirror experiment adds bounded world-space reflections with an offscreen emissive object and independent reflection history. General scene integration and the editor remain planned. No npm package has been published and the final graphics performance target remains unverified.
+**Status: rendering, geometry and lighting experiments.** The package initializes WebGPU and a Rust/WASM worker, renders diffuse or textured PBR scenes, and records CPU/GPU telemetry. Directional shadows, temporal anti-aliasing and bounded static-terrain streaming are implemented. The terrain prototype includes a Rust cooker, GPU LOD selection and conventional mesh comparisons; it does not yet handle arbitrary imported meshes. A separate two-room experiment adds one-bounce world-space diffuse GI through software BVH tracing and a budgeted probe cache. A selected-mirror experiment adds bounded world-space reflections with an offscreen emissive object and independent reflection history. A restricted courtyard combines streamed terrain, exact room geometry, GI and reflections, with a persistent coarse terrain tracing proxy. General scene authoring remains planned. No npm package has been published. The [first integrated M2 result](docs/benchmarks/2026-09-05-m2-integrated.md) records near-60-Hz callback cadence with occasional GPU-budget misses and substantial visible artifacts; the game-quality performance target is not achieved. Visual stability is the next priority.
 
 ## Try the foundation
 
@@ -20,7 +20,7 @@ See [the runtime guide](docs/runtime.md) for the API, packaging, ownership, devi
 
 Run `npm run benchmark` for the hardware browser baseline or read [the benchmark protocol](docs/benchmark.md). Results and captures remain outside the repository. See [the raster guide](docs/raster.md) for PBR and [the virtual geometry guide](docs/virtual-geometry.md) for cooking, streaming and comparisons.
 
-For the procedural lighting experiment, run `npm run benchmark -- --renderer gi` or see [the GI guide](docs/gi.md) for offscreen color transfer, door/light controls, quality budgets and limitations. For the selected mirror, use `npm run benchmark -- --renderer reflections`; the [reflection guide](docs/reflections.md) describes its controls and limits. The geometry and lighting experiments currently use different scenes.
+For the procedural lighting experiment, run `npm run benchmark -- --renderer gi` or see [the GI guide](docs/gi.md) for offscreen color transfer, door/light controls, quality budgets and limitations. For the selected mirror, use `npm run benchmark -- --renderer reflections`; the [reflection guide](docs/reflections.md) describes its controls and limits. The [integrated courtyard](docs/integrated.md) combines these paths in one image and documents its explicit raster, tracing and collision limits.
 
 ## Product requirements
 

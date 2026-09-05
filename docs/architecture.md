@@ -42,7 +42,7 @@ The renderer owns a frame graph that describes render/compute/copy ordering and 
 
 ## Performance evidence and milestones
 
-The ambition is a visually rich laptop experience at 60 fps, with Switch 2-inspired quality as a reference for scope. Neither the visual comparison nor the frame rate is verified. The actual target GPU, resolution, power mode, browser and representative content remain unresolved. A previously discussed 2–3 ms GI allocation is illustrative, not a measured cost or guarantee.
+The ambition is a visually rich laptop experience at 60 fps, with Switch 2-inspired quality as a reference for scope. The [first restricted integrated M2 test](benchmarks/2026-09-05-m2-integrated.md) shows promising callback cadence, occasional GPU-budget misses and substantial geometry/lighting artifacts; the combined game-quality objective is not achieved. Visual stability takes priority over broadening authoring scope. The actual target GPU, resolution, power mode, browser and representative content remain unresolved. A previously discussed 2–3 ms GI allocation is illustrative, not a measured cost or guarantee.
 
 Begin with a reproducible browser benchmark and a conventional rendering baseline. Add one independently measurable capability at a time: cooked assets and streaming; cluster selection; shared geometry outputs; world-space indirect lighting/reflections; temporal reconstruction; integrated scene stress tests. GitHub Issues track implementation tasks and their acceptance evidence.
 

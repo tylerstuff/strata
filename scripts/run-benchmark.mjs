@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
-import { arch, cpus, homedir, platform, release, totalmem } from 'node:os';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { arch, cpus, homedir, platform, release, tmpdir, totalmem } from 'node:os';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -19,10 +19,11 @@ function parseArguments(args) {
   for (let index = 0; index < args.length; index++) {
     const name = args[index];
     if (name === '--smoke') options.smoke = true;
+    else if (name === '--generated-fixture') options['generated-fixture'] = true;
     else if (name === '--require-ac-performance') options.requireAcPerformance = true;
     else if (name === '--sustained') options.sustained = true;
     else if (name === '--help') options.help = true;
-    else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view', '--manifest', '--geometry-mode', '--camera', '--gi', '--gi-scenario', '--reflections'].includes(name)) {
+    else if (numeric.has(name.slice(2)) || ['--output', '--device-label', '--renderer', '--temporal', '--debug-view', '--manifest', '--trace-proxy', '--terrain-color', '--geometry-mode', '--camera', '--gi', '--gi-scenario', '--reflections'].includes(name)) {
       const value = args[++index];
       if (!value || value.startsWith('--')) throw new Error(`Missing value for ${name}.`);
       options[name.slice(2)] = numeric.has(name.slice(2)) ? Number(value) : value;
@@ -33,23 +34,28 @@ function parseArguments(args) {
   options.warmup ??= options.smoke ? 0.25 : 30;
   options.seed ??= 1337;
   options.renderer ??= 'diffuse';
+  if (options['generated-fixture'] && (!options.smoke || options.renderer !== 'integrated' || options.manifest || options['trace-proxy'])) {
+    throw new Error('--generated-fixture requires --smoke --renderer integrated and no external source paths.');
+  }
   options.temporal ??= 'on';
   options['debug-view'] ??= 'final';
   options['geometry-mode'] ??= 'streamed';
-  options['pool-mib'] ??= 8;
+  options['pool-mib'] ??= options.renderer === 'integrated' ? 1 : 8;
   options['pixel-error'] ??= 2;
   options['page-delay-ms'] ??= 0;
   options.camera ??= options.renderer === 'reflections' ? 'receiver' : options.renderer === 'gi' ? 'overview' : 'tour';
-  options.gi ??= 'on'; options['gi-scenario'] ??= options.renderer === 'reflections' ? 'static' : 'door-light'; options['probes-per-update'] ??= 32; options['rays-per-probe'] ??= 64;
+  options.gi ??= 'on'; options['gi-scenario'] ??= options.renderer === 'integrated' ? 'integrated-tour' : options.renderer === 'reflections' ? 'static' : 'door-light'; options['probes-per-update'] ??= 32; options['rays-per-probe'] ??= 64;
+  options['terrain-color'] ??= 'green';
+  if (options.renderer === 'integrated' && options.manifest) options['trace-proxy'] ??= options.manifest.replace(/[^/]+$/, 'trace-proxy.json');
   options.reflections ??= 'world'; options['reflection-scale'] ??= 0.25; options['reflection-rays'] ??= 32768;
   options.roughness ??= 0.08; options['reflection-distance'] ??= 16; options['reflection-update'] ??= 1;
-  if (!['diffuse', 'raster', 'virtual', 'gi', 'reflections'].includes(options.renderer) || !['on', 'off'].includes(options.temporal)
+  if (!['diffuse', 'raster', 'virtual', 'gi', 'reflections', 'integrated'].includes(options.renderer) || !['on', 'off'].includes(options.temporal)
     || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility', 'reflections', 'reflection-source'].includes(options['debug-view'])) {
-    throw new Error('Use --renderer diffuse|raster|virtual|gi|reflections, --temporal on|off and a supported --debug-view.');
+    throw new Error('Use --renderer diffuse|raster|virtual|gi|reflections|integrated, --temporal on|off and a supported --debug-view.');
   }
   if (!['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(options['geometry-mode'])
-    || !((options.renderer === 'gi' || options.renderer === 'reflections') ? ['overview', 'receiver', 'tour'] : ['tour', 'coverage']).includes(options.camera)) throw new Error('Unknown geometry mode or camera.');
-  if (!['on', 'off'].includes(options.gi) || !['static', 'door-light'].includes(options['gi-scenario'])
+    || !(options.renderer === 'integrated' ? ['overview', 'receiver', 'tour', 'terrain-witness'] : (options.renderer === 'gi' || options.renderer === 'reflections') ? ['overview', 'receiver', 'tour'] : ['tour', 'coverage']).includes(options.camera)) throw new Error('Unknown geometry mode or camera.');
+  if (!['on', 'off'].includes(options.gi) || !(options.renderer === 'integrated' ? ['integrated-tour'] : ['static', 'door-light']).includes(options['gi-scenario'])
     || !Number.isInteger(options['probes-per-update']) || options['probes-per-update'] < 1 || options['probes-per-update'] > 128
     || !Number.isInteger(options['rays-per-probe']) || options['rays-per-probe'] < 16 || options['rays-per-probe'] > 128) throw new Error('Invalid GI mode, scenario or probe/ray budget.');
   if (!['off', 'probe-only', 'world'].includes(options.reflections) || ![0.25, 0.5, 1].includes(options['reflection-scale'])
@@ -60,7 +66,8 @@ function parseArguments(args) {
   if (!Number.isFinite(options['pool-mib']) || options['pool-mib'] < 0.0625 || !Number.isSafeInteger(options['pool-mib'] * 1024 ** 2)
     || !Number.isFinite(options['pixel-error']) || options['pixel-error'] <= 0 || options['pixel-error'] > 1000
     || !Number.isFinite(options['page-delay-ms']) || options['page-delay-ms'] < 0 || options['page-delay-ms'] > 60000) throw new Error('Invalid geometry pool, error or page delay.');
-  if (options.renderer === 'virtual' && (!options.manifest || !process.env.STRATA_BENCHMARK_ASSET_DIR)) throw new Error('Virtual benchmarks require --manifest relative/path/manifest.json and STRATA_BENCHMARK_ASSET_DIR pointing to the external cooked asset root.');
+  if (['virtual', 'integrated'].includes(options.renderer) && !options['generated-fixture'] && (!options.manifest || !process.env.STRATA_BENCHMARK_ASSET_DIR)) throw new Error('Cooked benchmarks require --manifest relative/path/manifest.json and STRATA_BENCHMARK_ASSET_DIR pointing to the external cooked asset root.');
+  if (options.renderer === 'integrated' && ((!options['generated-fixture'] && !options['trace-proxy']) || !['green', 'neutral'].includes(options['terrain-color']))) throw new Error('Integrated benchmarks require a trace proxy and green|neutral terrain color.');
   for (const name of ['duration', 'warmup', 'seed', 'instance-count']) {
     const value = options[name];
     if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error(`--${name} must be a nonnegative finite number.`);
@@ -69,7 +76,7 @@ function parseArguments(args) {
   for (const name of ['seed', 'instance-count']) if (options[name] !== undefined && !Number.isSafeInteger(options[name])) throw new Error(`--${name} must be an integer.`);
   if (options['instance-count'] === 0) throw new Error('--instance-count must be positive.');
   if (options.seed > 0xffff_ffff) throw new Error('--seed must be a uint32 integer (0–4294967295).');
-  if ((options.renderer === 'gi' || options.renderer === 'reflections') && options.seed !== 1337) throw new Error('The GI fixture uses fixed probe seed 1337.');
+  if (['gi', 'reflections', 'integrated'].includes(options.renderer) && options.seed !== 1337) throw new Error('The GI fixture uses fixed probe seed 1337.');
   if (options['instance-count'] > 16_384) throw new Error('--instance-count must be at most 16384.');
   return options;
 }
@@ -179,14 +186,14 @@ function isSoftwareAdapter(adapter) {
   return adapter?.isFallbackAdapter === true || /swiftshader|llvmpipe|software rasterizer|software adapter/i.test(JSON.stringify(adapter));
 }
 
-async function captureEvidence(page, path) {
+async function captureEvidence(page, path, timeoutMs) {
   // Capture the intrinsic render resolution after measurement, independently
   // from the responsive CSS size recorded during the timed window.
   await page.locator('canvas').evaluate((canvas) => {
     canvas.style.width = `${canvas.width}px`;
     canvas.style.height = `${canvas.height}px`;
   });
-  const png = await page.locator('canvas').screenshot({ path, timeout: 15_000 });
+  const png = await page.locator('canvas').screenshot({ path, timeout: timeoutMs });
   const content = await page.evaluate(async (base64) => {
     const image = new Image();
     image.src = `data:image/png;base64,${base64}`;
@@ -222,6 +229,27 @@ async function captureEvidence(page, path) {
   };
 }
 
+async function captureDiagnostics(page, browserErrors) {
+  const diagnostics = { pageClosed: page.isClosed(), browserErrors: browserErrors.slice(-8) };
+  if (diagnostics.pageClosed) return diagnostics;
+  let timer;
+  try {
+    diagnostics.runtime = await Promise.race([
+      page.evaluate(() => ({
+        visibility: document.visibilityState,
+        canvas: (() => { const canvas = document.querySelector('canvas'); return canvas ? { width: canvas.width, height: canvas.height } : null; })(),
+        ...globalThis.strataBenchmark?.diagnostics?.(),
+      })),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Browser diagnostics did not respond within 2 seconds.')), 2000); }),
+    ]);
+  } catch (error) {
+    diagnostics.error = error.message;
+  } finally {
+    clearTimeout(timer);
+  }
+  return diagnostics;
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
@@ -229,6 +257,8 @@ async function main() {
     console.log('Virtual terrain: STRATA_BENCHMARK_ASSET_DIR=/external/cooked/root plus --manifest relative/manifest.json [--geometry-mode streamed|resident-lod|resident-full|mesh-lod] [--pool-mib 8] [--pixel-error 2] [--page-delay-ms 0] [--camera tour|coverage].');
     console.log('World-space GI: --renderer gi [--gi on|off] [--gi-scenario door-light|static] [--probes-per-update 32] [--rays-per-probe 64] [--camera overview|receiver|tour].');
     console.log('Selective reflections: --renderer reflections [--reflections world|probe-only|off] [--reflection-scale 0.25|0.5|1] [--reflection-rays 32768] [--roughness 0..0.35] [--reflection-distance 1..32] [--reflection-update 1|2|3|4].');
+    console.log('Integrated courtyard: --renderer integrated --manifest relative/manifest.json [--trace-proxy relative/trace-proxy.json] [--pool-mib 1] [--camera tour|receiver|overview|terrain-witness] [--terrain-color green|neutral]. Requires STRATA_BENCHMARK_ASSET_DIR; the fixed 60-second motion/door/light scenario is shared by every feature ablation.');
+    console.log('CI functional smoke: --smoke --renderer integrated --generated-fixture cooks a fresh bounded temporary fixture without reading any external asset collection.');
     console.log('Default: headed Chrome, 720p + 1080p, 30s warmup and 60s capture per resolution. Sustained: 1080p, 30s warmup + 180s capture. Smoke timings are never performance evidence.');
     console.log('--require-ac-performance requires a confirmed macOS AC profile with Low Power Mode off. All measured sessions reject a detected power-profile change.');
     return;
@@ -240,12 +270,18 @@ async function main() {
   await stat(resolve(repository, 'benchmarks/browser/app.js')).catch(() => { throw new Error('Run npm run build first to compile the benchmark application.'); });
   const directory = await outputDirectory(options.output);
   let geometryAsset;
-  if (options.renderer === 'virtual') {
+  if (['virtual', 'integrated'].includes(options.renderer) && !options['generated-fixture']) {
     const root = await realpath(resolve(process.env.STRATA_BENCHMARK_ASSET_DIR));
     const manifest = await realpath(resolve(root, options.manifest));
     if (!within(root, manifest) || isAbsolute(options.manifest)) throw new Error('--manifest must identify a file inside the external asset root.');
     const bytes = await readFile(manifest);
     geometryAsset = { manifestSha256: createHash('sha256').update(bytes).digest('hex'), source: JSON.parse(bytes).source };
+    if (options.renderer === 'integrated') {
+      const path = await realpath(resolve(root, options['trace-proxy']));
+      if (!within(root, path) || isAbsolute(options['trace-proxy'])) throw new Error('--trace-proxy must identify a file inside the external asset root.');
+      const proxyBytes = await readFile(path);
+      geometryAsset.traceProxy = { manifestSha256: createHash('sha256').update(proxyBytes).digest('hex'), ...JSON.parse(proxyBytes) };
+    }
   }
   const host = await hostMetadata();
   const [commit, gitChanges] = await Promise.all([
@@ -262,19 +298,39 @@ async function main() {
   } else if (softwareGpu) args.push('--use-angle=swiftshader', '--enable-unsafe-swiftshader');
   let server;
   let browser;
+  let generatedRoot;
+  let generatedProxy;
   const report = { schemaVersion: 1, kind: 'strata-local-benchmark-session', createdAt: new Date().toISOString(), mode, host, source, browser: null, runs: [] };
   const reportPath = resolve(directory, 'report.json');
   const save = () => writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   try {
-    server = await createBenchmarkServer();
+    if (options['generated-fixture']) {
+      generatedRoot = await mkdtemp(resolve(tmpdir(), 'strata-benchmark-courtyard-'));
+      await exec('cargo', ['run', '--package', 'strata-geometry-cooker', '--release', '--locked', '--',
+        '--seed', '1337', '--tiles', '4', '--cells', '64', '--trace-proxy', '--output', generatedRoot],
+      { cwd: repository, timeout: 120_000, maxBuffer: 1024 * 1024 });
+      const sourceBytes = await readFile(resolve(generatedRoot, 'manifest.json'));
+      const proxyJson = await readFile(resolve(generatedRoot, 'trace-proxy.json'));
+      generatedProxy = { json: proxyJson, binary: await readFile(resolve(generatedRoot, 'trace-proxy.bin')) };
+      geometryAsset = { manifestSha256: createHash('sha256').update(sourceBytes).digest('hex'), source: JSON.parse(sourceBytes).source,
+        traceProxy: { manifestSha256: createHash('sha256').update(proxyJson).digest('hex'), ...JSON.parse(proxyJson) } };
+    }
+    server = await createBenchmarkServer(generatedRoot ? { assetRoot: '', proceduralRoot: generatedRoot } : {});
     browser = await chromium.launch({ channel, headless: !headed, args });
     report.browser = { version: browser.version(), channel, headed, softwareGpu, launchArguments: args };
     console.log(`${mode}: ${host.cpu}; ${channel} ${browser.version()}; ${headed ? 'headed' : 'headless'}; reports outside repository.`);
     if (options.smoke) console.log('Functional smoke validation only. These timings are not hardware-performance evidence.');
     const context = await browser.newContext({ viewport: { width: 1920, height: 1160 }, deviceScaleFactor: 1 });
     const page = await context.newPage();
+    if (generatedProxy) {
+      // Only these two files from this invocation's fresh cooker output bypass
+      // the procedural page allowlist. External asset roots remain forbidden in CI.
+      await page.route(`${server.url}/procedural-assets/trace-proxy.json`, route => route.fulfill({ contentType: 'application/json', body: generatedProxy.json }));
+      await page.route(`${server.url}/procedural-assets/trace-proxy.bin`, route => route.fulfill({ contentType: 'application/octet-stream', body: generatedProxy.binary }));
+    }
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
+    page.on('crash', () => errors.push('The benchmark browser page crashed.'));
     page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
     page.setDefaultTimeout(30_000);
     await page.goto(server.url);
@@ -309,14 +365,15 @@ async function main() {
           width, height, warmupSeconds: options.warmup, durationSeconds: options.duration,
           seed: options.seed, mode, metadata, renderer: options.renderer, temporal: options.temporal === 'on', debugView: options['debug-view'],
           ...(options['instance-count'] === undefined ? {} : { instanceCount: options['instance-count'] }),
-          ...(options.renderer === 'virtual' ? {
-            manifestUrl: `/external-assets/${options.manifest.split('/').map(encodeURIComponent).join('/')}`,
+          ...(['virtual', 'integrated'].includes(options.renderer) ? {
+            manifestUrl: generatedRoot ? '/procedural-assets/manifest.json' : `/external-assets/${options.manifest.split('/').map(encodeURIComponent).join('/')}`,
             geometryMode: options['geometry-mode'], poolBytes: options['pool-mib'] * 1024 ** 2,
             pixelError: options['pixel-error'], pageLoadDelayMs: options['page-delay-ms'], cameraMode: options.camera,
           } : {}),
-          ...(options.renderer === 'gi' || options.renderer === 'reflections' ? { giEnabled: options.gi === 'on', giScenario: options['gi-scenario'],
+          ...(options.renderer === 'integrated' ? { traceProxyUrl: generatedRoot ? '/procedural-assets/trace-proxy.json' : `/external-assets/${options['trace-proxy'].split('/').map(encodeURIComponent).join('/')}`, terrainColor: options['terrain-color'] } : {}),
+          ...(['gi', 'reflections', 'integrated'].includes(options.renderer) ? { giEnabled: options.gi === 'on', giScenario: options['gi-scenario'],
             probesPerUpdate: options['probes-per-update'], raysPerProbe: options['rays-per-probe'], cameraMode: options.camera } : {}),
-          ...(options.renderer === 'reflections' ? { reflectionMode: options.reflections, reflectionResolutionScale: options['reflection-scale'],
+          ...(['reflections', 'integrated'].includes(options.renderer) ? { reflectionMode: options.reflections, reflectionResolutionScale: options['reflection-scale'],
             reflectionMaxRays: options['reflection-rays'], reflectionRoughness: options.roughness, reflectionMaxDistance: options['reflection-distance'], reflectionUpdateEvery: options['reflection-update'] } : {}),
         });
       } finally {
@@ -329,15 +386,28 @@ async function main() {
       samples.push({ phase: 'after', ...await powerSnapshot() });
       for (const sample of samples) checkPower(sample, sessionPower, options.requireAcPerformance);
       const captureFilename = `${width}x${height}.png`;
-      // The measured window has completed. Capture a known camera time separately.
-      const captureState = await page.evaluate(() => globalThis.strataBenchmark.capture(0));
-      const captureValidation = await captureEvidence(page, resolve(directory, captureFilename));
-      result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0, captureValidation, ...captureState };
+      // Retain the completed measurements even if a later queue fence or
+      // browser compositor screenshot fails. A failure is never a valid run.
       report.runs.push(result);
+      // The measured window has completed. Capture a known camera time separately.
+      let captureState;
+      let captureValidation;
+      try {
+        captureState = await page.evaluate(() => globalThis.strataBenchmark.capture(0));
+        // Software smoke runs can drain substantial queued work and need a
+        // longer compositor deadline; this never changes measured frame data.
+        captureValidation = await captureEvidence(page, resolve(directory, captureFilename), options.smoke ? 120_000 : 15_000);
+      } catch (error) {
+        const diagnostics = await captureDiagnostics(page, errors);
+        result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0,
+          captureFailure: { message: error.message, diagnostics } };
+        throw new Error(`The ${width}x${height} post-measurement capture failed: ${error.message}\nCapture diagnostics: ${JSON.stringify(diagnostics)}`, { cause: error });
+      }
+      result.runner = { powerSamples: samples, captureFilename, captureTimeSeconds: 0, captureValidation, ...captureState };
       if (errors.length) throw new Error(`Browser errors during capture: ${errors.join('; ')}`);
       if (!captureValidation.passed) throw new Error(`The ${width}x${height} procedural scene capture is blank or lacks visible geometry; the failed image and measurements were retained locally.`);
       if (!result.frames?.length || !result.frames.every((frame) => frame.drawCalls > 0
-        && (frame.triangles > 0 || (options.renderer === 'virtual' && frame.triangleCountSourceFrameId === null)))) throw new Error('The scene did not record geometry submissions or explicitly unavailable GPU counters.');
+        && (frame.triangles > 0 || (['virtual', 'integrated'].includes(options.renderer) && frame.triangleCountSourceFrameId === null)))) throw new Error('The scene did not record geometry submissions or explicitly unavailable GPU counters.');
       validateBenchmarkReport(report);
       await save();
       console.log(`${width}x${height}: completed; ${samples.length} power/thermal observations and a deterministic capture recorded.`);
@@ -351,8 +421,10 @@ async function main() {
     await save();
     throw error;
   } finally {
-    await browser?.close();
-    await server?.close();
+    const cleanup = await Promise.allSettled([browser?.close(), server?.close(),
+      generatedRoot ? rm(generatedRoot, { recursive: true, force: true }) : undefined]);
+    const failed = cleanup.find(result => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
   }
 }
 

@@ -4,11 +4,12 @@ import { GpuProfiler } from './profiling/gpu-profiler.js';
 import type { SceneRenderer } from './rendering/scene-renderer.js';
 import type { RasterRenderer } from './rendering/raster-renderer.js';
 import type { VirtualRenderer } from './geometry/virtual-renderer.js';
+import type { IntegratedRenderer } from './integrated/integrated-renderer.js';
 import type { ReflectionRenderer } from './reflections/reflection-renderer.js';
 import type { GiRenderer } from './gi/gi-renderer.js';
 import type { CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry, FrameMetrics, RenderOptions } from './types.js';
 
-type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer } | { kind: 'gi'; value: GiRenderer } | { kind: 'reflections'; value: ReflectionRenderer };
+type OwnedScene = { kind: 'diffuse'; value: SceneRenderer } | { kind: 'raster'; value: RasterRenderer } | { kind: 'virtual'; value: VirtualRenderer } | { kind: 'gi'; value: GiRenderer } | { kind: 'reflections'; value: ReflectionRenderer } | { kind: 'integrated'; value: IntegratedRenderer };
 
 // Module evaluation is intentionally safe without navigator, document or Worker.
 const ownedCanvases = new WeakSet<HTMLCanvasElement>();
@@ -314,9 +315,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         pendingGpuSamples: profiler?.pendingSamples ?? 0,
         droppedGpuSamples: profiler?.droppedSamples ?? 0,
         gpuErrorCount, lastGpuError,
-        ...(scene?.kind === 'virtual' ? { geometry: scene.value.geometryTelemetry } : {}),
-        ...(scene?.kind === 'gi' || scene?.kind === 'reflections' ? { gi: scene.value.giTelemetry } : {}),
-        ...(scene?.kind === 'reflections' ? { reflections: scene.value.reflectionTelemetry } : {}),
+        ...(scene?.kind === 'virtual' || scene?.kind === 'integrated' ? { geometry: scene.value.geometryTelemetry } : {}),
+        ...(scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated' ? { gi: scene.value.giTelemetry } : {}),
+        ...(scene?.kind === 'reflections' || scene?.kind === 'integrated' ? { reflections: scene.value.reflectionTelemetry } : {}),
+        ...(scene?.kind === 'integrated' ? { integrated: scene.value.integratedTelemetry } : {}),
       };
     }
 
@@ -332,10 +334,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
       async setScene(sceneOptions) {
         assertReady();
         if (sceneOptions !== null && (!sceneOptions || typeof sceneOptions !== 'object' || Array.isArray(sceneOptions)
-          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual', 'gi', 'reflections'].includes(sceneOptions.renderer)))) {
-          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse, raster, virtual, gi or reflections, or null to clear.');
+          || (sceneOptions.renderer !== undefined && !['diffuse', 'raster', 'virtual', 'gi', 'reflections', 'integrated'].includes(sceneOptions.renderer)))) {
+          throw new StrataError('INVALID_OPTIONS', 'Scene options require renderer diffuse, raster, virtual, gi, reflections or integrated, or null to clear.');
         }
-        if (sceneOptions?.renderer === 'virtual' && sceneOptions.signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
+        if ((sceneOptions?.renderer === 'virtual' || sceneOptions?.renderer === 'integrated') && sceneOptions.signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Scene creation was aborted.');
         const generation = ++sceneGeneration;
         pendingSceneAbort?.abort();
         pendingSceneAbort = undefined;
@@ -347,10 +349,11 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         const snapshot = { ...sceneOptions };
         const requestAbort = new AbortController();
         pendingSceneAbort = requestAbort;
-        const userSignal = snapshot.renderer === 'virtual' ? snapshot.signal : undefined;
+        const userSignal = snapshot.renderer === 'virtual' || snapshot.renderer === 'integrated' ? snapshot.signal : undefined;
         const abortRequest = () => requestAbort.abort(userSignal?.reason);
         userSignal?.addEventListener('abort', abortRequest, { once: true });
-        if (snapshot.renderer === 'virtual') snapshot.manifestUrl = String(snapshot.manifestUrl);
+        if (snapshot.renderer === 'virtual' || snapshot.renderer === 'integrated') snapshot.manifestUrl = String(snapshot.manifestUrl);
+        if (snapshot.renderer === 'integrated') snapshot.traceProxyUrl = String(snapshot.traceProxyUrl);
         const ownedDevice = device!;
         const assertCurrentRequest = (): void => {
           assertReady();
@@ -360,7 +363,11 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         };
         let next: OwnedScene;
         try {
-          if (snapshot.renderer === 'virtual') {
+          if (snapshot.renderer === 'integrated') {
+            const { IntegratedRenderer } = await import('./integrated/integrated-renderer.js');
+            assertCurrentRequest();
+            next = { kind: 'integrated', value: await IntegratedRenderer.create(ownedDevice, format, { ...snapshot, signal: requestAbort.signal }) };
+          } else if (snapshot.renderer === 'virtual') {
             const { VirtualRenderer } = await import('./geometry/virtual-renderer.js');
             assertCurrentRequest();
             next = { kind: 'virtual', value: await VirtualRenderer.create(ownedDevice, format, { ...snapshot, signal: requestAbort.signal }) };
@@ -422,8 +429,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           let dispatchCalls = 0;
           let triangles = 0;
           let uploadBytes = 0;
+          let skippedGpuPasses: readonly string[] | undefined;
           if (scene && scene.kind !== 'diffuse') {
-            ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.value.encode(
+            ({ drawCalls, dispatchCalls, triangles, uploadBytes, skippedGpuPasses } = scene.value.encode(
               encoder, view, canvas.width, canvas.height, timeSeconds, controls, timing?.timestamps,
             ));
           } else if (scene) {
@@ -444,11 +452,11 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             pass.end();
           }
           totalUploadBytes += uploadBytes;
-          if (timing) profiler!.resolve(encoder, timing);
+          if (timing) profiler!.resolve(encoder, timing, skippedGpuPasses);
           device!.queue.submit([encoder.finish()]);
           if (scene && scene.kind !== 'diffuse') forceRasterCameraCut = false;
           submittedFrames++;
-          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections') scene.value.submitted(frameId);
+          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated') scene.value.submitted(frameId);
           if (timing) profiler!.submitted(timing);
           const stats = telemetry();
           const metrics: FrameMetrics = {
@@ -457,16 +465,17 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             allocatedGpuBufferBytes: stats.allocatedGpuBufferBytes,
             allocatedGpuTextureBytes: stats.allocatedGpuTextureBytes,
             wasmMemoryBytes: stats.wasmMemoryBytes,
-            triangleCountSourceFrameId: scene?.kind === 'virtual' ? scene.value.geometryTelemetry.sourceFrameId : frameId,
+            triangleCountSourceFrameId: scene?.kind === 'virtual' || scene?.kind === 'integrated' ? scene.value.geometryTelemetry.sourceFrameId : frameId,
             ...(stats.geometry ? { geometry: stats.geometry } : {}),
             ...(stats.gi ? { gi: stats.gi } : {}),
             ...(stats.reflections ? { reflections: stats.reflections } : {}),
+            ...(stats.integrated ? { integrated: stats.integrated } : {}),
           };
           return metrics;
         } catch (cause) {
           // Encoding can advance ping-pong histories before a later pass or submission fails.
           forceRasterCameraCut = true;
-          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections') scene.value.cancelFrame();
+          if (scene?.kind === 'virtual' || scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated') scene.value.cancelFrame();
           if (timing) profiler!.cancel(timing);
           throw new StrataError('RENDER_FAILED', 'WebGPU frame submission failed.', { cause });
         }
@@ -477,12 +486,30 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         assertReady();
         try {
         await profiler?.flush(timeoutMs);
-        if (scene?.kind === 'virtual') await scene.value.flushFeedback(timeoutMs);
+        if (scene?.kind === 'virtual' || scene?.kind === 'integrated') await scene.value.flushFeedback(timeoutMs);
         } catch (cause) {
           assertReady();
           throw cause;
         }
         assertReady();
+      },
+      async waitForIdle(timeoutMs = 5000) {
+        assertReady();
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+          throw new StrataError('INVALID_OPTIONS', 'GPU work timeout must be positive and at most 2147483647 ms.');
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new StrataError('GPU_WORK_TIMEOUT', `GPU work exceeded ${timeoutMs} ms.`)), timeoutMs);
+        });
+        try {
+          await Promise.race([device!.queue.onSubmittedWorkDone(), deadline]);
+          assertReady();
+        } catch (cause) {
+          assertReady();
+          if (cause instanceof StrataError) throw cause;
+          throw new StrataError('GPU_WORK_FAILED', 'Waiting for submitted GPU work failed.', { cause });
+        } finally { clearTimeout(timer); }
       },
       dispose() {
         if (state === 'disposed') return;

@@ -126,7 +126,7 @@ fn pullGeometry(vertexIndex: u32) -> PulledVertex {
   let index = geometryPool[pageBase + geometryMetadata[record + 2u] + triangle * 3u + vertexIndex % 3u];
   let vertex = pageBase + geometryMetadata[record + 1u] + index * 8u;
   var result: PulledVertex;
-  result.position = vec3f(bitcast<f32>(geometryPool[vertex]), bitcast<f32>(geometryPool[vertex + 1u]), bitcast<f32>(geometryPool[vertex + 2u]));
+  result.position = terrainWorldPosition(vec3f(bitcast<f32>(geometryPool[vertex]), bitcast<f32>(geometryPool[vertex + 1u]), bitcast<f32>(geometryPool[vertex + 2u])));
   result.normal = vec3f(bitcast<f32>(geometryPool[vertex + 3u]), bitcast<f32>(geometryPool[vertex + 4u]), bitcast<f32>(geometryPool[vertex + 5u]));
   result.uv = vec2f(bitcast<f32>(geometryPool[vertex + 6u]), bitcast<f32>(geometryPool[vertex + 7u]));
   result.cluster = cluster;
@@ -152,7 +152,7 @@ fn clusterColor(id: u32) -> vec3f {
   output.previousClip = frame.previousViewProjection * position;
   output.position = output.currentClip;
   output.world = vertex.position; output.normal = vertex.normal; output.uv = vertex.uv;
-  output.color = vec3f(0.31, 0.48, 0.19); output.metallic = 0.0; output.roughness = 0.85;
+  output.color = terrainAlbedo(); output.metallic = 0.0; output.roughness = terrainRoughness();
   output.viewDepths = vec2f(-(frame.view * position).z, select(-(frame.previousView * position).z, -1.0, changed));
   let debug = u32(frame.parameters.z + 0.5);
   output.debugColor = clusterColor(vertex.cluster);

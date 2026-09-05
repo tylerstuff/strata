@@ -1,3 +1,5 @@
+import { transformGeometryBounds } from './terrain-rendering.js';
+import type { TerrainTransform } from './terrain-rendering.js';
 import { StrataError } from '../errors.js';
 import type { GeometryBounds, GeometryManifest } from './format.js';
 import { lookAtMatrix, multiplyMatrices, orthographicMatrix } from '../rendering/raster-math.js';
@@ -5,7 +7,7 @@ import type { CameraFrame, Vec3 } from '../rendering/raster-math.js';
 import { perspectiveMatrix } from '../rendering/scene-data.js';
 
 /** GPU ABI v1: 16-word header, 12-word tiles, 8-word LODs, 16-word clusters. */
-export function buildGeometryMetadata(manifest: GeometryManifest, capacityPages: number): { words: Uint32Array<ArrayBuffer>; triangleCapacity: number } {
+export function buildGeometryMetadata(manifest: GeometryManifest, capacityPages: number, transform?: TerrainTransform): { words: Uint32Array<ArrayBuffer>; triangleCapacity: number } {
   const lodCount = manifest.tiles.reduce((sum, tile) => sum + tile.lods.length, 0);
   const pageRefs = manifest.tiles.flatMap(tile => tile.lods.flatMap(lod => [...lod.pageIds]));
   const clusterRefs = manifest.tiles.flatMap(tile => tile.lods.flatMap(lod => [...lod.clusterIds]));
@@ -34,17 +36,19 @@ export function buildGeometryMetadata(manifest: GeometryManifest, capacityPages:
   let lodIndex = 0; let pageIndex = 0; let clusterIndex = 0;
   for (const tile of manifest.tiles) {
     const base = tileOffset + tile.id * 12;
-    floats.set(tile.bounds.min, base); floats.set(tile.bounds.max, base + 4);
+    const bounds = transform ? transformGeometryBounds(tile.bounds, transform) : tile.bounds;
+    floats.set(bounds.min, base); floats.set(bounds.max, base + 4);
     words.set([lodIndex, tile.lods.length, 0, 0], base + 8);
     for (const lod of tile.lods) {
       const record = lodOffset + lodIndex * 8;
       words.set([clusterIndex, lod.clusterIds.length, pageIndex, lod.pageIds.length], record);
-      floats[record + 4] = lod.error; words[record + 5] = lod.level; words[record + 6] = tile.id;
+      floats[record + 4] = lod.error * (transform?.scale ?? 1); words[record + 5] = lod.level; words[record + 6] = tile.id;
       for (const id of lod.clusterIds) {
         const cluster = manifest.clusters[id]!;
         const clusterBase = clusterOffset + id * 16;
         words.set([cluster.pageId, cluster.vertexOffset / 4, cluster.indexOffset / 4, cluster.triangleCount, tile.id, lod.level, 0, 0], clusterBase);
-        floats.set(cluster.bounds.min, clusterBase + 8); floats.set(cluster.bounds.max, clusterBase + 12);
+        const bounds = transform ? transformGeometryBounds(cluster.bounds, transform) : cluster.bounds;
+        floats.set(bounds.min, clusterBase + 8); floats.set(bounds.max, clusterBase + 12);
       }
       pageIndex += lod.pageIds.length; clusterIndex += lod.clusterIds.length; lodIndex++;
     }

@@ -70,6 +70,68 @@ function fixture() {
 }
 
 describe('bounded GPU timestamps', () => {
+  it('excludes explicitly omitted stale pairs while preserving query indices, real long gaps, and ring reuse', async () => {
+    const f = fixture();
+    const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
+    const names = ['empty-first', 'gi', 'empty-middle', 'presentation', 'empty-last'];
+    const slot = profiler.begin(1, names)!;
+    const origin = 9_000_000_000_000_000_000n;
+    // Omitted slots include zeros, an ancient pair, and reversed stale values.
+    f.buffers[1]!.data.set([0n, 0n, origin + 2_000_000n, origin + 5_000_000n,
+      1_000_000n, 3_500_000n, origin + 2_002_000_000n, origin + 2_003_000_000n, 9n, 1n]);
+    profiler.resolve(f.encoder as unknown as GPUCommandEncoder, slot, ['empty-first', 'empty-middle', 'empty-last']);
+    expect(slot.timestamps.presentation).toMatchObject({ beginningOfPassWriteIndex: 6, endOfPassWriteIndex: 7 });
+    expect(f.encoder.resolveQuerySet).toHaveBeenCalledWith(f.queries[0], 0, 10, f.buffers[0], 0);
+    expect(f.encoder.copyBufferToBuffer).toHaveBeenCalledWith(f.buffers[0], 0, f.buffers[1], 0, 80);
+    expect(profiler.pendingSamples).toBe(2);
+    profiler.submitted(slot); f.buffers[1]!.mapping.resolve(); await profiler.flush();
+    expect(f.buffers[1]!.mapAsync).toHaveBeenCalledWith(1, 0, 80);
+    expect(profiler.drain()).toEqual([
+      { frameId: 1, pass: 'gi', gpuMs: 3, startOffsetMs: 0, endOffsetMs: 3 },
+      { frameId: 1, pass: 'presentation', gpuMs: 1, startOffsetMs: 2000, endOffsetMs: 2001 },
+    ]);
+    expect(profiler.pendingSamples).toBe(0); expect(profiler.droppedSamples).toBe(0);
+    const reused = profiler.begin(2, names)!;
+    expect(reused).toBe(slot); expect(profiler.pendingSamples).toBe(5);
+    f.buffers[1]!.data.set([10_000_000n, 11_000_000n, 12_000_000n, 13_000_000n, 14_000_000n,
+      15_000_000n, 16_000_000n, 17_000_000n, 18_000_000n, 19_000_000n]);
+    profiler.resolve(f.encoder as unknown as GPUCommandEncoder, reused); profiler.submitted(reused); await profiler.flush();
+    const timings = profiler.drain();
+    expect(timings.map(value => value.pass)).toEqual(names);
+    expect(timings.map(value => value.startOffsetMs)).toEqual([0, 2, 4, 6, 8]);
+    expect(profiler.droppedSamples).toBe(0); profiler.dispose();
+  });
+
+  it('counts only active samples on omitted-pass readback failure, cancellation, and disposal', async () => {
+    for (const failure of ['readback', 'cancel', 'dispose'] as const) {
+      const f = fixture(); const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
+      const slot = profiler.begin(1, ['gi', 'empty', 'presentation'])!;
+      profiler.resolve(f.encoder as unknown as GPUCommandEncoder, slot, ['empty']);
+      expect(profiler.pendingSamples).toBe(2);
+      if (failure === 'readback') {
+        profiler.submitted(slot); f.buffers[1]!.mapping.reject(new Error('Readback failed')); await profiler.flush();
+      } else if (failure === 'cancel') profiler.cancel(slot);
+      else profiler.dispose();
+      expect(profiler.pendingSamples).toBe(0); expect(profiler.droppedSamples).toBe(2);
+      expect(profiler.drain()).toEqual([]); profiler.dispose();
+    }
+  });
+
+  it('rejects invalid omissions atomically and releases entirely omitted plans without fake samples', async () => {
+    const f = fixture(); const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
+    const slot = profiler.begin(1, ['a', 'b'])!;
+    for (const omitted of [['unknown'], ['a', 'a']]) {
+      expect(() => profiler.resolve(f.encoder as unknown as GPUCommandEncoder, slot, omitted)).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+      expect(profiler.pendingSamples).toBe(2); expect(f.encoder.resolveQuerySet).not.toHaveBeenCalled();
+    }
+    profiler.resolve(f.encoder as unknown as GPUCommandEncoder, slot, ['a', 'b']);
+    expect(profiler.pendingSamples).toBe(0); profiler.submitted(slot); await profiler.flush();
+    expect(f.buffers[1]!.mapAsync).not.toHaveBeenCalled(); expect(profiler.drain()).toEqual([]); expect(profiler.droppedSamples).toBe(0);
+    const next = profiler.begin(2, ['a'])!; expect(next).toBe(slot); expect(profiler.pendingSamples).toBe(1);
+    profiler.submitted(next); f.buffers[1]!.mapping.resolve(); await profiler.flush();
+    expect(profiler.drain().map(value => value.pass)).toEqual(['a']); profiler.dispose();
+  });
+
   it('preserves overlapping intervals and scheduling order independently of pass sums', async () => {
     const f = fixture();
     const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
@@ -501,6 +563,26 @@ describe('engine telemetry and scene ownership', () => {
     f.buffers[1]!.mapping.resolve();
     await engine.flushGpuTimings();
     expect(engine.drainGpuTimings().map(({ pass }) => pass)).toEqual(['shadow', 'raster', 'presentation']);
+  });
+
+  it('excludes renderer-declared skipped queries from submitted frame timing', async () => {
+    const value = { ...scene(), passNames: vi.fn(() => ['raster', 'reflection-trace', 'presentation'] as const),
+      encode: vi.fn(() => ({ drawCalls: 2, dispatchCalls: 0, triangles: 4, uploadBytes: 64,
+        skippedGpuPasses: ['reflection-trace'] as const })) };
+    vi.mocked(RasterRenderer.create).mockResolvedValue(value as unknown as RasterRenderer);
+    const engine = await ready(true);
+    await engine.setScene({ renderer: 'raster' });
+    // The unexecuted query retains an old epoch, but executed intervals are current.
+    f.buffers[1]!.data.set([1_000_000_000n, 1_002_000_000n, 0n, 3_000_000n,
+      1_001_000_000n, 1_005_000_000n]);
+    engine.render();
+    expect(engine.getTelemetry().pendingGpuSamples).toBe(2);
+    f.buffers[1]!.mapping.resolve(); await engine.flushGpuTimings();
+    expect(engine.drainGpuTimings()).toEqual([
+      { frameId: 1, pass: 'raster', gpuMs: 2, startOffsetMs: 0, endOffsetMs: 2 },
+      { frameId: 1, pass: 'presentation', gpuMs: 4, startOffsetMs: 1, endOffsetMs: 5 },
+    ]);
+    expect(engine.getTelemetry().droppedGpuSamples).toBe(0);
   });
 
   it('keeps a diffuse scene usable while raster loads and safely disposes an outdated raster result', async () => {

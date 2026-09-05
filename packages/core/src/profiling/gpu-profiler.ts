@@ -13,6 +13,8 @@ interface Slot {
   readonly passWrites: readonly GPURenderPassTimestampWrites[];
   readonly timestamps: Record<string, GPURenderPassTimestampWrites>;
   readonly passNames: string[];
+  /** Executed samples retain their original query indices even when other passes were omitted. */
+  readonly activeIndices: number[];
   busy: boolean;
   frameId: number;
   passCount: number;
@@ -59,7 +61,7 @@ export class GpuProfiler {
             querySet, resolveBuffer, readBuffer,
             timestampWrites: passWrites[0]!, passWrites,
             timestamps: Object.create(null) as Record<string, GPURenderPassTimestampWrites>,
-            passNames: [], busy: false, frameId: 0, passCount: 0, pending: null,
+            passNames: [], activeIndices: [], busy: false, frameId: 0, passCount: 0, pending: null,
           });
         } catch (error) {
           readBuffer?.destroy();
@@ -76,7 +78,7 @@ export class GpuProfiler {
 
   get droppedSamples(): number { return this.dropped; }
   get pendingSamples(): number {
-    return this.slots.reduce((count, slot) => count + (slot.busy ? slot.passCount : 0), 0);
+    return this.slots.reduce((count, slot) => count + (slot.busy ? slot.activeIndices.length : 0), 0);
   }
 
   begin(frameId: number, passes: string | readonly string[]): Slot | null {
@@ -93,8 +95,10 @@ export class GpuProfiler {
     }
     for (const name of slot.passNames) delete slot.timestamps[name];
     slot.passNames.length = 0;
+    slot.activeIndices.length = 0;
     names.forEach((name, index) => {
       slot.passNames.push(name);
+      slot.activeIndices.push(index);
       slot.timestamps[name] = slot.passWrites[index]!;
     });
     slot.busy = true;
@@ -103,35 +107,44 @@ export class GpuProfiler {
     return slot;
   }
 
-  resolve(encoder: GPUCommandEncoder, slot: Slot): void {
+  /** Explicit omissions exclude unexecuted passes, whose query values may be stale on reuse. */
+  resolve(encoder: GPUCommandEncoder, slot: Slot, omittedPasses: readonly string[] = []): void {
+    if (!Array.isArray(omittedPasses) || omittedPasses.some((name, index) => !slot.passNames.includes(name)
+      || omittedPasses.indexOf(name) !== index)) {
+      throw new StrataError('INVALID_OPTIONS', 'Omitted GPU passes must be unique names from the current frame plan.');
+    }
+    slot.activeIndices.length = 0;
+    slot.passNames.forEach((name, index) => { if (!omittedPasses.includes(name)) slot.activeIndices.push(index); });
+    // The query and copy ranges stay tied to the original pass plan, not the compacted samples.
     encoder.resolveQuerySet(slot.querySet, 0, slot.passCount * 2, slot.resolveBuffer, 0);
     encoder.copyBufferToBuffer(slot.resolveBuffer, 0, slot.readBuffer, 0, slot.passCount * 16);
   }
 
   /** Call only after submitting the command buffer that resolves this slot. */
   submitted(slot: Slot): void {
+    if (!slot.activeIndices.length) { slot.busy = false; slot.pending = null; return; }
     const complete = async (): Promise<void> => {
       try {
         await slot.readBuffer.mapAsync(mapRead, 0, slot.passCount * 16);
         if (this.disposed) return;
         const values = new BigUint64Array(slot.readBuffer.getMappedRange(0, slot.passCount * 16));
         const frame: GpuTiming[] = [];
-        let origin = values[0]!;
-        for (let index = 0; index < slot.passCount; index++) {
+        let origin: bigint | undefined;
+        for (const index of slot.activeIndices) {
           const start = values[index * 2]!;
           const end = values[index * 2 + 1]!;
           if (start === undefined || end === undefined || end < start) {
-            this.dropped += slot.passCount;
+            this.dropped += slot.activeIndices.length;
             return;
           }
-          if (start < origin) origin = start;
+          if (origin === undefined || start < origin) origin = start;
         }
-        for (let index = 0; index < slot.passCount; index++) {
+        for (const index of slot.activeIndices) {
           const start = values[index * 2]!; const end = values[index * 2 + 1]!;
           // Preserve overlap and gaps. Summing durations is not elapsed frame time.
           // Subtract uint64 origins before Number conversion to retain nanosecond differences.
           frame.push({ frameId: slot.frameId, pass: slot.passNames[index]!, gpuMs: Number(end - start) / 1_000_000,
-            startOffsetMs: Number(start - origin) / 1_000_000, endOffsetMs: Number(end - origin) / 1_000_000 });
+            startOffsetMs: Number(start - origin!) / 1_000_000, endOffsetMs: Number(end - origin!) / 1_000_000 });
         }
         // Keep frame groups atomic so queue pressure cannot yield misleading partial sums.
         if (frame.length > this.resultCapacity) {
@@ -146,7 +159,7 @@ export class GpuProfiler {
         this.results.push(frame);
         this.resultCount += frame.length;
       } catch {
-        if (!this.disposed) this.dropped += slot.passCount;
+        if (!this.disposed) this.dropped += slot.activeIndices.length;
       } finally {
         try { slot.readBuffer.unmap(); } catch { /* The device may already be destroyed. */ }
         slot.busy = false;
@@ -161,7 +174,7 @@ export class GpuProfiler {
   cancel(slot: Slot): void {
     if (slot.busy && !slot.pending) {
       slot.busy = false;
-      this.dropped += slot.passCount;
+      this.dropped += slot.activeIndices.length;
     }
   }
 
@@ -193,7 +206,7 @@ export class GpuProfiler {
     if (this.disposed) return;
     this.disposed = true;
     for (const slot of this.slots) {
-      if (slot.busy) this.dropped += slot.passCount;
+      if (slot.busy) this.dropped += slot.activeIndices.length;
       slot.busy = false;
       try { slot.readBuffer.destroy(); } catch { /* Continue releasing other slots. */ }
       try { slot.resolveBuffer.destroy(); } catch { /* Continue releasing other slots. */ }

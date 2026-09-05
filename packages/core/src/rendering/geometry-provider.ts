@@ -1,6 +1,14 @@
 import type { CameraFrame } from './raster-math.js';
 import type { RasterControls } from './raster-types.js';
 
+/** Providers draw into one shared camera, shadow map and MRT set. At most one owns selection timestamps. */
+export interface RasterGeometryGroup {
+  readonly providers: readonly RasterGeometryProvider[];
+  readonly halfExtent: number;
+  readonly lightMatrix: Float32Array<ArrayBuffer>;
+  camera(width: number, height: number, time: number, jitter: readonly [number, number]): CameraFrame;
+}
+
 /** Internal geometry boundary: lighting, intermediate targets, and temporal ownership stay in RasterRenderer. */
 export interface RasterGeometryProvider {
   readonly shaderSource: string;

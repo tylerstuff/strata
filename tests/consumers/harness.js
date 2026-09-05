@@ -55,6 +55,8 @@ export function installHarness(createEngine) {
     async exerciseScene(options, renderOptions = {}) {
       await engine.setScene(options);
       const metrics = engine.render({ timeSeconds: 0, temporal: false, ...renderOptions });
+      await engine.flushGpuTimings();
+      await engine.waitForIdle(120_000);
       // Give GPU validation/error delivery a browser turn without imposing a frame-rate assertion.
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       return { metrics, telemetry: engine.getTelemetry() };

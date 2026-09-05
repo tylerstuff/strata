@@ -1,3 +1,5 @@
+import { TerrainRendering, transformGeometryBounds, transformTerrainCamera } from './terrain-rendering.js';
+import type { TerrainLight, TerrainRenderOptions } from './terrain-rendering.js';
 import { StrataError } from '../errors.js';
 import type { GeometryManifest } from './format.js';
 import { GeometryPageCache } from './page-cache.js';
@@ -34,7 +36,9 @@ interface Resources {
 
 /** GPU tile selection and triangle compaction over unique cooked pages. */
 export class GpuGeometry implements RasterGeometryProvider {
-  readonly shaderSource = geometryVertexShader;
+  readonly shaderSource: string;
+  readonly fragmentEntryPoint?: string;
+  readonly usesMaterialTextures: boolean;
   readonly selectionPass = true;
   readonly vertexEntryPoint = 'virtualVertexMain';
   readonly shadowEntryPoint = 'virtualShadowMain';
@@ -68,16 +72,21 @@ export class GpuGeometry implements RasterGeometryProvider {
     private readonly pageLoadDelayMs: number,
     feedback: FeedbackSlot[],
     residencyWords: Uint32Array<ArrayBuffer>,
+    private readonly rendering: TerrainRendering,
   ) {
     this.feedback = feedback; this.residencyWords = residencyWords;
-    this.halfExtent = Math.max(manifest.bounds.max[0] - manifest.bounds.min[0], manifest.bounds.max[2] - manifest.bounds.min[2]) / 2;
+    this.shaderSource = geometryVertexShader + rendering.shader(5);
+    this.usesMaterialTextures = rendering.shading !== 'lambert';
+    if (!this.usesMaterialTextures) this.fragmentEntryPoint = 'terrainLambertFragment';
+    const bounds = transformGeometryBounds(manifest.bounds, rendering.transform);
+    this.halfExtent = Math.max(Math.abs(bounds.min[0]), Math.abs(bounds.max[0]), Math.abs(bounds.min[2]), Math.abs(bounds.max[2]));
     this.lightMatrix = createLightMatrix(this.halfExtent);
     this.argumentReset[1] = 1; this.argumentReset[5] = 1;
     // The second half of the reference list is used by the shadow draw.
     this.argumentReset[6] = triangleCapacity * 3;
   }
 
-  static async create(device: GPUDevice, manifest: GeometryManifest, manifestUrl: URL, options: VirtualSceneOptions): Promise<GpuGeometry> {
+  static async create(device: GPUDevice, manifest: GeometryManifest, manifestUrl: URL, options: VirtualSceneOptions, renderOptions?: TerrainRenderOptions): Promise<GpuGeometry> {
     if (options.geometryMode === 'mesh-lod') throw new StrataError('INVALID_OPTIONS', 'mesh-lod uses the conventional geometry provider.');
     const pixelError = options.pixelError ?? 2;
     if (!Number.isFinite(pixelError) || pixelError <= 0 || pixelError > 1000) {
@@ -88,6 +97,7 @@ export class GpuGeometry implements RasterGeometryProvider {
     }
     const cache = await GeometryPageCache.create(device, manifest, manifestUrl, options);
     const buffers: GPUBuffer[] = [];
+    let rendering: TerrainRendering | undefined;
     let allocatedBytes = 0;
     function buffer(label: string, size: number, flags: GPUBufferUsageFlags): GPUBuffer {
       if (size > device.limits.maxBufferSize || ((flags & usage.storage) !== 0 && size > device.limits.maxStorageBufferBindingSize)) {
@@ -97,7 +107,8 @@ export class GpuGeometry implements RasterGeometryProvider {
       buffers.push(result); allocatedBytes += size; return result;
     }
     try {
-      const metadata = buildGeometryMetadata(manifest, cache.gpuBufferBytes / manifest.pageBytes);
+      rendering = new TerrainRendering(device, renderOptions);
+      const metadata = buildGeometryMetadata(manifest, cache.gpuBufferBytes / manifest.pageBytes, rendering.transform);
       const module = device.createShaderModule({ label: 'Strata virtual geometry selection', code: geometrySelectionShader });
       const [selectPipeline, compactPipeline] = await Promise.all([
         device.createComputePipelineAsync({ label: 'Strata projected-error tile selection', layout: 'auto', compute: { module, entryPoint: 'selectTiles' } }),
@@ -130,15 +141,15 @@ export class GpuGeometry implements RasterGeometryProvider {
         buffers, metadata: metaBuffer, residency, selections, triangles, arguments: argumentsBuffer, uniform,
         selectPipeline, compactPipeline, selectBindings, compactBindings, bytes: allocatedBytes,
         uploadedBytes: metadata.words.byteLength + residencyWords.byteLength + initialSelections.byteLength,
-      }, metadata.triangleCapacity, pixelError, options.geometryMode ?? 'streamed', options.cameraMode ?? 'tour', options.pageLoadDelayMs ?? 0, feedback, residencyWords);
+      }, metadata.triangleCapacity, pixelError, options.geometryMode ?? 'streamed', options.cameraMode ?? 'tour', options.pageLoadDelayMs ?? 0, feedback, residencyWords, rendering);
       return result;
     } catch (cause) {
-      cache.dispose(); for (const owned of buffers) owned.destroy(); throw cause;
+      rendering?.dispose(); cache.dispose(); for (const owned of buffers) owned.destroy(); throw cause;
     }
   }
 
-  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bytes + this.cache.gpuBufferBytes; }
-  get initialUploadBytes(): number { return this.resources.uploadedBytes + this.cache.initialUploadBytes; }
+  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bytes + this.cache.gpuBufferBytes + this.rendering.gpuBufferBytes; }
+  get initialUploadBytes(): number { return this.resources.uploadedBytes + this.cache.initialUploadBytes + this.rendering.initialUploadBytes; }
   get geometryTelemetry(): GeometryTelemetry {
     return { ...this.cache.telemetry, ...this.latest, geometryMode: this.mode,
       cameraPath: this.cameraMode === 'coverage' ? 'terrain-coverage-v1' : 'terrain-tour-v1',
@@ -152,12 +163,15 @@ export class GpuGeometry implements RasterGeometryProvider {
   }
 
   camera(width: number, height: number, time: number, jitter: readonly [number, number]): CameraFrame {
-    return createTerrainCamera(this.manifest, width, height, time, jitter, this.cameraMode);
+    return transformTerrainCamera(createTerrainCamera(this.manifest, width, height, time, jitter, this.cameraMode), this.rendering.transform);
   }
+
+  setLight(light: TerrainLight): void { this.rendering.setLight(light); }
 
   attachPipelines(raster: GPURenderPipeline, shadow: GPURenderPipeline): void {
     const shared = [this.cache.buffer, this.resources.metadata, this.resources.residency, this.resources.triangles];
     const entries = shared.map((buffer, binding) => ({ binding, resource: { buffer } }));
+    if (this.rendering.buffer) entries.push({ binding: 5, resource: { buffer: this.rendering.buffer } });
     this.shadowBindings = this.device.createBindGroup({ label: 'Strata shadow page pulling', layout: shadow.getBindGroupLayout(1), entries });
     this.rasterBindings = this.device.createBindGroup({ label: 'Strata raster page pulling', layout: raster.getBindGroupLayout(1),
       entries: [...entries, { binding: 4, resource: { buffer: this.resources.selections } }] });
@@ -173,7 +187,7 @@ export class GpuGeometry implements RasterGeometryProvider {
     let update: ReturnType<GeometryPageCache['update']>;
     try { update = this.cache.update(); }
     catch (cause) { this.residencyDirty = true; throw cause; }
-    let uploadBytes = update.uploadBytes + uniformBytes + argumentBytes;
+    let uploadBytes = update.uploadBytes + uniformBytes + argumentBytes + this.rendering.flush();
     if (update.uploaded.length || update.evicted.length) this.residencyDirty = true;
     if (this.residencyDirty) {
       for (const page of this.manifest.pages) this.residencyWords[page.id] = this.cache.getSlot(page.id) >>> 0;
@@ -258,7 +272,7 @@ export class GpuGeometry implements RasterGeometryProvider {
 
   dispose(): void {
     if (this.disposed) return;
-    this.cancelFrame(); this.disposed = true; this.cache.dispose();
+    this.cancelFrame(); this.disposed = true; this.cache.dispose(); this.rendering.dispose();
     for (const slot of this.feedback) { if (slot.busy) this.droppedFeedback++; slot.busy = false; }
     for (const buffer of this.resources.buffers) buffer.destroy();
     this.rasterBindings = undefined; this.shadowBindings = undefined;

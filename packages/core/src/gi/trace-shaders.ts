@@ -92,7 +92,9 @@ fn giTraverseBvh(ray: GiRay, anyHit: bool) -> GiTraceHit {
       let triangle = giTriangles[index]; hit.primitiveTests++;
       let distance = giTriangleDistance(ray, triangle);
       if (distance >= 0.0 && (hit.status == 0u || distance < hit.distance || (distance == hit.distance && triangle.sourceId < hit.triangleId))) {
-        if (triangle.materialId >= giTraceConfig.counts.w || triangle.boxId >= giTraceConfig.counts.z) { hit.status = 2u; return hit; }
+        // 0xfffffffe identifies the persistent non-box triangle source; never index giBoxes with it.
+        if (triangle.materialId >= giTraceConfig.counts.w
+          || (triangle.boxId >= giTraceConfig.counts.z && triangle.boxId != 0xfffffffeu)) { hit.status = 2u; return hit; }
         hit.distance = distance; hit.normal = triangle.normal; hit.triangleId = triangle.sourceId;
         hit.materialId = triangle.materialId; hit.boxId = triangle.boxId; hit.status = 1u;
         if (anyHit) { return hit; }
@@ -121,7 +123,9 @@ fn giSdfBoxNormal(box: GiTraceBox, point: vec3f) -> vec3f {
 }
 fn giTraceSdf(ray: GiRay) -> GiTraceHit {
   var hit = giEmptyHit(ray); let count = giTraceConfig.counts.z;
-  if (!giValidRay(ray) || count == 0u || count > 341u || count > arrayLength(&giBoxes)) { hit.status = 2u; return hit; }
+  // A box-only SDF cannot silently stand in for a scene containing static mesh triangles.
+  if (!giValidRay(ray) || count == 0u || count > 341u || count > arrayLength(&giBoxes)
+    || giTraceConfig.counts.y != count * 12u) { hit.status = 2u; return hit; }
   var distance = ray.tMin;
   for (var step = 0u; step < 128u; step++) {
     let point = ray.origin + ray.direction * distance;

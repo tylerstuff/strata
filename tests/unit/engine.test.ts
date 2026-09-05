@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEngine, StrataError, type Engine } from '../../packages/core/src/index.js';
 import { initializeCpuRuntime } from '../../packages/core/src/internal/cpu-runtime.js';
+import type { IntegratedRenderer as IntegratedRendererType } from '../../packages/core/src/integrated/integrated-renderer.js';
 
 vi.mock('../../packages/core/src/internal/cpu-runtime.js', () => ({
   initializeCpuRuntime: vi.fn(),
@@ -31,7 +32,7 @@ function gpuFixture() {
     destroy: vi.fn(),
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
-    queue: { submit: vi.fn() },
+    queue: { submit: vi.fn(), onSubmittedWorkDone: vi.fn(async () => {}) },
     createCommandEncoder: vi.fn(() => encoder),
   };
   const adapter = {
@@ -113,6 +114,63 @@ describe('engine lifecycle', () => {
     expect(fixture.context.unconfigure).toHaveBeenCalledOnce();
     expect(() => engine.render()).toThrowError(expect.objectContaining({ code: 'ENGINE_DISPOSED' }));
     expect(() => engine.resize(10, 10)).toThrowError(expect.objectContaining({ code: 'ENGINE_DISPOSED' }));
+  });
+
+  it('fences submitted GPU work without profiling and does not submit extra frames', async () => {
+    const engine = await ready(); const completion = deferred<void>();
+    fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(completion.promise);
+    engine.render(); let finished = false;
+    const waiting = engine.waitForIdle().then(() => { finished = true; });
+    await flushMicrotasks(); expect(finished).toBe(false);
+    expect(fixture.device.queue.submit).toHaveBeenCalledTimes(1);
+    completion.resolve(); await waiting;
+    expect(finished).toBe(true);
+    expect(engine.getTelemetry().submittedFrames).toBe(1);
+  });
+
+  it('bounds GPU work waits and reports failures or disposal without leaking timers', async () => {
+    const engine = await ready(); vi.useFakeTimers();
+    fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(new Promise(() => {}));
+    const timeout = expect(engine.waitForIdle(10)).rejects.toMatchObject({ code: 'GPU_WORK_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(10); await timeout;
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(engine.waitForIdle(0)).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
+    fixture.device.queue.onSubmittedWorkDone.mockRejectedValueOnce(new Error('Queue failed'));
+    await expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'GPU_WORK_FAILED' });
+    const completion = deferred<void>(); fixture.device.queue.onSubmittedWorkDone.mockReturnValueOnce(completion.promise);
+    const disposed = expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'ENGINE_DISPOSED' });
+    engine.dispose(); completion.resolve(); await disposed;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('loads integrated scenes lazily with cancellation, mixed counters and shared lighting telemetry', async () => {
+    const { IntegratedRenderer } = await import('../../packages/core/src/integrated/integrated-renderer.js');
+    const geometry = { sourceFrameId: 3, selectedTriangles: 200 };
+    const value = { gpuBufferBytes: 100, gpuTextureBytes: 200, initialUploadBytes: 50,
+      geometryTelemetry: geometry, giTelemetry: { enabled: true }, reflectionTelemetry: { mode: 'world' },
+      integratedTelemetry: { persistentProxyTriangles: 2048, staticRasterTriangles: 312 },
+      passNames: vi.fn(() => ['raster']), encode: vi.fn(() => ({ drawCalls: 6, dispatchCalls: 7, triangles: 514, uploadBytes: 12 })),
+      submitted: vi.fn(), cancelFrame: vi.fn(), flushFeedback: vi.fn(async () => {}), dispose: vi.fn() };
+    const load = vi.spyOn(IntegratedRenderer, 'create').mockResolvedValue(value as unknown as IntegratedRendererType);
+    const engine = await ready(); const abort = new AbortController();
+    const manifestUrl = new URL('https://example.test/manifest.json');
+    const proxyUrl = new URL('https://example.test/trace-proxy.json');
+    await engine.setScene({ renderer: 'integrated', manifestUrl, traceProxyUrl: proxyUrl, signal: abort.signal });
+    expect(load).toHaveBeenCalledWith(fixture.device, 'bgra8unorm', expect.objectContaining({ renderer: 'integrated',
+      manifestUrl: String(manifestUrl), traceProxyUrl: String(proxyUrl), signal: expect.any(AbortSignal) }));
+    const frame = engine.render({ gi: { enabled: true }, reflections: { mode: 'world' } });
+    expect(frame).toMatchObject({ triangles: 514, triangleCountSourceFrameId: 3, geometry,
+      gi: { enabled: true }, reflections: { mode: 'world' }, integrated: { persistentProxyTriangles: 2048 },
+      allocatedGpuBufferBytes: 100, allocatedGpuTextureBytes: 200 });
+    expect(value.submitted).toHaveBeenCalledWith(1);
+    await engine.flushGpuTimings(); expect(value.flushFeedback).toHaveBeenCalledOnce();
+    fixture.device.queue.submit.mockImplementationOnce(() => { throw new Error('submission failure'); });
+    expect(() => engine.render()).toThrow(); expect(value.cancelFrame).toHaveBeenCalledOnce();
+    await engine.setScene(null); expect(value.dispose).toHaveBeenCalledOnce();
+    abort.abort();
+    await expect(engine.setScene({ renderer: 'integrated', manifestUrl, traceProxyUrl: proxyUrl, signal: abort.signal }))
+      .rejects.toMatchObject({ code: 'SCENE_LOAD_ABORTED' });
+    expect(load).toHaveBeenCalledOnce();
   });
 
   it('reports missing browser WebGPU without touching the canvas or CPU', async () => {

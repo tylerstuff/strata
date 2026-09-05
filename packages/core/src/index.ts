@@ -7,4 +7,5 @@ export type {
   SceneOptions, VirtualSceneOptions, GeometryTelemetry, GeometryMode,
   GiSceneOptions, GiControls, GiTelemetry,
   ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, ReflectionMode,
+  IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode,
 } from './types.js';

@@ -1,3 +1,5 @@
+import { TerrainRendering, transformGeometryBounds, transformTerrainCamera } from './terrain-rendering.js';
+import type { TerrainTransform, TerrainLight, TerrainRenderOptions } from './terrain-rendering.js';
 import { StrataError } from '../errors.js';
 import { validateGeometryPage } from './format.js';
 import type { GeometryManifest } from './format.js';
@@ -35,17 +37,19 @@ export function buildMeshPacking(manifest: GeometryManifest): MeshPacking {
   return { vertexCount, indexCount, clusterVertexBases, clusterIndexBases, tiles };
 }
 
-export function selectMeshLods(manifest: GeometryManifest, camera: CameraFrame, height: number, pixelError: number): { lod: number; visible: boolean; error: number }[] {
+export function selectMeshLods(manifest: GeometryManifest, camera: CameraFrame, height: number, pixelError: number, transform?: TerrainTransform): { lod: number; visible: boolean; error: number }[] {
   return manifest.tiles.map(tile => {
-    const visible = geometryBoundsVisible(camera.viewProjection, tile.bounds);
+    const bounds = transform ? transformGeometryBounds(tile.bounds, transform) : tile.bounds;
+    const errorScale = transform?.scale ?? 1;
+    const visible = geometryBoundsVisible(camera.viewProjection, bounds);
     let lod = tile.lods.length - 1;
     if (visible) {
       lod = 0;
       for (let level = tile.lods.length - 1; level >= 0; level--) {
-        if (projectedGeometryError(camera, tile.bounds, tile.lods[level]!.error, height) <= pixelError) { lod = level; break; }
+        if (projectedGeometryError(camera, bounds, tile.lods[level]!.error * errorScale, height) <= pixelError) { lod = level; break; }
       }
     }
-    return { lod, visible, error: projectedGeometryError(camera, tile.bounds, tile.lods[lod]!.error, height) };
+    return { lod, visible, error: projectedGeometryError(camera, bounds, tile.lods[lod]!.error * errorScale, height) };
   });
 }
 
@@ -53,7 +57,7 @@ const meshVertexShader = /* wgsl */ `
 @group(1) @binding(0) var<storage, read> meshSelections: array<u32>;
 struct MeshInput { @location(0) position: vec3f, @location(1) normal: vec3f, @location(2) uv: vec2f, @builtin(instance_index) tile: u32, };
 @vertex fn meshShadowMain(input: MeshInput) -> @builtin(position) vec4f {
-  return frame.lightViewProjection * vec4f(input.position, 1.0);
+  return frame.lightViewProjection * vec4f(terrainWorldPosition(input.position), 1.0);
 }
 fn meshColor(id: u32) -> vec3f {
   let hash = (id + 1u) * 2654435761u;
@@ -62,11 +66,11 @@ fn meshColor(id: u32) -> vec3f {
 @vertex fn meshVertexMain(input: MeshInput) -> VertexOutput {
   let selected = meshSelections[input.tile * 2u];
   let changed = meshSelections[input.tile * 2u + 1u] != 0u;
-  let position = vec4f(input.position, 1.0);
+  let position = vec4f(terrainWorldPosition(input.position), 1.0);
   var output: VertexOutput;
   output.currentClip = frame.viewProjection * position; output.previousClip = frame.previousViewProjection * position;
-  output.position = output.currentClip; output.world = input.position; output.normal = input.normal; output.uv = input.uv;
-  output.color = vec3f(0.31, 0.48, 0.19); output.metallic = 0.0; output.roughness = 0.85;
+  output.position = output.currentClip; output.world = position.xyz; output.normal = input.normal; output.uv = input.uv;
+  output.color = terrainAlbedo(); output.metallic = 0.0; output.roughness = terrainRoughness();
   output.viewDepths = vec2f(-(frame.view * position).z, select(-(frame.previousView * position).z, -1.0, changed));
   let debug = u32(frame.parameters.z + 0.5);
   // The conventional reference submits tiles, so its cluster debug view colors draw batches.
@@ -81,7 +85,9 @@ fn meshColor(id: u32) -> vec3f {
 /** Ordinary preloaded indexed mesh reference, with CPU selection and one draw per tile. */
 export class MeshGeometry implements RasterGeometryProvider {
   readonly selectionPass = false;
-  readonly shaderSource = meshVertexShader;
+  readonly shaderSource: string;
+  readonly fragmentEntryPoint?: string;
+  readonly usesMaterialTextures: boolean;
   readonly vertexEntryPoint = 'meshVertexMain';
   readonly shadowEntryPoint = 'meshShadowMain';
   readonly vertexBuffers: GPUVertexBufferLayout[] = [{ arrayStride: 32, attributes: [
@@ -91,6 +97,7 @@ export class MeshGeometry implements RasterGeometryProvider {
   readonly halfExtent: number;
   readonly lightMatrix: Float32Array<ArrayBuffer>;
   private bindings: GPUBindGroup | undefined;
+  private shadowBindings: GPUBindGroup | undefined;
   private readonly selectionWords: Uint32Array<ArrayBuffer>;
   private previousLods: number[];
   private current: ReturnType<typeof selectMeshLods> = [];
@@ -102,14 +109,18 @@ export class MeshGeometry implements RasterGeometryProvider {
   private constructor(private readonly device: GPUDevice, readonly manifest: GeometryManifest,
     private readonly packing: MeshPacking, private readonly vertices: GPUBuffer, private readonly indices: GPUBuffer,
     private readonly selections: GPUBuffer, private readonly pixelError: number, private readonly cameraMode: 'tour' | 'coverage',
-    private readonly pageLoadDelayMs: number, private readonly stagingBound: number) {
+    private readonly pageLoadDelayMs: number, private readonly stagingBound: number, private readonly rendering: TerrainRendering) {
     this.selectionWords = new Uint32Array(manifest.tiles.length * 2);
     this.previousLods = Array<number>(manifest.tiles.length).fill(-1);
-    this.halfExtent = Math.max(manifest.bounds.max[0] - manifest.bounds.min[0], manifest.bounds.max[2] - manifest.bounds.min[2]) / 2;
+    this.shaderSource = meshVertexShader + rendering.shader(1);
+    this.usesMaterialTextures = rendering.shading !== 'lambert';
+    if (!this.usesMaterialTextures) this.fragmentEntryPoint = 'terrainLambertFragment';
+    const bounds = transformGeometryBounds(manifest.bounds, rendering.transform);
+    this.halfExtent = Math.max(Math.abs(bounds.min[0]), Math.abs(bounds.max[0]), Math.abs(bounds.min[2]), Math.abs(bounds.max[2]));
     this.lightMatrix = createLightMatrix(this.halfExtent);
   }
 
-  static async create(device: GPUDevice, manifest: GeometryManifest, manifestUrl: URL, options: VirtualSceneOptions): Promise<MeshGeometry> {
+  static async create(device: GPUDevice, manifest: GeometryManifest, manifestUrl: URL, options: VirtualSceneOptions, renderOptions?: TerrainRenderOptions): Promise<MeshGeometry> {
     const pixelError = options.pixelError ?? 2; const concurrency = options.maxConcurrentRequests ?? 4;
     const delay = options.pageLoadDelayMs ?? 0; const cameraMode = options.cameraMode ?? 'tour';
     if (!Number.isFinite(pixelError) || pixelError <= 0 || pixelError > 1000 || !Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32
@@ -126,8 +137,10 @@ export class MeshGeometry implements RasterGeometryProvider {
     options.signal?.addEventListener('abort', onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
     const buffers: GPUBuffer[] = [];
+    let rendering: TerrainRendering | undefined;
     try {
       abort.signal.throwIfAborted();
+      rendering = new TerrainRendering(device, renderOptions);
       const vertices = new Float32Array(packing.vertexCount * 8); const indices = new Uint32Array(packing.indexCount);
       const clustersByPage = manifest.pages.map(() => [] as number[]);
       for (const cluster of manifest.clusters) clustersByPage[cluster.pageId]!.push(cluster.id);
@@ -182,21 +195,22 @@ export class MeshGeometry implements RasterGeometryProvider {
       const selections = make('Strata conventional tile selections', selectionBytes, 0x80);
       device.queue.writeBuffer(vertexBuffer, 0, vertices); device.queue.writeBuffer(indexBuffer, 0, indices);
       return new MeshGeometry(device, manifest, packing, vertexBuffer, indexBuffer, selections, pixelError, cameraMode, delay,
-        Math.min(concurrency, manifest.pages.length) * manifest.pageBytes);
-    } catch (cause) { abort.abort(cause); for (const buffer of buffers) buffer.destroy(); throw cause; }
+        Math.min(concurrency, manifest.pages.length) * manifest.pageBytes, rendering);
+    } catch (cause) { abort.abort(cause); rendering?.dispose(); for (const buffer of buffers) buffer.destroy(); throw cause; }
     finally { options.signal?.removeEventListener('abort', onAbort); }
   }
 
-  get initialUploadBytes(): number { return this.packing.vertexCount * 32 + this.packing.indexCount * 4; }
+  get initialUploadBytes(): number { return this.packing.vertexCount * 32 + this.packing.indexCount * 4 + this.rendering.initialUploadBytes; }
   get gpuBufferBytes(): number { return this.disposed ? 0 : this.initialUploadBytes + this.selectionWords.byteLength; }
   get geometryTelemetry(): GeometryTelemetry {
+    const packedBytes = this.packing.vertexCount * 32 + this.packing.indexCount * 4;
     return { ...this.latest, geometryMode: 'mesh-lod', cameraPath: this.cameraMode === 'coverage' ? 'terrain-coverage-v1' : 'terrain-tour-v1',
       sourceSeed: this.manifest.source.seed, sourceTriangleCount: this.manifest.source.triangleCount,
       sourceTilesPerSide: this.manifest.source.tilesPerSide, sourceCellsPerTile: this.manifest.source.cellsPerTile,
       pixelError: this.pixelError, pageLoadDelayMs: this.pageLoadDelayMs,
       uniqueCompiledBytes: this.manifest.pages.length * this.manifest.pageBytes,
-      packedGeometryBytes: this.initialUploadBytes, startupCopiedBytes: this.initialUploadBytes,
-      startupCpuBufferBytes: this.initialUploadBytes, startupPageStagingBoundBytes: this.stagingBound,
+      packedGeometryBytes: packedBytes, startupCopiedBytes: packedBytes,
+      startupCpuBufferBytes: packedBytes, startupPageStagingBoundBytes: this.stagingBound,
       fetchedBytes: this.manifest.pages.length * this.manifest.pageBytes,
       residentPages: 0, capacityPages: 0, rootPages: 0,
       sourcePageCount: this.manifest.pages.length, sourceRootPageCount: this.manifest.rootPageIds.length,
@@ -207,17 +221,21 @@ export class MeshGeometry implements RasterGeometryProvider {
       overflowCount: 0, pendingFeedbackFrames: 0, droppedFeedbackFrames: 0, lastFailure: null };
   }
   camera(width: number, height: number, time: number, jitter: readonly [number, number]): CameraFrame {
-    return createTerrainCamera(this.manifest, width, height, time, jitter, this.cameraMode);
+    return transformTerrainCamera(createTerrainCamera(this.manifest, width, height, time, jitter, this.cameraMode), this.rendering.transform);
   }
-  attachPipelines(raster: GPURenderPipeline, _shadow: GPURenderPipeline): void {
+  setLight(light: TerrainLight): void { this.rendering.setLight(light); }
+  attachPipelines(raster: GPURenderPipeline, shadow: GPURenderPipeline): void {
     this.bindings = this.device.createBindGroup({ label: 'Strata conventional tile history', layout: raster.getBindGroupLayout(1),
-      entries: [{ binding: 0, resource: { buffer: this.selections } }] });
+      entries: [{ binding: 0, resource: { buffer: this.selections } },
+        ...(this.rendering.buffer ? [{ binding: 1, resource: { buffer: this.rendering.buffer } }] : [])] });
+    if (this.rendering.buffer) this.shadowBindings = this.device.createBindGroup({ label: 'Strata conventional terrain shadow transform',
+      layout: shadow.getBindGroupLayout(1), entries: [{ binding: 1, resource: { buffer: this.rendering.buffer } }] });
   }
   prepare(_encoder: GPUCommandEncoder, camera: CameraFrame, _width: number, height: number, reset: boolean, _controls: RasterControls): {
     dispatchCalls: number; uploadBytes: number; triangles: number; drawCalls: number;
   } {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Conventional geometry was disposed.');
-    this.current = selectMeshLods(this.manifest, camera, height, this.pixelError);
+    this.current = selectMeshLods(this.manifest, camera, height, this.pixelError, this.rendering.transform);
     let selectedTriangles = 0; let shadowTriangles = 0; let selectedClusters = 0; let shadowClusters = 0; let visibleTiles = 0; let maxProjectedError = 0;
     for (const tile of this.manifest.tiles) {
       const selection = this.current[tile.id]!; const range = this.packing.tiles[tile.id]![selection.lod]!;
@@ -231,13 +249,14 @@ export class MeshGeometry implements RasterGeometryProvider {
     }
     this.device.queue.writeBuffer(this.selections, 0, this.selectionWords);
     this.pending = { sourceFrameId: null, visibleTiles, selectedTriangles, shadowTriangles, selectedClusters, shadowClusters, maxProjectedError };
-    return { dispatchCalls: 0, uploadBytes: this.selectionWords.byteLength, triangles: selectedTriangles + shadowTriangles,
+    return { dispatchCalls: 0, uploadBytes: this.selectionWords.byteLength + this.rendering.flush(), triangles: selectedTriangles + shadowTriangles,
       drawCalls: visibleTiles + this.manifest.tiles.length };
   }
   draw(pass: GPURenderPassEncoder, phase: 'raster' | 'shadow'): void {
     if (!this.bindings || !this.pending) throw new StrataError('RENDER_FAILED', 'Conventional geometry is not prepared.');
     pass.setVertexBuffer(0, this.vertices); pass.setIndexBuffer(this.indices, 'uint32');
     if (phase === 'raster') pass.setBindGroup(1, this.bindings);
+    else if (this.shadowBindings) pass.setBindGroup(1, this.shadowBindings);
     for (const tile of this.manifest.tiles) {
       const selection = this.current[tile.id]!;
       if (phase === 'raster' && !selection.visible) continue;
@@ -255,6 +274,6 @@ export class MeshGeometry implements RasterGeometryProvider {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true; this.pending = undefined;
-    this.vertices.destroy(); this.indices.destroy(); this.selections.destroy();
+    this.vertices.destroy(); this.indices.destroy(); this.selections.destroy(); this.rendering.dispose();
   }
 }

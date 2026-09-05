@@ -24,7 +24,7 @@
       #geometry label { display: inline-flex; gap: 8px; align-items: center; margin: 8px 12px 8px 0; }
       .control-note { margin: 0 0 12px; }
       @media (max-width: 640px) { body { padding: 12px; } header { gap: 10px; } h1 { width: 100%; } select { max-width: 100%; } .settings-row > label { flex: 1 1 170px; } }
-      #manifest { width: min(60vw, 620px); }
+      #manifest, #trace-proxy { width: min(60vw, 620px); }
       button { cursor: pointer; } button:disabled { opacity: .45; }
       canvas { display: block; width: min(100%, 1280px); aspect-ratio: 16 / 9; background: #101927; }
       output { display: block; padding: 14px 0; color: #a7d9d0; font-size: 14px; }
@@ -35,19 +35,19 @@
   <body>
     <header>
       <h1>Strata / Renderer</h1>
-      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option><option value="virtual">Cooked terrain</option><option value="gi">World-space GI · two rooms</option><option value="reflections">Selective reflections · mirror</option></select>
+      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option><option value="virtual">Cooked terrain</option><option value="gi">World-space GI · two rooms</option><option value="reflections">Selective reflections · mirror</option><option value="integrated">Integrated courtyard</option></select>
       <select id="debug" aria-label="Rendering view">
         <option value="final">Final</option>
-        <optgroup label="Scene views" data-renderers="raster virtual gi reflections">
+        <optgroup label="Scene views" data-renderers="raster virtual gi reflections integrated">
           <option value="direct">Direct light</option><option value="shadow">Shadows</option><option value="depth">Depth</option><option value="normal">Normals</option><option value="motion">Motion</option><option value="material">Materials</option>
         </optgroup>
-        <optgroup label="Terrain views" data-renderers="virtual">
+        <optgroup label="Terrain views" data-renderers="virtual integrated">
           <option value="clusters">Clusters</option><option value="lod">LOD</option><option value="residency">Residency</option><option value="coverage">Coverage</option>
         </optgroup>
-        <optgroup label="Global illumination views" data-renderers="gi reflections">
+        <optgroup label="Global illumination views" data-renderers="gi reflections integrated">
           <option value="indirect">Indirect light only · ×20 display</option><option value="trace">Tracing geometry</option><option value="probe-age">Probe freshness</option><option value="probe-irradiance">Probe irradiance</option><option value="probe-visibility">Probe visibility</option>
         </optgroup>
-        <optgroup label="Reflection views" data-renderers="reflections">
+        <optgroup label="Reflection views" data-renderers="reflections integrated">
           <option value="reflections">Reflections only</option><option value="reflection-source">Reflection source</option>
         </optgroup>
       </select>
@@ -61,10 +61,10 @@
       <div class="settings-row">
         <label class="toggle"><input id="gi-enabled" type="checkbox" checked> Diffuse GI</label>
         <label>Camera
-          <select id="gi-camera"><option value="receiver">Receiver room</option><option value="overview" selected>Whole scene</option><option value="tour">Receiver tour</option></select>
+          <select id="gi-camera"><option value="receiver">Receiver room</option><option value="overview" selected>Whole scene</option><option value="tour">Recorded tour</option><option value="terrain-witness">Courtyard light receiver</option></select>
         </label>
         <label>Lighting scenario
-          <select id="gi-scenario"><option value="static">Static lighting</option><option value="door-light">Door and light changes</option></select>
+          <select id="gi-scenario"><option value="static">Static lighting</option><option value="door-light">Door and light changes</option><option value="integrated-tour">Courtyard motion, door and light</option></select>
         </label>
       </div>
       <p>Compare light bouncing from the colored wall with direct lighting. Switch Diffuse GI off for the direct-light baseline.</p>
@@ -92,13 +92,16 @@
         <label>Trace frequency<select id="reflection-update"><option value="1">Every frame</option><option value="2">Every second frame</option><option value="4">Every fourth frame</option></select></label>
       </div>
       <p>A selected floor mirror reflects an object outside the receiver camera. Probe approximation supplies low-frequency lighting and cannot reproduce its sharp image.</p>
-      <p>Source view: green = fresh world hit, orange = reused history, blue = probe fallback, magenta = traversal exhaustion, black = no reflection. These runs hold the object fixed; separate validation exercises motion and history rejection.</p>
+      <p>Source view: green = fresh world hit, orange = reused history, blue = probe fallback, magenta = traversal exhaustion, black = no reflection.</p>
+      <p id="reflection-motion-note">Mirror runs hold the object fixed; the integrated courtyard includes object motion.</p>
     </section>
     <details id="geometry" class="settings-panel" hidden>
       <summary>Cooked terrain settings</summary>
       <label>Manifest URL <input id="manifest" type="text" value="/external-assets/terrain-v1-s1337-t8-c128/manifest.json"></label>
-      <label>Geometry <select id="geometry-mode"><option value="streamed">Streamed · 8 MiB pool</option><option value="resident-lod">Resident GPU LOD</option><option value="resident-full">Resident finest</option><option value="mesh-lod">Conventional mesh LOD</option></select></label>
+      <label id="trace-proxy-control" hidden>Tracing proxy URL <input id="trace-proxy" type="text" value="/external-assets/integrated-courtyard-v1-s1337-t4-c64/trace-proxy.json"></label>
+      <label>Geometry <select id="geometry-mode"><option value="streamed">Streamed · default pool</option><option value="resident-lod">Resident GPU LOD</option><option value="resident-full">Resident finest</option><option value="mesh-lod">Conventional mesh LOD</option></select></label>
       <p>Serve locally cooked data through STRATA_BENCHMARK_ASSET_DIR. The terrain tour uses a 2-pixel error target. Results record the achieved error while pages are missing.</p>
+      <p id="integrated-geometry-note" hidden>The courtyard streams a 5 MiB terrain through a 1 MiB pool while its coarse tracing proxy stays resident. The room probe volume supports local indoor GI. No collision is implemented.</p>
     </details>
     <canvas width="1280" height="720" aria-label="Strata real-time renderer benchmark"></canvas>
     <output role="status">Ready. The default run warms up for 30 seconds, then measures for 60 seconds.</output>

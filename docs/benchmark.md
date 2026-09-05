@@ -13,7 +13,7 @@ npm run benchmark:sustained
 
 The runner opens installed Chrome in a separate temporary profile, headed, on the hardware WebGPU adapter. The normal run measures 1280×720 then 1920×1080. Each resolution gets 30 seconds of shader/runtime warm-up followed by 60 seconds of moving-camera capture. The sustained run measures 1080p for 180 seconds after 30 seconds of warm-up. Keep the tab visible, connect AC power, record the chosen power profile and close competing GPU workloads where practical. Never silently change the user's power settings. A hidden tab cancels the run; a known software adapter is rejected for performance runs.
 
-On macOS, `--require-ac-performance` requires confirmed AC Power with active Low Power Mode off. All performance captures reject an observed change in power source or active profile. The inactive battery profile does not determine AC behavior. Sampling cannot detect changes entirely between observations.
+On macOS, `--require-ac-performance` requires confirmed AC Power with active Low Power Mode off. A declared battery comparison may omit that flag and keep its active profile fixed. Report battery and AC comparisons separately; the profile setting alone does not measure power consumption or prove equal performance. All performance captures reject an observed change in power source or active profile. The inactive battery profile does not determine AC behavior. Sampling cannot detect changes entirely between observations.
 
 See [the initial M2 baseline](benchmarks/2026-09-05-m2-baseline.md) for the first hardware evidence and [the raster guide](raster.md) for feature comparisons.
 
@@ -58,7 +58,7 @@ The three additional named compute passes are `gi-trace`, `gi-update` and `gi-sh
 
 `npm run test:gi` runs the exact BVH/SDF comparison, cache tests and rendered offscreen/door/light validation. `npm run test:gi -- --measure` runs an isolated hardware representation microbenchmark with named ray distributions; its timings do not establish total-frame GI cost. CI runs functional validation only and uploads no raw GI evidence.
 
-Smoke mode allows a bounded 30-second final timestamp flush for software adapters; performance mode retains the five-second deadline. The flush occurs after measurement. The small-resolution GI validation harness separately checks 240-frame convergence; full-resolution smoke screenshots check package/render/report operation only.
+Smoke mode allows a bounded 30-second final timestamp flush for software adapters; performance mode retains the five-second deadline. The flush occurs after measurement. Capture settling also fences submitted GPU work, with a 120-second deadline, so an unavailable profiler does not permit screenshots of incomplete work. Smoke screenshots allow 120 seconds for browser composition; performance screenshots retain 15 seconds. Capture failures preserve completed measurement samples and bounded diagnostics but invalidate the run. The small-resolution GI validation harness separately checks 240-frame convergence; full-resolution smoke screenshots check package/render/report operation only.
 
 
 ## Selective reflections
@@ -73,6 +73,30 @@ npm run benchmark -- --renderer reflections --reflections world --require-ac-per
 
 Defaults are receiver camera, static lighting, GI/TAA enabled, 156 source triangles, quarter-width/quarter-height reflections, 32,768 candidate rays per frame, roughness 0.08, distance 16 m and every-frame tracing. Options are `--reflection-scale 0.25|0.5|1`, `--reflection-rays 1..131072`, `--roughness 0..0.35`, `--reflection-distance 1..32` and `--reflection-update 1..4`. The ordinary GI controls and `--gi-scenario door-light` also apply. Object offset stays zero in this benchmark; separate functional tests exercise movement, camera cuts, disocclusion and roughness changes.
 
-The world path records `reflection-trace` and `reflection-resolve` between raster and shared composition. An empty or skipped trace update still records its timing pass, with zero trace dispatches. Other modes skip both passes. The report preserves the configured and actual scheduled candidate ceilings; unread GPU hit/failure/history counts remain null. A candidate slot can fail the material mask and issue no ray, so its count is not measured ray throughput. Source view is green for a fresh represented-world hit, orange for history, blue for the probe approximation, magenta for exhaustion and black for none. `probe-only` is a low-frequency approximation, not evidence of sharp reflections.
+The world path records `reflection-trace` and `reflection-resolve` between raster and shared composition. An empty or skipped trace update omits its pass and timing sample; resolve remains timed. Other modes skip both passes. The report preserves the configured and actual scheduled candidate ceilings; unread GPU hit/failure/history counts remain null. A candidate slot can fail the material mask and issue no ray, so its count is not measured ray throughput. Source view is green for a fresh represented-world hit, orange for history, blue for the probe approximation, magenta for exhaustion and black for none. `probe-only` is a low-frequency approximation, not evidence of sharp reflections.
 
 Reflection allocations are 512 buffer bytes plus 88 bytes per low-resolution pixel. Fresh never-world off/probe-only scenes have only 1×1 placeholders; disabling a previously active cache retains its history allocation. Shared trace/probe/composition memory is counted once in total allocations. See [the reflection guide](reflections.md) for the complete layout and limitations. The final screenshot is outside measurement: 240 held-time submissions with GI enabled, 32 for reflections with GI disabled, and 8 in smoke mode. Smoke is not a convergence or performance result.
+
+## Integrated courtyard comparisons
+
+Cook the fixed procedural courtyard and its persistent tracing sidecar outside Git:
+
+```sh
+cargo run --package strata-geometry-cooker --release --locked -- \
+  --seed 1337 --tiles 4 --cells 64 --trace-proxy \
+  --output "$HOME/Downloads/Strata-Cooked-Geometry/integrated-courtyard-v1-s1337-t4-c64"
+export STRATA_BENCHMARK_ASSET_DIR="$HOME/Downloads/Strata-Cooked-Geometry"
+npm run benchmark -- --renderer integrated \
+  --manifest integrated-courtyard-v1-s1337-t4-c64/manifest.json \
+  --require-ac-performance
+```
+
+The proxy URL defaults to `trace-proxy.json` beside that manifest; `--trace-proxy relative/path/trace-proxy.json` can specify it explicitly. The cooker emits 131,072 unique terrain triangles in 80 pages (5 MiB), including three pinned root pages. A 1 MiB pool is the default. The source's scale0.125 and translation[0,-1.625,0] place its highest possible point below the room floor underside. A distinct 2,048-triangle proxy remains resident while those render pages stream. Its measured maximum vertical error is0.1255053m and conservative bound0.1895959m; neither bounds normal, shadow or radiometric error. The shared BVH contains2,204 triangles, including156 exact room/rigid-object triangles, with184,640 explicitly allocated tracing bytes.
+
+`integrated-streamed-courtyard-v1` uses one camera, shared shadow/MRT targets, local room probes and selected reflections. The default tour follows a recorded60-second path from the receiver room through the courtyard and around the terrain. The mandatory `integrated-tour` scenario moves the emissive object sinusoidally from2–6seconds, closes the door at4 and opens it at8, turns the sun off at14 and restores it at18. Camera and scenario use the same explicit simulation time, restarted at zero for each measured window. All feature comparisons preserve these events; world changes reset lighting history, and their stalls/repopulation remain in the recorded distributions.
+
+Repeat the command with exactly one change for each comparison: `--gi off`, `--reflections off`, `--geometry-mode resident-lod` (no streaming), and `--temporal off`. `--geometry-mode mesh-lod` adds the conventional CPU-selected mesh reference; `resident-full` holds finest terrain detail. Keep the camera, seed, terrain color, error, resolution, trace budgets, warm-up, capture duration and power profile fixed. `--terrain-color neutral` is a diagnostic material comparison that updates raster and tracing together. `--camera receiver|overview|terrain-witness` provides fixed diagnostic views; those are separate workloads from the tour.
+
+Start with fixed720p and1080p. Dynamic resolution is disabled and recorded as such. Assess the60 FPS requirement from end-to-end callback/submission distributions, stalls and GPU timing coverage; report misses and dominant costs. The fully enabled GPU terrain path has10 timed passes, up to7 compute dispatches and5+TAA draws. Terrain triangle counts retain their delayed `sourceFrameId`; the frame total additionally includes312 current room raster/shadow triangles and fullscreen triangles. Both source hashes, proxy errors and representation limits are recorded. No collision is implemented; the fixed probe grid does not provide general outdoor GI. This courtyard is a bounded integration test, not evidence of Switch2-equivalent scene complexity or visual quality.
+
+Use the separate functional harness for cold-cache offscreen contribution, cuts, delayed delivery, eviction, resize and lighting-latency evidence. Reflection trace timing exists only when the current frame schedules candidates; an omitted pass is absent rather than reported as a synthetic zero or an old query value. CI can additionally exercise the complete report path with `npm run benchmark:smoke -- --renderer integrated --generated-fixture`. That option cooks a fresh bounded temporary asset, serves only its allowlisted pages and two exact proxy files, then removes it. It never enables external asset collections in CI. Smoke timing and screenshot settling are not performance or convergence evidence.
