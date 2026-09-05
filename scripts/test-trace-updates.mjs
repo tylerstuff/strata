@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { appendFile, lstat, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { platform } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -71,13 +71,44 @@ async function sourceState() {
   return { root: repository, commit: await git('rev-parse', 'HEAD'), tree: await git('rev-parse', 'HEAD^{tree}'),
     status: await git('status', '--porcelain'), trackedDiffSha256: proofHash(await git('diff', 'HEAD')) };
 }
-async function newExternalDirectory(path) {
-  const target = resolve(path);
+/** Check canonical existing ancestors before creating even an intermediate directory. */
+export async function newExternalDirectory(path) {
+  let ancestor = resolve(path);
+  const suffix = [];
+  for (;;) {
+    try { ancestor = await realpath(ancestor); break; }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      const parent = dirname(ancestor);
+      assert.notEqual(parent, ancestor, 'Cannot resolve proof output ancestry.');
+      suffix.unshift(relative(parent, ancestor)); ancestor = parent;
+    }
+  }
+  for (let current = ancestor;; current = dirname(current)) {
+    let git = false;
+    try { await lstat(join(current, '.git')); git = true; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    assert.equal(git, false, 'Proof artifacts must remain outside every Git worktree.');
+    if (dirname(current) === current) break;
+  }
+  const target = resolve(ancestor, ...suffix);
   await mkdir(dirname(target), { recursive: true });
-  const parent = await realpath(dirname(target)), canonicalRepo = await realpath(repository);
-  assert(!within(canonicalRepo, resolve(parent, target.split(sep).at(-1))), 'Proof artifacts must remain outside the repository.');
   await mkdir(target); // Existing evidence is never overwritten.
-  return realpath(target);
+  assert.equal(await realpath(target), target, 'Proof output changed during creation.');
+  return target;
+}
+
+/** Final browser-error admission happens after all asynchronous teardown/verification. */
+export async function finalizeProofReport(report, output, settle) {
+  try { await settle(); }
+  catch (error) { report.status = 'fail'; report.finalizationFailure = String(error); }
+  if (report.browserErrors.length) {
+    report.status = 'fail';
+    report.failure ??= { message: `Browser errors: ${report.browserErrors.join('\n')}` };
+  }
+  report.completedAt = new Date().toISOString();
+  if (report.result?.shaders) for (const shader of report.result.shaders) shader.sha256 = proofHash(shader.code);
+  await writeFile(resolve(output, 'report.json'), json(report), { flag: 'wx' });
 }
 async function frozenFile(path, expected) {
   const bytes = await readFile(path);
@@ -269,7 +300,7 @@ export async function runProof(args) {
   const report = { kind: 'strata-issue20-gpu-correctness', correctnessOnly: true, performanceEligible: false,
     manifest: { path: resolve(args['--manifest']), sha256: args['--manifest-sha256'] }, requestedAdapter: args['--adapter'],
     startedAt: new Date().toISOString(), browserErrors: [], events: 0, cleanup: {} };
-  let browser, server, timer, stopped = false, pendingEvents = Promise.resolve();
+  let browser, server, timer, detachBrowserListeners, stopped = false, pendingEvents = Promise.resolve();
   const active = () => { assert(!stopped, 'Proof execution already terminated.'); };
   const event = value => {
     pendingEvents = pendingEvents.then(() => appendFile(resolve(output, 'events.jsonl'), JSON.stringify({ sequence: report.events++, at: new Date().toISOString(), value }) + '\n'));
@@ -289,8 +320,10 @@ export async function runProof(args) {
     if (stopped) { await browser.close(); throw Error('Proof terminated during browser launch.'); }
     report.browser = browser.version();
     const page = await browser.newPage({ viewport: { width: 1000, height: 760 }, deviceScaleFactor: 1 });
-    page.on('pageerror', error => report.browserErrors.push(error.message));
-    page.on('console', message => { if (message.type() === 'error') report.browserErrors.push(message.text()); });
+    const pageError = error => report.browserErrors.push(error.message);
+    const consoleError = message => { if (message.type() === 'error') report.browserErrors.push(message.text()); };
+    page.on('pageerror', pageError); page.on('console', consoleError);
+    detachBrowserListeners = () => { page.off('pageerror', pageError); page.off('console', consoleError); };
     await page.exposeFunction('recordTraceProofEvent', event);
     await page.route(`${server.url}/proof.html`, route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Strata issue20 correctness proof</title>' }));
     for (const name of ['direct.mjs', 'candidate.mjs', 'full-correctness-only.mjs', 'inputs.json', 'steps.json', 'shaders.json']) {
@@ -376,17 +409,22 @@ export async function runProof(args) {
   finally {
     stopped = true;
     clearTimeout(timer);
-    const cleanup = await Promise.allSettled([bounded(browser?.close(), 'Browser cleanup'), bounded(server?.close(), 'Server cleanup')]);
-    report.cleanup = { browser: { status: cleanup[0].status, ...(cleanup[0].status === 'rejected' ? { error: String(cleanup[0].reason) } : {}) },
-      server: { status: cleanup[1].status, ...(cleanup[1].status === 'rejected' ? { error: String(cleanup[1].reason) } : {}) } };
-    if (cleanup.some(item => item.status === 'rejected')) report.status = 'fail';
-    try { await bounded(verifyProof(args['--manifest'], args['--manifest-sha256']), 'Final source verification', 30000); report.sourceGuard = 'unchanged'; }
-    catch (error) { report.status = 'fail'; report.sourceGuard = { failure: error.message }; }
-    try { await bounded(pendingEvents, 'Event persistence'); }
-    catch (error) { report.status = 'fail'; report.eventPersistenceFailure = String(error); }
-    report.completedAt = new Date().toISOString();
-    if (report.result?.shaders) for (const shader of report.result.shaders) shader.sha256 = proofHash(shader.code);
-    await writeFile(resolve(output, 'report.json'), json(report), { flag: 'wx' });
+    await finalizeProofReport(report, output, async () => {
+      try {
+        const cleanup = await Promise.allSettled([bounded(browser?.close(), 'Browser cleanup'), bounded(server?.close(), 'Server cleanup')]);
+        report.cleanup = { browser: { status: cleanup[0].status, ...(cleanup[0].status === 'rejected' ? { error: String(cleanup[0].reason) } : {}) },
+          server: { status: cleanup[1].status, ...(cleanup[1].status === 'rejected' ? { error: String(cleanup[1].reason) } : {}) } };
+        if (cleanup.some(item => item.status === 'rejected')) report.status = 'fail';
+        try { await bounded(verifyProof(args['--manifest'], args['--manifest-sha256']), 'Final source verification', 30000); report.sourceGuard = 'unchanged'; }
+        catch (error) { report.status = 'fail'; report.sourceGuard = { failure: error.message }; }
+        try { await bounded(pendingEvents, 'Event persistence'); }
+        catch (error) { report.status = 'fail'; report.eventPersistenceFailure = String(error); }
+      } finally {
+        // Keep listeners through teardown and verification, then seal the evidence
+        // before its final synchronous error check and serialization.
+        detachBrowserListeners?.();
+      }
+    });
   }
   assert.equal(report.status, 'pass', `Proof failed; evidence retained at ${output}/report.json`);
   return { path: resolve(output, 'report.json'), status: report.status };

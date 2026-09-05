@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { decodeProofRays, parseProofArguments, parseProofInputJson, proofInputJson, proofHash, verifyProof } from './test-trace-updates.mjs';
+import { decodeProofRays, finalizeProofReport, newExternalDirectory, parseProofArguments, parseProofInputJson, proofInputJson, proofHash, verifyProof } from './test-trace-updates.mjs';
 
 test('GPU mode requires an explicit run, adapter class and reviewed manifest digest', () => {
   for (const args of [[], ['--run'], ['--prepare-only', '--run'], ['--help'],
@@ -40,5 +40,76 @@ test('draft manifest and tampered manifest are rejected before source or GPU adm
     await assert.rejects(verifyProof(path, proofHash(bytes)), /Draft manifests cannot request a GPU/);
     await writeFile(path, bytes + '\n');
     await assert.rejects(verifyProof(path, proofHash(bytes)), /Frozen input hash differs/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('another checkout or worktree is rejected before any missing parent is created', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'strata-proof-output-'));
+  try {
+    for (const marker of ['directory', 'file', 'dangling-symlink']) {
+      const checkout = join(directory, marker); await mkdir(checkout);
+      if (marker === 'directory') await mkdir(join(checkout, '.git'));
+      else if (marker === 'file') await writeFile(join(checkout, '.git'), 'gitdir: /external/main/.git/worktrees/proof\n');
+      else await symlink(join(directory, 'missing-git'), join(checkout, '.git'));
+      await writeFile(join(checkout, 'sentinel'), 'unchanged');
+      const alias = join(directory, marker + '-alias'); await symlink(checkout, alias);
+      const before = await readdir(checkout);
+      for (const path of [checkout, alias]) {
+        await assert.rejects(newExternalDirectory(join(path, 'missing', 'nested', 'evidence')), /outside every Git worktree/);
+        await assert.rejects(lstat(join(checkout, 'missing')), { code: 'ENOENT' });
+        assert.deepEqual(await readdir(checkout), before);
+        assert.equal(await readFile(join(checkout, 'sentinel'), 'utf8'), 'unchanged');
+      }
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('a valid external alias creates a canonical new output and never reuses evidence', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'strata-proof-exclusive-'));
+  try {
+    const external = join(directory, 'external'); await mkdir(external);
+    const alias = join(directory, 'alias'); await symlink(external, alias);
+    const target = join(alias, 'nested', 'evidence'), output = await newExternalDirectory(target);
+    assert.equal(output, join(await realpath(external), 'nested', 'evidence'));
+    await writeFile(join(output, 'sentinel'), 'preserve original evidence');
+    await assert.rejects(newExternalDirectory(target), { code: 'EEXIST' });
+    assert.deepEqual(await readdir(output), ['sentinel']);
+    assert.equal(await readFile(join(output, 'sentinel'), 'utf8'), 'preserve original evidence');
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('errors arriving during asynchronous finalization cannot be persisted as a pass', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'strata-proof-finalization-'));
+  try {
+    for (const priorFailure of [false, true]) {
+      const output = await newExternalDirectory(join(directory, String(priorFailure)));
+      const original = { message: 'original GPU failure' };
+      const report = { status: priorFailure ? 'fail' : 'pass', browserErrors: [], ...(priorFailure ? { failure: original } : {}) };
+      assert.deepEqual(report.browserErrors, []); // The earlier run admission saw no browser errors.
+      await finalizeProofReport(report, output, async () => {
+        await new Promise(resolve => setImmediate(() => { report.browserErrors.push('late page error during close'); resolve(); }));
+        await new Promise(resolve => setImmediate(() => { report.browserErrors.push('late console error during verification'); resolve(); }));
+      });
+      const saved = JSON.parse(await readFile(join(output, 'report.json'), 'utf8'));
+      assert.equal(report.status, 'fail'); assert.equal(saved.status, 'fail');
+      assert.deepEqual(saved.browserErrors, ['late page error during close', 'late console error during verification']);
+      assert.equal(saved.failure.message, priorFailure ? original.message : `Browser errors: ${saved.browserErrors.join('\n')}`);
+      if (priorFailure) assert.equal(report.failure, original);
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('clean finalization retains pass and unexpected finalizer rejection is recorded as failure', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'strata-proof-final-status-'));
+  try {
+    for (const reject of [false, true]) {
+      const output = await newExternalDirectory(join(directory, String(reject)));
+      const report = { status: 'pass', browserErrors: [] };
+      await finalizeProofReport(report, output, async () => { if (reject) throw Error('failed cleanup'); });
+      const saved = JSON.parse(await readFile(join(output, 'report.json'), 'utf8'));
+      assert.equal(saved.status, reject ? 'fail' : 'pass');
+      if (reject) assert.match(saved.finalizationFailure, /failed cleanup/);
+      else assert.equal(saved.failure, undefined);
+    }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
