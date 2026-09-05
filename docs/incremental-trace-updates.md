@@ -198,3 +198,39 @@ its CPU tests establishes neither GPU correctness nor image quality or 60 FPS.
 No benchmark assets, generated bundles or captured images belong in Git or CI.
 CPU checks are `node --test scripts/test-trace-updates.test.mjs`, the four
 `trace-update`/`full-trace-updater` unit files, and both TypeScript configurations.
+## Hardware correctness receipt
+
+The one frozen correctness run at `ed83499eb6a12f86a94073554ffd86af8c765ac5`
+passed on Chrome 152.0.7977.82 with a non-fallback Apple Metal 3 adapter.
+Its production runtime is byte-identical to PR #40 head `1f4cfdf`; the additional
+source is diagnostic tooling and documentation. The later main wording merge
+does not relabel this evidence as a new-source run.
+
+The run verified 71 direct-update cases, 460 GPU source readbacks and 32 query
+outputs, including the canonical 912-byte/seven-write update with no static
+triangle writes. All eight states of the 512-ray closest/any corpus matched the
+full correctness control. GI, reflection and integrated pairs passed their
+cache/image, disabled-mode, moved-emitter and reset/retry checks. Candidate-only
+1 MiB streaming observed 83 mapping changes in 120 records with unchanged trace
+data. Browser/GPU errors were empty, the final source guard was unchanged, and
+all tracked renderer resources were released. This is single-device correctness,
+not elapsed-performance or general visual-quality evidence.
+
+The realized reflection/integrated plans each contain one `soft-motion-8` offset
+that differs from Node's frozen plan by one binary64 ULP, caused by cross-runtime
+`Math.sin`. Both arms used the same realized value; both values round identically
+to float32. An exhaustive follow-up comparison found only those two plan deltas,
+and CPU reconstruction of all 126 states found identical bytes in all five trace
+arrays, including node bounds. The affected GPU hashes match the frozen targets.
+Literal frozen JSON identity was therefore not achieved, even though the paired
+tracing inputs were equivalent. Original artifacts remain unchanged; subsequent
+harness runs must consume the reviewed serialized steps directly.
+
+Manifest SHA256: `d14e8cb97c98fc26778ce3e9696e14a4f5a44f9f73e4e71af93b422ee8c1f3e6`.
+Hardware report SHA256: `f9b5e5f7cebbb397d01df526d35d2c43307f55b8fb0d6f4fc7359344450b1136`.
+Complete plan-delta audit SHA256: `eaf08e2bd1f540dd733bb3c4ab5fee462e2881ae9eee8e6ecfd858e40914055a`.
+The [issue receipt](https://github.com/tylerstuff/strata/issues/20#issuecomment-5553908388)
+records exact source, external artifact paths, independent audits and limitations.
+The BigInt full control is correctness-only. Issue #20 remains open for the
+matched 30-second warmup / 60-second 720p and 1080p performance comparison using
+the original 1 MiB workload and a production-policy full maintenance control.
