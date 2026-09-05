@@ -67,4 +67,12 @@ export interface AuthoredFrameMetadata {
   readonly height: number;
   readonly debugView: 'final' | 'base-color';
   readonly timeSeconds: number;
+  /** Camera correspondence only; authored temporal resolve remains unsupported. */
+  readonly motion: {
+    /** Last successful submission in this scene, including on a reset. */
+    readonly previousSubmittedFrameId: number | null;
+    /** Individual prior points may still be outside the previous clip volume. */
+    readonly valid: boolean;
+    readonly resetReason: 'first-frame' | 'camera-cut' | 'viewport-change' | null;
+  };
 }

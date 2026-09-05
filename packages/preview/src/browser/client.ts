@@ -106,7 +106,12 @@ async function dispatch(method: string, data: unknown, signal: AbortSignal): Pro
       commit: metrics.scene, frameId: metrics.frameId,
       width: metrics.authored.width, height: metrics.authored.height,
       resolvedView: {
-        ...metrics.authored, light: scene.light, background: scene.background,
+        // Submission history changes each frame while the rendered view remains
+        // fixed. Preserve that history in metrics, outside the view revision.
+        camera: metrics.authored.camera, origin: metrics.authored.origin, aspect: metrics.authored.aspect,
+        width: metrics.authored.width, height: metrics.authored.height,
+        debugView: metrics.authored.debugView, timeSeconds: metrics.authored.timeSeconds,
+        light: scene.light, background: scene.background,
         renderer: 'authored-boxes', sceneFormatVersion: scene.version, temporal: false,
       },
       metrics,

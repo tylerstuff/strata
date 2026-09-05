@@ -168,7 +168,7 @@ function underOutput(path) {
   assert.ok(local !== '' && !local.startsWith('..') && !isAbsolute(local), `Artifact escaped external output: ${path}`);
 }
 
-async function verifyPublication(publication, ready, width, height, label) {
+async function verifyPublication(publication, ready, width, height, label, expectedPreviousFrameId = ready.frameId) {
   underOutput(publication.imagePath); underOutput(publication.receiptPath);
   assert.equal(dirname(publication.imagePath), dirname(publication.receiptPath));
   const bytes = await readFile(publication.imagePath);
@@ -197,6 +197,9 @@ async function verifyPublication(publication, ready, width, height, label) {
     assert.deepEqual(frame.authored.camera, view().camera);
     assert.deepEqual([frame.authored.width, frame.authored.height], [width, height]);
     assert.equal(frame.authored.debugView, receipt.resolvedView.debugView);
+    assert.deepEqual(frame.authored.motion, {
+      previousSubmittedFrameId: expectedPreviousFrameId, valid: true, resetReason: null,
+    }, 'Capture must retain the immediately preceding submitted load/resize frame as motion evidence');
     assert.equal(frame.triangles, 12, 'Exactly one authored box should be submitted');
   }
   assert.deepEqual(receipt.gpuTimings.map(timing => timing.frameId), receipt.submittedFrameIds);
@@ -209,6 +212,7 @@ async function verifyPublication(publication, ready, width, height, label) {
   assert.deepEqual(receipt.resolvedView.light, view().light);
   assert.deepEqual(receipt.resolvedView.background, view().background);
   assert.equal(receipt.resolvedView.temporal, false);
+  assert.equal(Object.hasOwn(receipt.resolvedView, 'motion'), false, 'Per-frame motion provenance must not change stable view identity');
   assert.equal(receipt.resolvedView.timeSeconds, 0);
   assert.equal(receipt.resolvedView.debugView, label.startsWith('final-') ? 'final' : 'base-color');
   const decoded = decodePng(bytes);
@@ -216,6 +220,7 @@ async function verifyPublication(publication, ready, width, height, label) {
   report.captures.push({ label, imagePath: publication.imagePath, receiptPath: publication.receiptPath, receiptSha256: hash(receiptText),
     image: receipt.image, sessionId: receipt.sessionId, loadId: receipt.loadId, sourceRevision: receipt.sourceRevision,
     commit: receipt.commit, viewRevision: receipt.viewRevision, submittedFrameIds: receipt.submittedFrameIds,
+    motion: receipt.frames.map(frame => ({ frameId: frame.frameId, ...frame.authored.motion })),
     gpuErrorCount: receipt.telemetry.gpuErrorCount, environment: receipt.environment });
   return { image: decoded, receipt };
 }
@@ -332,7 +337,7 @@ try {
   assert.equal(result.error, undefined); assert.equal(result.cleanupWarnings, undefined);
   assert.equal(result.receipt.sourceRevision, revisionA);
   assert.notEqual(result.receipt.sessionId, first.sessionId, 'CLI must create an independent session');
-  const cliCapture = await verifyPublication(result, { ...result.receipt, sceneId: firstScene.id, sourceRevision: revisionA }, 512, 512, 'installed-cli');
+  const cliCapture = await verifyPublication(result, { ...result.receipt, sceneId: firstScene.id, sourceRevision: revisionA }, 512, 512, 'installed-cli', 1);
   baseColorEvidence(cliCapture.image, red, -1);
   assert.equal(result.receipt.telemetry.submittedFrames, 2);
   report.cliSubmittedFrames = result.receipt.telemetry.submittedFrames;

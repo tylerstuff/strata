@@ -1,8 +1,9 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createProceduralScene, sceneRevision } from '@strata-engine/authoring';
-import type { BoxSceneDescriptor, RenderOptions, SceneCommitReceipt } from '@strata-engine/core';
+import type { AuthoredFrameMetadata, BoxSceneDescriptor, FrameMetrics, RenderOptions, SceneCommitReceipt } from '@strata-engine/core';
 import type { AuthoredPreviewLoadInput } from '../src/adapter.js';
+import type { PublishCaptureOptions } from '../src/artifacts.js';
 
 const seams = vi.hoisted(() => ({
   launch: vi.fn(), startServer: vi.fn(), readClient: vi.fn(), createEngine: vi.fn(), publishCapture: vi.fn(),
@@ -69,6 +70,7 @@ function fakeResources() {
   let submitted = 0;
   let first: number | null = null;
   let last: number | null = null;
+  let previous: { frameId: number; width: number; height: number } | null = null;
   const engine = {
     state: 'ready',
     info: { profiling: { gpuTimestampAvailable: false, reason: 'disabled' } },
@@ -77,22 +79,30 @@ function fakeResources() {
       scene = next;
       identity = { sceneGeneration: ++generation, renderer: 'authored-boxes', sceneId: next.sceneId, sourceRevision: next.sourceRevision };
       first = last = null;
+      previous = null;
       return structuredClone(identity);
     },
     setScene: vi.fn(async (options: { scene: BoxSceneDescriptor; signal: AbortSignal }) => engine.commit(options.scene)),
-    render: vi.fn((options: RenderOptions) => {
+    render: vi.fn((options: RenderOptions): FrameMetrics => {
       if (!scene) throw new Error('No fake scene committed.');
-      const camera = options.camera ?? scene.camera;
+      const camera = structuredClone(options.camera ?? scene.camera);
+      const debugView = options.debugView ?? 'final';
+      if (debugView !== 'final' && debugView !== 'base-color') throw new Error('Unsupported fake authored debug view.');
       const frameId = ++submitted;
       first ??= frameId;
       last = frameId;
+      const resetReason: AuthoredFrameMetadata['motion']['resetReason'] = previous === null ? 'first-frame'
+        : options.cameraCut ? 'camera-cut' : previous.width !== canvas.width || previous.height !== canvas.height ? 'viewport-change' : null;
+      const authored: AuthoredFrameMetadata = {
+        camera, origin: camera.position, aspect: canvas.width / canvas.height, width: canvas.width, height: canvas.height,
+        debugView, timeSeconds: options.timeSeconds ?? 0,
+        motion: { previousSubmittedFrameId: previous?.frameId ?? null, valid: resetReason === null, resetReason },
+      };
+      previous = { frameId, width: canvas.width, height: canvas.height };
       return {
         frameId, scene: structuredClone(identity), cpuSubmissionMs: 0, drawCalls: 1, dispatchCalls: 0, triangles: 12,
         uploadBytes: 0, allocatedGpuBufferBytes: 1, allocatedGpuTextureBytes: 1, wasmMemoryBytes: 65536,
-        authored: {
-          camera, origin: camera.position, aspect: canvas.width / canvas.height, width: canvas.width, height: canvas.height,
-          debugView: options.debugView ?? 'final', timeSeconds: options.timeSeconds ?? 0,
-        },
+        authored,
       };
     }),
     resize: vi.fn((width: number, height: number) => { canvas.width = width; canvas.height = height; }),
@@ -173,6 +183,50 @@ afterEach(() => {
 });
 
 describe('browser driver with actual client RPC and CPU resource doubles', () => {
+  it('captures an unchanged view as submitted motion history advances and retains the history in its receipt', async () => {
+    seams.publishCapture.mockImplementationOnce(async (options: PublishCaptureOptions) => ({
+      imagePath: '/unused-capture-output/stable-view/image.png', receiptPath: '/unused-capture-output/stable-view/receipt.json',
+      receipt: options.createReceipt({ relativePath: 'image.png', width: f.canvas.width, height: f.canvas.height, sha256: 'a'.repeat(64), bytes: 3 }),
+      cleanupWarnings: [],
+    }));
+    const session = await createPreviewSession();
+    try {
+      const ready = await session.load(source());
+      expect(ready.resolvedView).not.toHaveProperty('motion');
+      expect(f.engine.render.mock.results[0]!.value.authored.motion).toEqual({ previousSubmittedFrameId: null, valid: false, resetReason: 'first-frame' });
+      const capture = await session.capture({
+        expectedRevision: ready.sourceRevision, expectedLoadId: ready.loadId, expectedViewRevision: ready.viewRevision,
+        outputDirectory: '/unused-capture-output', captureId: 'stable-view', frames: 3,
+      });
+      expect(capture.receipt).toMatchObject({
+        viewRevision: ready.viewRevision, resolvedView: ready.resolvedView, submittedFrameIds: [2, 3, 4],
+        frames: [1, 2, 3].map(predecessor => ({ frameId: predecessor + 1,
+          authored: { motion: { previousSubmittedFrameId: predecessor, valid: true, resetReason: null } } })),
+      });
+      expect(f.engine.render).toHaveBeenCalledTimes(4);
+      expect(f.screenshot).toHaveBeenCalledTimes(1);
+      expect(seams.publishCapture).toHaveBeenCalledTimes(1);
+      expect((await session.observe()).ready).toMatchObject({ frameId: 4, viewRevision: ready.viewRevision });
+    } finally { await session.dispose(); }
+  });
+
+  it.each(['camera', 'debug-view'] as const)('still rejects a changed resolved %s before capture publication', async changed => {
+    const session = await createPreviewSession();
+    try {
+      const ready = await session.load(source()), render = f.engine.render.getMockImplementation()!;
+      f.engine.render.mockImplementationOnce(options => render(changed === 'camera'
+        ? { ...options, camera: { ...options.camera!, position: [0.25, 1, 3] } }
+        : { ...options, debugView: 'base-color' }));
+      await expect(session.capture({
+        expectedRevision: ready.sourceRevision, expectedLoadId: ready.loadId, expectedViewRevision: ready.viewRevision,
+        outputDirectory: '/unused-capture-output', captureId: 'changed-view',
+      })).rejects.toMatchObject({ code: 'PREVIEW_STALE_STATE' });
+      expect(f.engine.render).toHaveBeenCalledTimes(2);
+      expect(f.screenshot).not.toHaveBeenCalled();
+      expect(seams.publishCapture).not.toHaveBeenCalled();
+    } finally { await session.dispose(); }
+  });
+
   it('owns and disposes one server/browser/context without a real browser launch', async () => {
     const session = await createPreviewSession({ width: 640, height: 480, headless: false, channel: 'chrome' });
     const ready = await session.load(source());
