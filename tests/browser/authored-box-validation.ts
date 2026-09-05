@@ -9,7 +9,7 @@ const offsets = [0, 1000, -1000, 10000, -10000, 100000, -100000, 1000000, -10000
 const variants = ['dyadic', 'decimal'] as const;
 type Variant = typeof variants[number];
 type Capture = { color: Uint8Array<ArrayBuffer>; depth: Float32Array<ArrayBuffer>; authored: AuthoredFrameMetadata };
-type Hit = { id: number; distance: number; normal: BoxVec3; position: BoxVec3 };
+type Hit = { id: number; distance: number; normal: BoxVec3; position: BoxVec3; face: readonly [axis: number, sign: number] };
 type OracleBox = { center: BoxVec3; half: BoxVec3; axes: readonly BoxVec3[]; origin: BoxVec3 };
 type Oracle = { ids: Uint8Array; depths: Float64Array; counts: number[]; interior: Uint8Array; trace: (x: number, y: number) => Hit | null };
 
@@ -79,7 +79,7 @@ function prepareOracle(scene: BoxSceneDescriptor, camera = scene.camera): (x: nu
         exit = Math.min(exit, Math.max(a, b));
       }
       if (entry <= exit && entry >= camera.projection.near && entry < closest) {
-        closest = entry; result = { id: index + 1, distance: entry, normal: scale(box.axes[face]!, sign), position: scale(direction, entry) };
+        closest = entry; result = { id: index + 1, distance: entry, normal: scale(box.axes[face]!, sign), position: scale(direction, entry), face: [face, sign] };
       }
     }
     return result;
@@ -161,6 +161,79 @@ function classify(capture: Capture, scene: BoxSceneDescriptor): Uint8Array {
   return ids;
 }
 
+type DepthErrors = { samples: number; outsideTolerance: number; minimumSigned: number | null; maximumSigned: number | null; maximumAbsolute: number };
+const depthErrors = (): DepthErrors => ({ samples: 0, outsideTolerance: 0, minimumSigned: null, maximumSigned: null, maximumAbsolute: 0 });
+function recordDepth(errors: DepthErrors, signed: number): void {
+  errors.samples++;
+  if (Math.abs(signed) > 2e-6) errors.outsideTolerance++;
+  errors.minimumSigned = errors.minimumSigned === null ? signed : Math.min(errors.minimumSigned, signed);
+  errors.maximumSigned = errors.maximumSigned === null ? signed : Math.max(errors.maximumSigned, signed);
+  errors.maximumAbsolute = Math.max(errors.maximumAbsolute, Math.abs(signed));
+}
+
+/** Failure-only analysis of existing readback. It neither changes acceptance nor renders another frame. */
+function depthDiagnostics(capture: Capture, scene: BoxSceneDescriptor, actual: Uint8Array, referenceIds: Uint8Array,
+  referenceDepth: ArrayLike<number>, interior: Uint8Array, referenceColor?: ArrayLike<number>) {
+  const trace = prepareOracle(scene, capture.authored.camera);
+  const perObject = scene.boxes.map(box => ({ id: box.id, interiorSamples: 0, idMismatches: 0, matchingIdDepth: depthErrors() }));
+  const perFace = new Map<string, { id: string; face: Hit['face']; normal: BoxVec3; matchingIdDepth: DepthErrors }>();
+  // Bit flags: ID=1, depth=2, color=4. These seven buckets are mutually exclusive.
+  const failureNames = ['pass', 'idOnly', 'depthOnly', 'idAndDepth', 'colorOnly', 'idAndColor', 'depthAndColor', 'idDepthAndColor'] as const;
+  const exclusiveFailures = { idOnly: 0, depthOnly: 0, idAndDepth: 0, colorOnly: 0, idAndColor: 0, depthAndColor: 0, idDepthAndColor: 0 };
+  const samplesPerObject = Array<number>(scene.boxes.length + 1).fill(0);
+  const samples: ReturnType<typeof pixel>[] = [];
+  let failingPixels = 0, faceUnclassifiedSamples = 0;
+  function pixel(index: number, hit = trace(index % size, Math.floor(index / size))) {
+    const { near, far } = capture.authored.camera.projection;
+    return { x: index % size, y: Math.floor(index / size), expectedId: referenceIds[index], actualId: actual[index],
+      referenceDepth: referenceDepth[index], roundedReferenceDepth: Math.fround(referenceDepth[index]!), gpuDepth: capture.depth[index],
+      signedDepthError: capture.depth[index]! - referenceDepth[index]!, oracleId: hit?.id ?? 0,
+      cameraDepth: hit?.distance ?? null,
+      analyticDepth: hit ? far / (far - near) * (1 - near / hit.distance) : 1,
+      oracleFace: hit?.face ?? null, oracleNormal: hit?.normal ?? null };
+  }
+  for (let index = 0; index < actual.length; index++) {
+    const expected = referenceIds[index]!;
+    if (!interior[index] || expected === 0) continue;
+    const object = perObject[expected - 1]!; object.interiorSamples++;
+    const idMismatch = actual[index] !== expected, signed = capture.depth[index]! - referenceDepth[index]!;
+    let colorMismatch = false;
+    if (referenceColor) for (let channel = 0; channel < 3; channel++) {
+      if (Math.abs(capture.color[index * 4 + channel]! - referenceColor[index * 4 + channel]!) > 1) colorMismatch = true;
+    }
+    const flags = Number(idMismatch) | (Number(Math.abs(signed) > 2e-6) << 1) | (Number(colorMismatch) << 2);
+    const hit = trace(index % size, Math.floor(index / size));
+    if (idMismatch) object.idMismatches++;
+    else {
+      recordDepth(object.matchingIdDepth, signed);
+      // Face attribution is independently ray-derived, not an observed GPU face ID.
+      if (hit?.id === expected) {
+        const key = `${expected}/${hit.face[0]}/${hit.face[1]}`;
+        let face = perFace.get(key);
+        if (!face) { face = { id: object.id, face: hit.face, normal: hit.normal, matchingIdDepth: depthErrors() }; perFace.set(key, face); }
+        recordDepth(face.matchingIdDepth, signed);
+      } else faceUnclassifiedSamples++;
+    }
+    if (flags !== 0) {
+      exclusiveFailures[failureNames[flags] as keyof typeof exclusiveFailures]++;
+      failingPixels++;
+      if (samples.length < 16 && samplesPerObject[expected]! < 3) { samples.push(pixel(index, hit)); samplesPerObject[expected]!++; }
+    }
+  }
+  const front = pixel(256 * size + 252), background = pixel(0);
+  const camera = capture.authored.camera;
+  const rationalFrontApplies = scene.sceneId === 'coordinate-dyadic' && camera.position.every(value => value === 0)
+    && camera.rotation.every((value, index) => value === (index === 3 ? 1 : 0))
+    && camera.projection.near === 0.1 && camera.projection.far === 32 && front.oracleId === 1 && front.cameraDepth === 127 / 128
+    && front.oracleNormal?.every((value, index) => value === (index === 2 ? 1 : 0));
+  return { exclusiveFailures, failingPixels, perObject, perFace: [...perFace.values()], faceUnclassifiedSamples,
+    samples, sampleLimit: 16, perObjectSampleLimit: 3, droppedSamples: failingPixels - samples.length,
+    sentinels: { front: { ...front, rationalReferenceDepth: rationalFrontApplies ? 36544 / 40513 : null },
+      background: { ...background, expectedClearDepth: background.oracleId === 0 ? 1 : null } },
+    camera, width: capture.authored.width, height: capture.authored.height,
+    scope: 'Signed error is GPU minus comparison reference; face labels and analyticDepth come from the independent current-camera ray oracle. Per-face depth statistics include matching object IDs only.' };
+}
+
 function compare(capture: Capture, scene: BoxSceneDescriptor, referenceIds: Uint8Array, referenceDepth: ArrayLike<number>, interior: Uint8Array, referenceColor?: ArrayLike<number>) {
   const actual = classify(capture, scene); const counts = Array<number>(17).fill(0), intersection = Array<number>(17).fill(0), unions = Array<number>(17).fill(0);
   const expectedCount = Array<number>(17).fill(0), actualXY = Array.from({ length: 17 }, () => [0, 0]), expectedXY = Array.from({ length: 17 }, () => [0, 0]);
@@ -186,16 +259,21 @@ function compare(capture: Capture, scene: BoxSceneDescriptor, referenceIds: Uint
       actualXY[id]![1]! / measured - expectedXY[id]![1]! / expected) : expected === measured ? 0 : Infinity;
     return { id: box.id, expected, measured, iou: unions[id] ? intersection[id]! / unions[id]! : 1, centroidDriftPixels: centroid };
   });
-  return { objects, interiorSamples, badInterior, badInteriorFraction: badInterior / Math.max(1, interiorSamples), maximumDepthError, maximumInteriorColorDelta };
+  return { objects, interiorSamples, badInterior, badInteriorFraction: badInterior / Math.max(1, interiorSamples), maximumDepthError, maximumInteriorColorDelta,
+    diagnostics: badInterior > 0 ? depthDiagnostics(capture, scene, actual, referenceIds, referenceDepth, interior, referenceColor) : null };
 }
 
 function assertComparison(result: ReturnType<typeof compare>, tolerance: 'oracle' | 'offset'): void {
-  for (const box of result.objects) {
-    check(box.iou >= (tolerance === 'oracle' ? 0.98 : 0.995), `${box.id} coverage IoU=${box.iou} failed ${tolerance} comparison.`);
-    check(box.centroidDriftPixels <= (tolerance === 'oracle' ? 0.5 : 0.25), `${box.id} centroid drift=${box.centroidDriftPixels}.`);
-    if (box.expected === 0) check(box.measured === 0, 'A fully occluded box became visible.');
+  try {
+    for (const box of result.objects) {
+      check(box.iou >= (tolerance === 'oracle' ? 0.98 : 0.995), `${box.id} coverage IoU=${box.iou} failed ${tolerance} comparison.`);
+      check(box.centroidDriftPixels <= (tolerance === 'oracle' ? 0.5 : 0.25), `${box.id} centroid drift=${box.centroidDriftPixels}.`);
+      if (box.expected === 0) check(box.measured === 0, 'A fully occluded box became visible.');
+    }
+    check(result.interiorSamples > 50 && result.badInteriorFraction <= 0.001, `Interior coverage/depth failures=${result.badInterior}/${result.interiorSamples}.`);
+  } catch (cause) {
+    throw new Error(`${cause instanceof Error ? cause.message : String(cause)}; comparison=${JSON.stringify({ tolerance, ...result })}`, { cause });
   }
-  check(result.interiorSamples > 50 && result.badInteriorFraction <= 0.001, `Interior coverage/depth failures=${result.badInterior}/${result.interiorSamples}.`);
 }
 
 function sameBytes(a: ArrayBufferView, b: ArrayBufferView): boolean {
@@ -251,6 +329,10 @@ export async function runAuthoredBoxValidation({ software = false } = {}) {
   const references = validateAuthoredBoxReference();
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); check(adapter, 'No WebGPU adapter.');
   if (!software) check(adapter.info.isFallbackAdapter !== true, 'Hardware correctness request received a fallback adapter.');
+  const environment = { softwareRequested: software, browser: { userAgent: navigator.userAgent, platform: navigator.platform },
+    adapter: { vendor: adapter.info.vendor, architecture: adapter.info.architecture, device: adapter.info.device,
+      description: adapter.info.description, isFallbackAdapter: adapter.info.isFallbackAdapter ?? null } };
+  let stage = 'device-initialization';
   const device = await adapter.requestDevice(); const errors: string[] = []; let expectedDestroy = false, lost: { reason: string; message: string } | null = null;
   device.addEventListener('uncapturederror', event => errors.push(event.error.message));
   void device.lost.then(value => { if (!expectedDestroy) lost = { reason: value.reason, message: value.message }; });
@@ -282,11 +364,13 @@ export async function runAuthoredBoxValidation({ software = false } = {}) {
   try {
     for (const variant of variants) {
       console.info(`Authored correctness: ${variant} static offset witnesses.`);
+      stage = `${variant}/static/origin/oracle`;
       const originScene = authoredValidationScene(variant), reference = oracle(originScene), baseline = await renderOnce(originScene);
       const independent = compare(baseline, originScene, reference.ids, reference.depths, reference.interior); assertComparison(independent, 'oracle');
       const baselineIds = classify(baseline, originScene); const captures: unknown[] = [];
       const originPacked = packWorldCoordinateFrame(originScene.boxes, originScene.camera, { ...originScene.camera.projection, aspect: 1 });
       for (const offset of offsets.slice(1)) {
+        stage = `${variant}/static/${offset}/offset`;
         const scene = authoredValidationScene(variant, offset); const current = await renderOnce(scene);
         const comparison = compare(current, scene, baselineIds, baseline.depth, reference.interior, baseline.color); assertComparison(comparison, 'offset');
         const exactColor = sameBytes(current.color, baseline.color), exactDepth = sameBytes(current.depth, baseline.depth);
@@ -297,8 +381,10 @@ export async function runAuthoredBoxValidation({ software = false } = {}) {
       }
       const controls = [];
       for (const offset of [100000, 1000000]) {
-        const invalid = await renderOnce(earlyFloat32(authoredValidationScene(variant, offset)));
-        const comparison = compare(invalid, originScene, baselineIds, baseline.depth, reference.interior, baseline.color);
+        stage = `${variant}/early-f32/${offset}`;
+        const invalidScene = earlyFloat32(authoredValidationScene(variant, offset));
+        const invalid = await renderOnce(invalidScene);
+        const comparison = compare(invalid, invalidScene, baselineIds, baseline.depth, reference.interior, baseline.color);
         const failedWitnesses = comparison.objects.filter(box => box.iou < 0.995 || box.centroidDriftPixels > 0.25);
         const gapWitnessFailed = failedWitnesses.some(box => box.id === 'gap-left' || box.id === 'gap-right');
         // At 100km the dyadic gap can close numerically yet retain the same covered pixel columns.
@@ -310,11 +396,13 @@ export async function runAuthoredBoxValidation({ software = false } = {}) {
       images.push({ name: `${variant}-base-color`, base64: image(baseline), authored: baseline.authored });
 
       // Reuse renderers while only the camera moves; every paired step is compared, with no temporal settling.
+      stage = `${variant}/paired-motion/setup`;
       const farScene = authoredValidationScene(variant, 1000000);
       const nearRenderer = await AuthoredBoxRenderer.create(device, 'rgba8unorm', originScene), farRenderer = await AuthoredBoxRenderer.create(device, 'rgba8unorm', farScene);
       let changedFrames = 0, maximumColorDelta = 0, maximumDepthDelta = 0; let previous: Capture | undefined;
       try {
         for (let step = 0; step < 32; step++) {
+          stage = `${variant}/paired-motion/${step}`;
           const shift = (step - 16) / (variant === 'dyadic' ? 1024 : 1000);
           const nearCamera: BoxCamera = { ...originScene.camera, position: add(originScene.camera.position, [shift, 0, 0]) };
           const farCamera: BoxCamera = { ...farScene.camera, position: add(farScene.camera.position, [shift, 0, 0]) };
@@ -342,6 +430,7 @@ export async function runAuthoredBoxValidation({ software = false } = {}) {
     }
 
     console.info('Authored correctness: direct PBR light/material witnesses.');
+    stage = 'dyadic/origin/direct-pbr';
     const scene = authoredValidationScene('dyadic'), reference = oracle(scene), direct = await renderOnce(scene, 'final');
     const darkScene = { ...scene, light: { ...scene.light, radiance: [0, 0, 0] as const } }, dark = await renderOnce(darkScene, 'final');
     check(dark.color.every((value, index) => index % 4 === 3 ? value === 255 : value === 0), 'Zero radiance produced ambient/emissive light.');
@@ -359,7 +448,7 @@ export async function runAuthoredBoxValidation({ software = false } = {}) {
       device: adapter.info.device, description: adapter.info.description, isFallbackAdapter: adapter.info.isFallbackAdapter ?? null },
       references, frameCount, results, images, gpuErrors: errors, deviceLost: lost,
       scope: 'Production renderer + packer, GPU color/depth readback; 16 roots, 15 expected visible and one intentionally occluded. Subpixel gap is not an empty-pixel guarantee. Box face normals check rotation/sign/stride; inverse-transpose necessity requires the separate oblique CPU oracle. No shadows, temporal rendering, GI or reflections.' };
-  } catch (cause) { throw new Error(`${cause instanceof Error ? cause.message : String(cause)}; GPU diagnostics=${JSON.stringify({ errors, lost })}`, { cause }); }
+  } catch (cause) { throw new Error(`${cause instanceof Error ? cause.message : String(cause)}; GPU diagnostics=${JSON.stringify({ stage, ...environment, errors, lost })}`, { cause }); }
   finally { staging.destroy(); target.destroy(); expectedDestroy = true; device.destroy(); }
 }
 
