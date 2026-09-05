@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ImportedRenderer } from '../../packages/core/src/imported/imported-renderer.js';
 import { ImportedGeometry, importedTextureExtent } from '../../packages/core/src/imported/imported-geometry.js';
+import { environmentTextureBytes, environmentUniformBytes } from '../../packages/core/src/imported/imported-environment.js';
 import type { ImportedAsset, ImportedMaterial, ImportedTexture } from '../../packages/core/src/imported/imported-types.js';
 
 const material: ImportedMaterial = { name: 'test', baseColorFactor: [1, 1, 1, 1], metallicFactor: 0, roughnessFactor: .5, emissiveFactor: [0, 0, 0], emissiveStrength: 1, normalScale: 1, occlusionStrength: 1, alphaMode: 'OPAQUE', alphaCutoff: .5, doubleSided: false };
@@ -45,7 +46,7 @@ describe('imported scene resource and temporal contracts', () => {
     const geometry = await ImportedGeometry.create(g.device, textured());
     expect(geometry.telemetry.textures).toHaveLength(2);
     expect(geometry.telemetry.textures.map(t => [t.uploadWidth, t.uploadHeight, t.colorSpace, t.mipLevels])).toEqual([[4, 2, 'srgb', 3], [4, 2, 'linear', 3]]);
-    expect(geometry.gpuTextureBytes).toBe(96); // 2*44 mip bytes + two 4-byte fallbacks.
+    expect(geometry.gpuTextureBytes).toBe(96 + environmentTextureBytes); // Texture role copies, white fallbacks, fixed generated environment.
     expect(g.raw.queue.copyExternalImageToTexture).toHaveBeenCalledTimes(2);
     expect(g.raw.queue.submit).toHaveBeenCalledTimes(2);
     for (const b of bitmaps) expect(b.close).toHaveBeenCalledOnce();
@@ -86,6 +87,50 @@ describe('imported scene resource and temporal contracts', () => {
     const g = gpu(), a = textured(8192); const decode = vi.fn(); vi.stubGlobal('createImageBitmap', decode);
     await expect(ImportedGeometry.create(g.device, { ...a, images: [{ ...a.images[0]!, width: 8192, height: 8192 }] })).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
     expect(decode).not.toHaveBeenCalled(); expect(g.raw.createTexture).not.toHaveBeenCalled(); expect(g.raw.createBuffer).not.toHaveBeenCalled();
+  });
+  it('snapshots environment and shading, replaces whole lighting, resets history and keeps bounded resources across toggles', async () => {
+    const g = gpu(), geometry = await ImportedGeometry.create(g.device, asset());
+    const bytes = geometry.gpuTextureBytes, resources = g.textures.length;
+    expect(geometry.telemetry.shading).toBe('authored'); expect(geometry.telemetry.environment).toBeNull();
+    const environment = { preset: 'studio' as const, intensity: 1, rotationRadians: Math.PI / 2 };
+    const lighting = { directionToLight: [0, 1, 0] as const, color: [1, 1, 1] as const, intensity: 2, ambient: [0, 0, 0] as const, environment };
+    expect(geometry.update({ shading: 'relit', lighting })).toBe(true);
+    environment.intensity = 4;
+    expect(geometry.telemetry.environment?.intensity).toBe(1);
+    expect(geometry.prepare(true, false)).toBe(48 + environmentUniformBytes);
+    expect(g.writes.filter(w => w.label === 'Strata imported environment and shading').at(-1)!.data[4]).toBe(1);
+    const returned = geometry.telemetry.environment! as { intensity: number }; returned.intensity = 8;
+    expect(geometry.telemetry.environment?.intensity).toBe(1);
+    expect(geometry.update()).toBe(false);
+    expect(geometry.update({ lighting: { ...lighting, environment: null } })).toBe(true);
+    expect(geometry.telemetry.environment).toBeNull();
+    geometry.update({ lighting });
+    const { environment: _environment, ...replacement } = lighting;
+    geometry.update({ lighting: replacement });
+    expect(geometry.telemetry.environment).toBeNull();
+    expect(geometry.telemetry.shading).toBe('relit');
+    expect(geometry.update({ shading: 'authored' })).toBe(true);
+    expect(geometry.gpuTextureBytes).toBe(bytes); expect(g.textures).toHaveLength(resources);
+    geometry.dispose(); for (const resource of [...g.buffers, ...g.textures]) expect(resource.destroy).toHaveBeenCalledOnce();
+  });
+  it('rejects invalid environment/shading atomically before publishing a new light or camera', async () => {
+    const g = gpu(), geometry = await ImportedGeometry.create(g.device, asset());
+    const before = structuredClone(geometry.telemetry);
+    const light = { directionToLight: [0, 1, 0] as const, color: [1, 1, 1] as const, intensity: 2, ambient: [0, 0, 0] as const };
+    for (const environment of [[], { preset: 'invalid', intensity: 1 }, { preset: 'sky', intensity: NaN }, { preset: 'sky', intensity: -1 }, { preset: 'sky', intensity: 65 }, { preset: 'sky', intensity: 1, rotationRadians: Infinity }, { preset: 'sky', intensity: 1, rotationRadians: null }]) {
+      expect(() => geometry.update({ lighting: { ...light, environment } } as never)).toThrow();
+      expect(geometry.telemetry).toEqual(before);
+    }
+    expect(() => geometry.update({ shading: 'unknown' } as never)).toThrow();
+    expect(geometry.telemetry).toEqual(before); geometry.dispose();
+  });
+  it('destroys all partial environment resources on an upload failure', async () => {
+    const g = gpu();
+    g.raw.queue.writeTexture.mockImplementation((destination: unknown) => {
+      if ((destination as { texture: { descriptor: { label?: string } } }).texture.descriptor.label?.includes('GGX')) throw new Error('environment upload failure');
+    });
+    await expect(ImportedGeometry.create(g.device, asset())).rejects.toThrow('environment upload failure');
+    for (const resource of [...g.buffers, ...g.textures]) expect(resource.destroy).toHaveBeenCalledOnce();
   });
   it.each([
     ['missing doubleSided', { doubleSided: undefined }], ['nonboolean doubleSided', { doubleSided: 1 }], ['nonboolean unlit', { unlit: 'true' }],

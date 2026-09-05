@@ -15,7 +15,7 @@ import type { IntegratedSceneOptions, IntegratedTelemetry } from './integrated/i
 import type { AuthoredBoxSceneOptions, AuthoredFrameMetadata, BoxCamera } from './rendering/authored-box-types.js';
 export type { AuthoredBoxSceneOptions, AuthoredFrameMetadata, BoxCamera, BoxSceneDescriptor, AuthoredBox, BoxVec3, BoxQuaternion } from './rendering/authored-box-types.js';
 
-export type { ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip } from './imported/imported-types.js';
+export type { ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip, ImportedEnvironment } from './imported/imported-types.js';
 import type { ImportedSceneOptions, ImportedControls, ImportedTelemetry } from './imported/imported-types.js';
 
 export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions | ReflectionSceneOptions | IntegratedSceneOptions | AuthoredBoxSceneOptions | ImportedSceneOptions;

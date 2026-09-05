@@ -1,5 +1,8 @@
+import { importedEnvironmentShader } from './imported-environment.js';
+
 /** Appended to the production raster shader; frame, shadow and GGX code are shared. */
 export const importedShader = /* wgsl */ `
+${importedEnvironmentShader}
 struct ImportedMaterial {
   base: vec4f,
   emissive: vec4f,
@@ -116,22 +119,27 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let emission = textureSample(importedEmissive, importedEmissiveSampler, input.uv).rgb * importedMaterial.emissive.rgb * importedMaterial.emissive.a;
   let base = baseSample * importedMaterial.base * input.color;
   if (importedMaterial.alpha.y > 0.5 && base.a < importedMaterial.alpha.x) { discard; }
-  let roughness = clamp(mr.g * importedMaterial.factors.y, 0.06, 1.0);
-  let metallic = clamp(mr.b * importedMaterial.factors.x, 0.0, 1.0);
+  let relit = importedMaterial.alpha.w > 0.5 && importedEnvironmentSettings.modes.x > 0.5;
+  let unlit = importedMaterial.alpha.w > 0.5 && !relit;
+  let roughness = select(clamp(mr.g * importedMaterial.factors.y, 0.06, 1.0), 0.65, relit);
+  let metallic = select(clamp(mr.b * importedMaterial.factors.x, 0.0, 1.0), 0.0, relit);
   let n = normalize(input.normal);
   let t = normalize(input.tangent.xyz - n * dot(n, input.tangent.xyz));
   let b = cross(n, t) * input.tangent.w;
   let mapped = normalize(vec3f(normalSample.xy * importedMaterial.factors.z, normalSample.z));
   // glTF flips the shaded normal on a double-sided backface, including normal mapping.
-  let normal = select(n, normalize(mat3x3f(t, b, n) * mapped), importedMaterial.alpha.z > 0.5) * select(-1.0, 1.0, front);
+  let normal = select(n, normalize(mat3x3f(t, b, n) * mapped), importedMaterial.alpha.z > 0.5 && !relit) * select(-1.0, 1.0, front);
   let shadow = shadowVisibility(input.world);
+  let view = normalize(frame.eyeTime.xyz - input.world);
   let direct = evaluateDirectLight(base.rgb, roughness, metallic, normal,
-    normalize(frame.eyeTime.xyz - input.world), importedLight.direction.xyz, importedLight.radiance.rgb) * shadow;
+    view, importedLight.direction.xyz, importedLight.radiance.rgb) * shadow;
   // Explicit diffuse fill, affected only by the asset's baked AO. This is not world-space GI or IBL.
-  let fill = base.rgb * (1.0 - metallic) * importedLight.ambient.rgb * occlusion;
+  let materialAo = select(occlusion, 1.0, relit);
+  let fill = base.rgb * (1.0 - metallic) * importedLight.ambient.rgb * materialAo;
+  let environment = importedEnvironmentLight(base.rgb, roughness, metallic, normal, view, materialAo);
   var output: GBufferOutput;
-  output.hdr = vec4f(select(direct + fill + emission, base.rgb, importedMaterial.alpha.w > 0.5), shadow);
-  output.normal = vec4f(select(normal, n * select(-1.0, 1.0, front), importedMaterial.alpha.w > 0.5), roughness);
+  output.hdr = vec4f(select(direct + fill + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
+  output.normal = vec4f(select(normal, n * select(-1.0, 1.0, front), unlit), roughness);
   output.material = vec4f(base.rgb, metallic);
   let currentUv = input.currentClip.xy / input.currentClip.w * vec2f(0.5, -0.5) + vec2f(0.5);
   let previousUv = input.previousClip.xy / input.previousClip.w * vec2f(0.5, -0.5) + vec2f(0.5);
