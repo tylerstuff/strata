@@ -1,30 +1,27 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { arch, cpus, homedir, platform, release } from 'node:os';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 import { createBenchmarkServer } from './benchmark-server.mjs';
 import { createGalleryFixture } from './gallery-fixture.mjs';
+import { prepareGalleryOutput } from './gallery-output.mjs';
 import { runGalleryAssertions } from '../tests/browser/gallery-assertions.mjs';
 
 const repository = fileURLToPath(new URL('../', import.meta.url));
 const command = promisify(execFile);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-const within = (root, candidate) => { const path = relative(root, candidate); return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path)); };
 let output;
 for (let index = 2; index < process.argv.length; index++) {
   if (process.argv[index] === '--output' && process.argv[index + 1] && !process.argv[index + 1].startsWith('--')) output = process.argv[++index];
   else throw new Error(`Unknown or incomplete gallery validation argument: ${process.argv[index]}`);
 }
-const outputDirectory = resolve(output ?? resolve(homedir(), 'Downloads/Strata-Gallery-Checks',
+const outputDirectory = await prepareGalleryOutput(output ?? resolve(homedir(), 'Downloads/Strata-Gallery-Checks',
   `${new Date().toISOString().replaceAll(':', '-')}-gallery-functional`));
-assert(!within(repository, outputDirectory), 'Gallery captures must remain outside the repository.');
-await mkdir(outputDirectory, { recursive: true });
-assert(!within(await realpath(repository), await realpath(outputDirectory)), 'Gallery output resolves into the repository.');
 const report = {
   kind: 'strata-gallery-functional', status: 'running', performanceEvidence: false, externalCollectionUsed: false,
   softwareGpuRequested: process.env.STRATA_TEST_SOFTWARE_GPU === '1',
@@ -59,7 +56,7 @@ async function builtFiles(directory, prefix) {
 
 async function identity() {
   const files = ['examples/gallery/index.html', 'examples/gallery/gallery.css', 'examples/gallery/app.js',
-    'scripts/test-gallery.mjs', 'scripts/gallery-fixture.mjs', 'scripts/benchmark-server.mjs', 'scripts/gallery-catalog.mjs',
+    'scripts/test-gallery.mjs', 'scripts/gallery-fixture.mjs', 'scripts/gallery-output.mjs', 'scripts/benchmark-server.mjs', 'scripts/gallery-catalog.mjs',
     'tests/browser/gallery-assertions.mjs'];
   return { ...await revision(), builtRuntime: await builtFiles(resolve(repository, 'packages/core/dist'), 'packages/core/dist/'),
     inputs: await Promise.all(files.map(async path => ({ path, sha256: hash(await readFile(resolve(repository, path))) }))) };
