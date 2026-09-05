@@ -3,6 +3,30 @@ import type { CameraFrame } from '../rendering/raster-math.js';
 import type { ReflectionControls, ReflectionMode } from './reflection-types.js';
 
 export type ReflectionVector = readonly [number, number, number];
+/** Raw samples retain current provenance; blended/reused estimates use history. */
+export const reflectionSources = Object.freeze({
+  zero: 0, worldHit: 1, probeFallback: 2, history: 3, traversalFailure: 4, worldMiss: 5,
+} as const);
+export type ReflectionSource = typeof reflectionSources[keyof typeof reflectionSources];
+export interface ReflectionRadianceSample { radiance: ReflectionVector; source: ReflectionSource }
+
+/** Scalar reference for the production temporal sample step; qualification happens separately.
+ * A completed bounded-world miss has zero incident radiance: this prototype has no environment light.
+ * A valid sample is not a converged estimate. Mixed output is labelled history, never a fresh hit.
+ */
+export function accumulateReflectionSample(current: ReflectionRadianceSample, history: ReflectionVector | undefined,
+  roughness: number, historyWeight = 0.8): ReflectionRadianceSample {
+  if (![...current.radiance, ...(history ?? []), roughness, historyWeight].every(Number.isFinite)
+    || roughness < 0 || roughness > 0.35 || historyWeight < 0 || historyWeight > 1
+    || !Object.values(reflectionSources).includes(current.source)) throw new RangeError('Invalid reflection accumulation input.');
+  if (current.source !== reflectionSources.zero && current.source !== reflectionSources.worldHit && current.source !== reflectionSources.worldMiss) {
+    return { radiance: [0, 0, 0], source: current.source };
+  }
+  const radiance: ReflectionVector = current.source === reflectionSources.worldMiss ? [0, 0, 0] : current.radiance;
+  if (history && roughness > 0) return { radiance: radiance.map((value, axis) => value * (1 - historyWeight) + history[axis]! * historyWeight) as unknown as ReflectionVector,
+    source: reflectionSources.history };
+  return { radiance, source: current.source };
+}
 export interface NormalizedReflectionControls {
   mode: ReflectionMode; roughness: number; maxDistance: number; updateEvery: number;
   objectOffset: number; resetHistory: boolean;
@@ -88,7 +112,8 @@ export function reflectionCandidateRegion(camera: CameraFrame, width: number, he
 export interface ReflectionHistoryQuery { epoch: number; frameIndex: number; maxAge: number; depth: number; normal: ReflectionVector; roughness: number }
 export interface ReflectionHistoryTap { epoch: number; freshFrame: number; source: number; depth: number; normal: ReflectionVector; roughness: number; reflector: boolean }
 export function acceptsReflectionHistory(query: ReflectionHistoryQuery, tap: ReflectionHistoryTap): boolean {
-  return tap.reflector && (tap.source === 0 || tap.source === 1 || tap.source === 3) && tap.epoch === query.epoch && tap.freshFrame <= query.frameIndex
+  return tap.reflector && (tap.source === reflectionSources.zero || tap.source === reflectionSources.worldHit
+    || tap.source === reflectionSources.history || tap.source === reflectionSources.worldMiss) && tap.epoch === query.epoch && tap.freshFrame <= query.frameIndex
     && query.frameIndex - tap.freshFrame <= query.maxAge && tap.depth > 0 && query.depth > 0
     && Math.abs(tap.depth - query.depth) <= Math.max(0.02, query.depth * 0.01)
     && dot(tap.normal, query.normal) >= 0.98 && Math.abs(tap.roughness - query.roughness) <= 0.005;

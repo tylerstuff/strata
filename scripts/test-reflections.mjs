@@ -48,7 +48,7 @@ try {
   if (!process.argv.includes('--smoke')) {
     report.results.cases = []; report.images = [];
     await page.evaluate(async () => (await import('/reflection-validation.js')).startReflectionValidation());
-    for (const name of ['cold-world', 'history', 'move-minus', 'move-plus', 'rough', 'camera-cut', 'fallback', 'off', 'probe-only-cold', 'probe-only-warm', 'resize', 'temporal-toggle']) {
+    for (const name of ['cold-world', 'history', 'move-minus', 'move-plus', 'rough', 'camera-cut', 'bounded-miss', 'off', 'probe-only-cold', 'probe-only-warm', 'resize', 'temporal-toggle']) {
       console.log(`Reflection case: ${name}`);
       const result = await page.evaluate(async name => (await import('/reflection-validation.js')).runReflectionCase(name), name);
       report.results.cases.push(result);

@@ -193,7 +193,7 @@ async function step(patch: Controls = {}, time = 0, capture = true) {
   const image = mode === 'off' && !s.renderer.giTelemetry.enabled ? await readTexture(s.device, target) : await readTexture(s.device, s.renderer.composer.outputTexture!);
   const metadata = await readTexture(s.device, diagnostic.metadataTexture); const raw = await readTexture(s.device, diagnostic.rawTexture);
   const rawMetadata = await readTexture(s.device, diagnostic.rawMetadataTexture); const counters = await readStats(s.device, diagnostic.statisticsBuffer);
-  const sourceCounts = [0, 0, 0, 0, 0]; let selectedPixels = 0;
+  const sourceCounts = [0, 0, 0, 0, 0, 0]; let selectedPixels = 0;
   const expectedSkipped = mode === 'world' && telemetry.scheduledCandidates === 0 ? ['reflection-trace'] : [];
   require(JSON.stringify(stats.skippedGpuPasses ?? []) === JSON.stringify(expectedSkipped),
     'Reflection skipped-query metadata disagrees with whether tracing dispatched.');
@@ -201,7 +201,7 @@ async function step(patch: Controls = {}, time = 0, capture = true) {
     require(counters[0] === telemetry.scheduledCandidates && counters[1]! <= counters[0]! && counters[2]! <= counters[1]!, `Reflection work exceeded declared quota: ${counters}`);
     require(counters[5] === 0 && counters[3]! + counters[4]! === counters[1], `Reflection traversal did not finish correctly: ${counters}`);
     for (let i = 0; i < metadata.values.length; i += 4) if (metadata.values[i + 3]) {
-      const source = metadata.values[i]!; require(source >= 0 && source <= 3, `Unexpected reflection source ${source}`);
+      const source = metadata.values[i]!; require([0, 1, 2, 3, 5].includes(source), `Unexpected reflection source ${source}`);
       require(metadata.values[i + 2] === telemetry.cacheEpoch, 'Resolved reflection retained an old epoch.');
       sourceCounts[source]!++; selectedPixels++;
     }
@@ -280,12 +280,14 @@ export async function runReflectionCase(name: string) {
     result = (await step({ cameraCut: true, reflections: { roughness: 0, objectOffset: 0, updateEvery: 4 } }))!;
     require(result.telemetry.cacheEpoch !== oldEpoch && result.counters[6] === 0, 'Camera cut retained old reflected history.');
     evidence.oracle = checkMirrorOracle(result.raw);
-  } else if (name === 'fallback') {
+  } else if (name === 'bounded-miss') {
     result = (await step({ debugView: 'reflection-source', reflections: { maxDistance: 1, updateEvery: 1 } }))!;
     const center = prior.get('cold-world')!.metrics.centroid!; const index = (Math.round(center[1]!) * result.image.width + Math.round(center[0]!)) * 4;
-    require(result.image.values[index + 2]! > .99 && result.image.values[index + 1]! < .31, 'Max-distance miss did not display explicit blue probe fallback.');
-    require(result.sourceCounts[2]! > 25 && result.raw.values.filter((v, i) => i % 4 === 0 && v > 2).length === 0, 'Short trace unexpectedly reached the emissive cube.');
-    evidence.fallbackPixel = result.image.values.slice(index, index + 3);
+    require(result.image.values[index + 2]! > .99 && result.image.values[index + 1]! > .89 && result.image.values[index]! < .01,
+      'Max-distance miss did not display explicit cyan completed-miss provenance.');
+    require(result.sourceCounts[5]! > 25 && result.raw.values.filter((v, i) => i % 4 === 0 && v > 2).length === 0, 'Short trace unexpectedly reached the emissive cube.');
+    evidence.completedMissPixel = result.image.values.slice(index, index + 3);
+    evidence.boundaryCondition = 'No represented contributor inside maxDistance; zero incident radiance, not a probe approximation.';
   } else if (name === 'off') {
     result = (await step({ reflections: { mode: 'off', maxDistance: 16, updateEvery: 1, roughness: 0, objectOffset: 0 } }))!; require(result.stats.dispatchCalls === 0 && result.metrics.total === 0, 'Disabled reflection still produced tracing or a reflection debug image.');
   } else if (name === 'probe-only-cold') {
