@@ -196,7 +196,7 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
       },
       quality: options.renderer !== 'diffuse' ? {
         shadowMapSize: 2048, shadowKernel: '3x3-comparison', materialFixture: integrated ? 'shared-courtyard-lambert-metallic-v1' : reflections ? 'shared-metallic-reflector-v1' : gi ? 'shared-flat-lambertian-v1' : virtual ? 'terrain-checker-v1' : 'checker-metal-rough-v1', exposure: 1,
-        temporalFilter: 'depth-qualified-bilinear-clamped-v1', temporalHistoryWeight: 0.9, jitterSequenceLength: 8,
+        temporalFilter: 'depth-qualified-catmull-rom-with-positive-bilinear-fallback-clamped-v1', temporalHistoryWeight: 0.9, jitterSequenceLength: 8,
         ...(virtual ? { geometryMode: options.geometryMode, residencyPolicy: options.residencyPolicy, poolBytes: options.poolBytes, pixelError: options.pixelError, pageLoadDelayMs: options.pageLoadDelayMs,
           shadowGeometry: 'selected-visible-lod-and-offscreen-roots', manifestUrl: options.manifestUrl } : {}),
         ...(integrated ? { traceProxyUrl: options.traceProxyUrl, terrainColor: options.terrainColor,
@@ -221,6 +221,9 @@ async function run(input: Partial<BenchmarkOptions> = {}) {
         externalAssetsUsed: virtual, steadyUploadBytes: finalTelemetry.totalUploadBytes - measuredStartTelemetry.totalUploadBytes,
         documentResourceTransferBytes: entries.reduce((sum, entry) => sum + entry.transferSize, 0), documentResourceDecodedBytes: entries.reduce((sum, entry) => sum + entry.decodedBodySize, 0),
         ...(virtual ? { geometryAtCaptureStart: measuredStartTelemetry.geometry, geometryAtCaptureEnd: geometry } : {}),
+        ...(lighting ? { giAtCaptureStart: measuredStartTelemetry.gi, reflectionsAtCaptureStart: measuredStartTelemetry.reflections,
+          giAtCaptureEnd: frames.at(-1)?.gi, reflectionsAtCaptureEnd: frames.at(-1)?.reflections,
+          traceCounterWindow: 'capture-start telemetry through final measured submission; excludes post-capture timing drain' } : {}),
         note: 'Document resource totals can omit worker/cache traffic. Geometry counters separately record completed page bytes and uploads; final counters may include requests completing during the bounded post-capture GPU readback flush.',
       },
       allocations: { ...finalTelemetry, note: 'Explicit app-owned GPU buffers/textures and WASM linear memory. Excludes swapchain, driver allocation, browser memory, and JavaScript heap.' },

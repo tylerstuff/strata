@@ -295,6 +295,10 @@ Independent RAF timing means frame counts and sinusoidal samples can differ.
 Capture-start trace counters make the first measured delta explicit; final trace
 counters come from the last measured frame, separately from post-capture drains.
 Images at t0/3/5/16/32 and disposal diagnostics are collected outside timing.
+The original nonblank-image admission gate applies to t0. Every additional image
+must be captured and hashed with the fixed submission count; its brightness
+metrics remain diagnostic, since the t16 scenario intentionally switches the sun
+off. A missing capture still fails the run.
 
 The offline summary reports fixed time windows, positive-target-delta opening
 CPU samples, actual uploads, GPU sample coverage, cadence and tracked memory.
