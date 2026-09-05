@@ -247,6 +247,16 @@ export async function validateImportedSpatial() {
       const tiny = planar(); tiny[40] = { ...tiny[40]!, guide: { ...tiny[40]!.guide, rho: [rho, .25, .75] } };
       await runCase(`tiny-rho-${rho}-whole-channel-fallback`, tiny, 9, 9);
     }
+    const heterogeneous = planar();
+    heterogeneous[40] = { ...heterogeneous[40]!, sum: [16, 8, 48] };
+    heterogeneous[41] = { ...heterogeneous[41]!, guide: { ...heterogeneous[41]!.guide, rho: [2 ** -17, .25, .75] } };
+    const channelFallback = await runCase('heterogeneous-unsafe-donor-fallback-is-channel-local', heterogeneous, 9, 9);
+    require(channelFallback.center?.[0] === .125 + .25,
+      'Unsafe eligible red donor was omitted/renormalized instead of preserving the heterogeneous raw center.');
+    // Green remains eligible: the center's lower raw value must gather its
+    // neighbors. This distinguishes whole-pixel fallback from channel fallback.
+    require(channelFallback.center![1] > .25 + .125 && channelFallback.center![1] < .25 + .25,
+      'A red-channel fallback incorrectly prevented independent green reconstruction.');
     const underflow = planar(); underflow[40] = { ...underflow[40]!, sum: [2 ** -120, 16, 48] };
     await runCase('positive-donor-below-normal-irradiance-domain', underflow, 9, 9);
     for (const bad of [float(1), NaN, Infinity, -1, 65504 * 64 + 1024]) {
@@ -474,18 +484,40 @@ export async function validateImportedSpatial() {
       } finally { removeBuffer(readback); }
     }
     const firstTrace = await traceSweep(true), firstGuide = new DataView(firstTrace.guideBytes);
+    // The rescaled triangle intersection need not produce exact dyadic weights.
+    // Even constant source color is reconstructed through w0=(1-b1)-b2 and
+    // three weighted additions. Allow gamma(8) for these at-most eight rounded
+    // subtract/multiply/add operations (FMA contraction does not increase this
+    // budget), with positive fixture weights and IEEE-f32 unit roundoff2^-24.
+    // This bounds interpolation of the ideal constant; it does NOT relax actual
+    // cached-rho transport or ordinary/optional raw-word parity below.
+    const interpolationUnitRoundoff = 2 ** -24, interpolationRoundings = 8;
+    const analyticRhoRelativeBound = interpolationRoundings * interpolationUnitRoundoff / (1 - interpolationRoundings * interpolationUnitRoundoff);
+    let maxAnalyticRhoRelativeError = 0, nonDiagonalPackedIdentityChecks = 0;
     for (let i = 0; i < 64; i++) {
       require(firstTrace.words[i * 8 + 3] === 1 && firstTrace.words[i * 8 + 4] === 1 && firstTrace.words[i * 8 + 5] === 0, 'Trace comparison did not complete exactly one sample.');
-      [.125, .5, 1.5].forEach((v, c) => require(firstTrace.words[i * 8 + c] === bits(v),
-        `Independent constant-environment rho*L oracle failed at pixel${i}, channel${c}: actual=${float(firstTrace.words[i * 8 + c]!)} word=${firstTrace.words[i * 8 + c]}, expected=${v} word=${bits(v)}.`));
-      [.25, .5, .75].forEach((v, c) => require(firstGuide.getUint32(16 + i * 32 + c * 4, true) === bits(v),
-        `Guide rho differs at pixel${i}, channel${c}: actual=${firstGuide.getFloat32(16 + i * 32 + c * 4, true)} word=${firstGuide.getUint32(16 + i * 32 + c * 4, true)}, expected=${v} word=${bits(v)}.`));
+      [.25, .5, .75].forEach((idealRho, c) => {
+        const actualRho = firstGuide.getFloat32(16 + i * 32 + c * 4, true), radiance = [.5, 1, 2][c]!;
+        const expectedSampleWord = bits(actualRho * radiance);
+        require(firstTrace.words[i * 8 + c] === expectedSampleWord,
+          `Cached-rho transport changed at pixel${i}, channel${c}: sampleWord=${firstTrace.words[i * 8 + c]}, cachedRho=${actualRho}, expectedWord=${expectedSampleWord}.`);
+        const relativeError = Math.abs(actualRho - idealRho) / idealRho;
+        require(Number.isFinite(actualRho) && relativeError <= analyticRhoRelativeBound,
+          `Constant-color interpolation at pixel${i}, channel${c}: actual=${actualRho}, ideal=${idealRho}, relativeError=${relativeError}, gamma8=${analyticRhoRelativeBound}.`);
+        maxAnalyticRhoRelativeError = Math.max(maxAnalyticRhoRelativeError, relativeError);
+      });
       const identity = firstGuide.getUint32(16 + i * 32 + 12, true);
       require((identity & 0xfff00000) === 0x00100000 && (identity & 0xfffff) < 2, 'Guide did not store valid packed identity/original orientation.');
       const x = i % 8 - 3.5, y = 3.5 - Math.floor(i / 8);
+      if (x !== y) {
+        const expectedPacked = y < x ? 1 : 0;
+        require((identity & 0xfffff) === expectedPacked, `Pixel${i}: source-order ID used instead of independently expected packed${expectedPacked}.`);
+        nonDiagonalPackedIdentityChecks++;
+      }
       [x, y, 0].forEach((v, c) => near(firstGuide.getFloat32(16 + i * 32 + 16 + c * 4, true), v, 'Traced guide world point'));
       near(firstGuide.getFloat32(16 + i * 32 + 28, true), 1, 'Actual first-primary tangent footprint');
     }
+    require(nonDiagonalPackedIdentityChecks === 56, 'Independent packed-ID witness did not cover every off-diagonal pixel.');
     // A cache sentinel proves later attempts do not silently recompute the guide.
     device.queue.writeBuffer(variants[1]!.guides, 44, new Float32Array([2]));
     const secondTrace = await traceSweep(false), cappedTrace = await traceSweep(false);
@@ -493,7 +525,9 @@ export async function validateImportedSpatial() {
     require(secondTrace.words.every((word, i) => word === cappedTrace.words[i]), 'Capped trace changed raw estimator state/counters.');
     cases.push({ name: 'actual-trace-guide-and-legacy-word-identity', pixels: 64, sweeps: 3, cap: 2, sourceSha256: firstTrace.sourceHash,
       firstCounters: firstTrace.words.slice(64 * 8), cappedCounters: cappedTrace.words.slice(64 * 8),
-      exactRhoBits: true, firstGuideOnly: true, rawStateAndCountersIdentical: true, tangentFootprint: 1 });
+      cachedRhoTransportBitsExact: true, idealColorInterpolation: { unitRoundoff: interpolationUnitRoundoff,
+        roundingOperations: interpolationRoundings, relativeBound: analyticRhoRelativeBound, maxRelativeError: maxAnalyticRhoRelativeError },
+      nonDiagonalPackedIdentityChecks, firstGuideOnly: true, rawStateAndCountersIdentical: true, tangentFootprint: 1 });
     await bounded(device.queue.onSubmittedWorkDone(), 'Spatial final fence');
     while (scopes > 0) { const error = await bounded(device.popErrorScope(), 'Spatial error scope'); scopes--; if (error) errors.push(error.message); }
     require(errors.length === 0, errors.join('; '));
