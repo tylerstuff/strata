@@ -76,6 +76,32 @@
               </div>
             </div>
 
+            <div class="quality-controls" aria-label="Material, environment and texture settings">
+              <div class="control-field">
+                <label for="material-shading">Materials</label>
+                <select id="material-shading" aria-describedby="quality-status" disabled><option value="authored">Authored (source)</option><option value="relit">Relight unlit</option></select>
+              </div>
+              <div class="control-field">
+                <label for="environment-preset">Distant environment</label>
+                <select id="environment-preset" aria-describedby="quality-status" disabled><option value="off">Off</option><option value="studio">Studio</option><option value="sky">Sky</option></select>
+              </div>
+              <div class="control-field">
+                <label for="texture-cap">Texture cap</label>
+                <select id="texture-cap" disabled><option value="2048">2,048 px</option><option value="4096" selected>4,096 px</option><option value="8192">8,192 px</option></select>
+              </div>
+            </div>
+            <div id="environment-controls" class="environment-controls" hidden>
+              <div class="control-field">
+                <label for="environment-intensity">Environment intensity</label>
+                <input id="environment-intensity" type="number" min="0" max="64" step="0.25" value="1" disabled />
+              </div>
+              <div class="control-field">
+                <label for="environment-rotation">Rotation (degrees)</label>
+                <input id="environment-rotation" type="number" step="15" value="0" disabled />
+              </div>
+            </div>
+            <p id="quality-status" class="quality-note">Source-authored materials. Environment off.</p>
+
             <div id="viewport-wrap" class="viewport-wrap">
               <canvas id="viewport" aria-label="Interactive model preview" aria-describedby="orbit-guidance" tabindex="0">
                 This browser does not support the canvas needed to display a model preview.

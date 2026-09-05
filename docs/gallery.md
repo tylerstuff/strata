@@ -29,23 +29,60 @@ The gallery offers whole-model selection, orbit and reset, model-only or ground
 presentation, explicit scene lighting, and only the debug views supported by the
 imported renderer. Model only is the default. The optional ground stays at the
 rest-pose level; animated poses can cross it. Use Model only to inspect the full
-pose. Lighting presets use a directional light and ambient fill with
-material AO only. That fill is not global illumination or image-based
-lighting. Imported GI/reflections, virtual geometry and world streaming are
-outside this gallery's scope.
+pose. Lighting presets use a directional light and diffuse ambient fill; the
+separate environment controls add distant illumination. Imported GI, local
+reflections, virtual geometry and world streaming are outside this gallery's scope.
+
+Material shading defaults to `authored`. Source unlit materials retain their base
+color when lighting changes. The explicit `relit` mode interprets only those unlit
+materials as matte dielectrics; source PBR materials keep their authored response.
+Relighting preserves the base colors and animated pose, but does not reconstruct
+the original author's missing material properties. The ground can still be lit
+and shadowed in either mode.
+
+The distant environment defaults to off. Studio and sky presets add generated
+illumination, with intensity and rotation controls. Environment intensity is a
+scene-linear multiplier from 0 to 64; rotation is about world +Y, shown in degrees
+in the panel and supplied in radians through the API.
+Directional, ambient and environment illumination are additive. This environment
+has no local visibility or interior occlusion and does not reflect surrounding
+scene geometry. Unrestricted distant light cannot account for light blocked by a
+room's walls. See the
+[imported material lighting guide](imported-lighting.md) for the authored/relit
+policy and the precise lighting approximation.
 
 Clip selection, play/pause and timeline scrubbing are enabled only for animation
 reported as supported by the runtime. A catalog clip count does not establish
 runtime support. Unsupported animation or materials, texture resizing and other
 importer diagnostics remain visible in Preview limits.
-Authored unlit materials retain their own color when lights change; the ground
-can still be lit and shadowed. Root motion is preserved. Reset fits the rest-pose
+Root motion is preserved. Reset fits the rest-pose
 bounds, and a traveling clip can leave that framing. Scripts can reframe by setting
 the orbit target and distance. Available Idle, F_idle or idle01 clips play initially;
 otherwise the gallery starts paused in the rest pose.
 Catalog triangle counts describe stored source primitives; they are separate from
 the runtime's actual submitted triangle count. The catalog's source SHA-256 covers
 the recommended glTF JSON file only, not every buffer and texture dependency.
+
+Texture quality requests a maximum image edge of 4096 px by default, with 2048,
+4096 and 8192 options. Requested, selected and effective edges are distinct: the
+device may limit an edge, and the gallery tries a lower option only when Core's
+texture allocation estimate exceeds its texture budget. Decoder, validation and
+renderer failures are reported instead of triggering a lower-quality retry.
+Changing the texture cap recreates the scene from already loaded bytes while
+retaining the camera, clip/time, live-view preference and other view settings;
+temporal history resets. If no supported cap fits the budget, the operation fails.
+The allocation estimate includes texture roles, mipmaps, fallback texels and the
+fixed environment payload. It excludes buffers, frame/shadow targets, driver
+overhead and the rest of process memory; it is not a whole-VRAM estimate. See the
+[texture estimate contract](imported-lighting.md#texture-allocation-estimate) for
+the budget and detailed scope.
+
+Fit viewport (native) sizes the drawing buffer from the canvas's CSS dimensions
+multiplied by the current device-pixel ratio, rounded to physical pixels. When a
+device dimension limit is reached, one shared scale preserves the aspect ratio.
+Layout, zoom and display-density changes update this size. Fixed render sizes
+remain explicit physical pixels. Temporal AA is enabled by default and can be
+disabled independently of render size and animation playback.
 
 ## Measurements and automation
 
@@ -67,28 +104,53 @@ const gallery = window.strataGallery;
 await gallery.selectModel('light_fury');
 gallery.setLive(false);
 await gallery.setViewport(1280, 720);
+const display = gallery.getDisplay();
+await gallery.setTemporal(true);
 await gallery.setLightingPreset('daylight');
+await gallery.setShading('authored');
+await gallery.setEnvironment({ preset: 'studio', intensity: 0.5, rotationRadians: 0 });
 const clips = gallery.getState().asset.clips;
+if (clips.length === 0) throw new Error('The runtime exposes no playable clips.');
 await gallery.setAnimation({
   clipId: clips[0].id, timeSeconds: 0.5, loop: false, playing: false,
 });
+await gallery.setTextureCap(4096);
 const frozen = await gallery.captureState(4);
 // An external browser runner screenshots canvas#viewport, then verifies that
 // frame/view/animation identity still matches frozen.state.
 ```
 
+`setShading('authored' | 'relit')`, `setEnvironment(partial)` and
+`setTextureCap(2048 | 4096 | 8192)` are asynchronous operations requiring a ready,
+idle gallery. Environment updates merge `preset` (`off`, `studio` or `sky`),
+`intensity` and `rotationRadians`; selecting `off` disables only the environment.
+Its initial settings are off, intensity 1 and rotation 0. `getState().settings`
+records `shading`, `environment`, the requested `textureCap` and the applied
+`textureDecision`. The decision is null before a load; an applied decision reports
+selected/effective caps, device limitation and any budget fallback. Effective
+render controls are available under `settings.effective`, where
+`lighting.environment` is null when the environment is off.
+
 The control surface also exposes `getCatalog`, `setScenePreset`, `setDebugView`,
 `setOrbit`, `resetCamera`, `renderFrames` and `dispose`. Orbit angles are radians.
 `setViewport` chooses physical pixels and locks responsive resizing; CSS can scale
-the canvas down to fit the page, so the browser runner must size its window for an
-unscaled screenshot. The page's Fit viewport option restores responsive sizing.
+the canvas down to fit the page. `getDisplay()` reports `mode` (`fit` or `fixed`),
+`css` and `render` width/height, `devicePixelRatio`, and `nativeScale.x/y`, calculated
+as `render / (css * devicePixelRatio)` for each axis. Record these values and the screenshot
+scale with capture evidence; screenshot dimensions alone do not establish native
+render density. The page's Fit viewport option restores responsive native sizing.
+`setTemporal(boolean)` changes AA, and `getState().settings.temporal` records it.
 Explicit frame batches are bounded to 1–120 frames. `captureState` defaults to four
 frames and leaves rendering and animation paused. It returns state, not PNG bytes.
 
-State distinguishes requested and last confirmed model identity. A rejected scene
-replacement without a Core commit receipt leaves the active model identity unknown
-and rendering stopped. Historical frame data does not establish a new readiness
-state. Device loss and GPU errors stop the session; reload to recreate its engine.
+State distinguishes requested and last confirmed model identity. A rejected
+texture-cap replacement retains the prior ready view only when Core evidence
+confirms that the scene is unchanged. A failed model selection stops rendering;
+replacement failure without a commit receipt leaves active model identity
+unknown. Failure after a commit can leave the candidate scene committed but the
+gallery faulted.
+Historical frame data does not establish a new readiness state. Device loss and
+GPU errors stop the session; reload to recreate its engine.
 
 ## Validation
 
@@ -101,3 +163,10 @@ resizing, capture stability, and disposal. Its caller owns the browser, server a
 hardware report. CI uses the contained procedural fixture route and never reads
 the downloaded collection. Actual-model captures require a separately scheduled
 local hardware run, with results kept external.
+
+Core's [lighting and estimator checks](imported-lighting.md#validation-scope) and
+the earlier native-resolution/DPR gallery proof cover separate parts of this
+system. They do not establish the combined browser behavior of the gallery's
+material, environment and texture controls. Track validation of the exact gallery
+revision in [issue #33](https://github.com/tylerstuff/strata/issues/33); no
+performance or whole-VRAM guarantee follows from those functional checks.
