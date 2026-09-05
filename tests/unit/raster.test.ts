@@ -3,6 +3,7 @@ import { createCameraMatrix } from '../../packages/core/src/rendering/scene-data
 import { animatedOffset, cameraJitter, createLightMatrix, createMaterialTextures, createRasterCamera, orthographicMatrix, referenceGgxDistribution } from '../../packages/core/src/rendering/raster-math.js';
 import { mustResetHistory, normalizeRasterControls, RasterRenderer } from '../../packages/core/src/rendering/raster-renderer.js';
 import type { RasterFrameState } from '../../packages/core/src/rendering/raster-renderer.js';
+import type { RasterGeometryProvider, RasterGeometryGroup } from '../../packages/core/src/rendering/geometry-provider.js';
 
 function project(matrix: Float32Array, point: readonly number[]): number[] {
   const clip = Array.from({ length: 4 }, (_, row) => point.reduce((sum, value, column) => sum + matrix[column * 4 + row]! * value, 0));
@@ -139,6 +140,60 @@ function fixture() {
 }
 
 describe('raster frame orchestration and ownership', () => {
+  function provider(name: string, selectionPass: boolean, counts: { triangles: number; drawCalls: number; dispatchCalls: number; uploadBytes: number }) {
+    return {
+      shaderSource: `// ${name}`, vertexEntryPoint: `${name}Vertex`, shadowEntryPoint: `${name}Shadow`, usesMaterialTextures: false,
+      halfExtent: 4, selectionPass, lightMatrix: createLightMatrix(4), gpuBufferBytes: 80, initialUploadBytes: 48,
+      camera: vi.fn(() => createRasterCamera(640, 360, 0, 4)), attachPipelines: vi.fn(), prepare: vi.fn(() => counts), draw: vi.fn(), dispose: vi.fn(),
+    } satisfies RasterGeometryProvider;
+  }
+
+  it('batches separate provider pipelines into one camera, shadow map and MRT while summing actual work', async () => {
+    const gpu = fixture();
+    const a = provider('terrain', true, { triangles: 20, drawCalls: 2, dispatchCalls: 2, uploadBytes: 7 });
+    const b = provider('rooms', false, { triangles: 12, drawCalls: 6, dispatchCalls: 0, uploadBytes: 11 });
+    const camera = createRasterCamera(640, 360, 0, 16); const lightMatrix = createLightMatrix(16);
+    const group = { providers: [a, b], halfExtent: 16, lightMatrix, camera: vi.fn(() => camera) } satisfies RasterGeometryGroup;
+    const renderer = await RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm', {}, group);
+    expect(a.attachPipelines).toHaveBeenCalledOnce(); expect(b.attachPipelines).toHaveBeenCalledOnce();
+    const selection = {} as GPUComputePassTimestampWrites;
+    const result = renderer.encode(gpu.encoder as unknown as GPUCommandEncoder, {} as GPUTextureView, 640, 360, 0,
+      { temporal: false }, { selection });
+    expect(result).toMatchObject({ drawCalls: 9, triangles: 33, dispatchCalls: 2, uploadBytes: 386 });
+    expect(group.camera).toHaveBeenCalledOnce(); expect(a.camera).not.toHaveBeenCalled(); expect(b.camera).not.toHaveBeenCalled();
+    expect(a.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false }, selection);
+    expect(b.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false }, undefined);
+    expect(gpu.encoder.beginRenderPass.mock.calls.map(([descriptor]) => descriptor.label)).toEqual([
+      'Strata directional shadow', 'Strata PBR and shared geometry outputs', 'Strata tone mapping and debug presentation',
+    ]);
+    const [aRaster, aShadow] = a.attachPipelines.mock.calls[0]!; const [bRaster, bShadow] = b.attachPipelines.mock.calls[0]!;
+    expect(gpu.pass.setPipeline.mock.calls.slice(0, 4).map(([pipeline]) => pipeline)).toEqual([aShadow, bShadow, aRaster, bRaster]);
+    expect(gpu.pass.setBindGroup.mock.calls.filter(([index]) => index === 0)).toHaveLength(5);
+    expect(a.draw.mock.calls.map(([, phase]) => phase)).toEqual(['shadow', 'raster']);
+    expect(b.draw.mock.calls.map(([, phase]) => phase)).toEqual(['shadow', 'raster']);
+    const uniformWrites = gpu.writes.filter(write => write.label === 'Strata current and previous transforms');
+    expect(uniformWrites).toHaveLength(1); expect(new Float32Array(uniformWrites[0]!.bytes.buffer).slice(64, 80)).toEqual(lightMatrix);
+    expect(renderer.gpuBufferBytes).toBe(gpu.buffers.reduce((sum, buffer) => sum + buffer.size, 0) + 160);
+    expect(gpu.textures.filter(texture => texture.descriptor.label === 'Strata directional shadow depth')).toHaveLength(1);
+    expect(renderer.passNames({ temporal: false })).toEqual(['selection', 'shadow', 'raster', 'presentation']);
+    renderer.dispose(); renderer.dispose(); expect(a.dispose).toHaveBeenCalledOnce(); expect(b.dispose).toHaveBeenCalledOnce();
+    expect([...gpu.buffers, ...gpu.textures].every(resource => resource.destroy.mock.calls.length === 1)).toBe(true);
+  });
+
+  it('rejects duplicate/ambiguous provider ownership and leaves providers caller-owned when creation fails', async () => {
+    const gpu = fixture(); const counts = { triangles: 2, drawCalls: 2, dispatchCalls: 0, uploadBytes: 0 };
+    const a = provider('a', true, counts); const b = provider('b', true, counts);
+    for (const providers of [[], [a, a], [a, b]]) {
+      await expect(RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm', {},
+        { providers, halfExtent: 4, lightMatrix: a.lightMatrix, camera: a.camera })).rejects.toThrow('unique providers');
+    }
+    expect(gpu.buffers).toHaveLength(0); expect(gpu.device.createRenderPipelineAsync).not.toHaveBeenCalled();
+    const fail = new Error('provider binding failed'); a.attachPipelines.mockImplementation(() => { throw fail; });
+    await expect(RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm', {}, a)).rejects.toBe(fail);
+    expect(a.dispose).not.toHaveBeenCalled(); expect(b.dispose).not.toHaveBeenCalled();
+    expect([...gpu.buffers, ...gpu.textures].every(resource => resource.destroy.mock.calls.length === 1)).toBe(true);
+  });
+
   it('orders all passes, counts allocations and uploads, and retains valid history until a reset', async () => {
     const gpu = fixture();
     const renderer = await RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm', { instanceCount: 2 });

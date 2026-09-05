@@ -1,5 +1,5 @@
 import { createEngine, StrataError } from '@strata-engine/core';
-import type { ReflectionMode, ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry } from '@strata-engine/core';
+import type { ReflectionMode, ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode } from '@strata-engine/core';
 
 const canvas = document.createElement('canvas');
 const options: Parameters<typeof createEngine>[0] = {
@@ -41,6 +41,15 @@ async function lifecycle() {
     // @ts-expect-error Resolution scale is a bounded choice rather than an arbitrary number.
     const invalidScale: ReflectionSceneOptions = { renderer: 'reflections', resolutionScale: 0.75 };
     void reflectionTelemetry; void currentReflectionTelemetry; void invalidMode; void invalidScale;
+    const integratedCamera: IntegratedCameraMode = 'tour';
+    const integratedScene: IntegratedSceneOptions = { renderer: 'integrated', manifestUrl: '/manifest.json',
+      traceProxyUrl: '/trace-proxy.json', cameraMode: integratedCamera, geometryMode: 'streamed',
+      poolBytes: 1024 * 1024, terrainColor: 'green', resolutionScale: 0.25 };
+    await engine.setScene(integratedScene);
+    const integratedTelemetry: IntegratedTelemetry | undefined = engine.render().integrated;
+    // @ts-expect-error A persistent trace proxy is mandatory for integrated coverage.
+    const missingProxy: IntegratedSceneOptions = { renderer: 'integrated', manifestUrl: '/manifest.json' };
+    void integratedTelemetry; void missingProxy;
     engine.dispose();
     return { abiVersion, memoryBytes, format, state };
   } catch (error) {

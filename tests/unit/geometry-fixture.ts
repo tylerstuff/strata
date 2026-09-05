@@ -30,7 +30,7 @@ export function geometryDevice() {
     limits: { maxBufferSize: 256 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024 },
     createShaderModule: vi.fn(),
     createComputePipelineAsync: vi.fn(async () => ({ getBindGroupLayout: vi.fn() })),
-    createBindGroup: vi.fn(() => ({})),
+    createBindGroup: vi.fn((_descriptor: GPUBindGroupDescriptor) => ({})),
     createBuffer: vi.fn((descriptor: GPUBufferDescriptor) => {
       const bytes = new Uint8Array(descriptor.size);
       const buffer = { label: descriptor.label ?? '', bytes, destroy: vi.fn(), mapAsync: vi.fn(async () => undefined), unmap: vi.fn(), getMappedRange: () => bytes.buffer };

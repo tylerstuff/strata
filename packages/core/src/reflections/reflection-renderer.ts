@@ -6,21 +6,25 @@ import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } 
 import { validateGiControls } from '../gi/gi-renderer.js';
 import { buildGiTraceData, refitGiTraceData } from '../gi/trace-data.js';
 import type { GiTraceData } from '../gi/trace-data.js';
+import type { GiTriangle } from '../gi/scene-data.js';
 import { ProbeCache } from '../gi/probe-cache.js';
 import type { ProbeBindings } from '../gi/probe-cache.js';
 import type { GiControls, GiTelemetry } from '../gi/gi-types.js';
 import { createReflectionScene } from './reflection-scene.js';
 import type { ReflectionSceneData } from './reflection-scene.js';
+import type { ReflectionSceneOptions as ReflectionFixtureOptions } from './reflection-scene.js';
 import { ReflectionGeometry } from './reflection-geometry.js';
 import { ReflectionCache, normalizeReflectionControls } from './reflection-cache.js';
 import type { NormalizedReflectionControls } from './reflection-cache.js';
 import { ReflectionComposer } from './reflection-composer.js';
 import type { ReflectionControls, ReflectionSceneOptions, ReflectionTelemetry } from './reflection-types.js';
 
-type Controls = RasterControls & { gi?: GiControls; reflections?: ReflectionControls };
+export type ReflectionRenderControls = RasterControls & { gi?: GiControls; reflections?: ReflectionControls };
+type Controls = ReflectionRenderControls;
 const traceArrays = (data: GiTraceData): readonly ArrayBuffer[] => [data.nodeData, data.triangleData, data.boxData, data.materialData, data.uniformData];
 
-class ReflectionEffect implements RasterGiProvider {
+/** Shared lighting over an explicit persistent tracing source. Not part of the package facade. */
+export class ReflectionEffect implements RasterGiProvider {
   giEnabled = true;
   controls: NormalizedReflectionControls;
   private revision = 1;
@@ -32,11 +36,13 @@ class ReflectionEffect implements RasterGiProvider {
 
   private constructor(private readonly device: GPUDevice, readonly traceData: GiTraceData,
     private readonly traceBuffers: readonly GPUBuffer[], readonly probeCache: ProbeCache,
-    readonly reflectionCache: ReflectionCache, readonly composer: ReflectionComposer, private scene: ReflectionSceneData) {
+    readonly reflectionCache: ReflectionCache, readonly composer: ReflectionComposer, private scene: ReflectionSceneData,
+    private readonly sceneFactory: (options: ReflectionFixtureOptions) => ReflectionSceneData) {
     this.controls = normalizeReflectionControls({ roughness: scene.state.roughness, objectOffset: scene.state.objectOffset });
   }
-  static async create(device: GPUDevice, scene: ReflectionSceneData, options: ReflectionSceneOptions): Promise<ReflectionEffect> {
-    const data = buildGiTraceData(scene); const buffers: GPUBuffer[] = [];
+  static async create(device: GPUDevice, scene: ReflectionSceneData, options: Omit<ReflectionSceneOptions, 'renderer' | 'cameraMode'>,
+    source: { sceneFactory?: (options: ReflectionFixtureOptions) => ReflectionSceneData; staticTriangles?: readonly GiTriangle[] } = {}): Promise<ReflectionEffect> {
+    const data = buildGiTraceData(scene, source.staticTriangles); const buffers: GPUBuffer[] = [];
     let probes: ProbeCache | undefined; let reflections: ReflectionCache | undefined; let composer: ReflectionComposer | undefined;
     try {
       for (const [index, bytes] of traceArrays(data).entries()) {
@@ -56,11 +62,15 @@ class ReflectionEffect implements RasterGiProvider {
         ...(options.maxRaysPerFrame === undefined ? {} : { maxRaysPerFrame: options.maxRaysPerFrame }),
       });
       composer = await ReflectionComposer.create(device, entries, reflections.samplingLayout);
-      return new ReflectionEffect(device, data, buffers, probes, reflections, composer, scene);
+      return new ReflectionEffect(device, data, buffers, probes, reflections, composer, scene, source.sceneFactory ?? createReflectionScene);
     } catch (cause) { composer?.dispose(); reflections?.dispose(); probes?.dispose(); for (const buffer of buffers) buffer.destroy(); throw cause; }
   }
   get active(): boolean { return this.giEnabled || this.controls.mode !== 'off'; }
   get currentScene(): ReflectionSceneData { return this.scene; }
+  /** Internal diagnostics borrow these buffers; ownership stays with the effect. */
+  get traceBindings(): readonly GPUBindGroupEntry[] {
+    return this.traceBuffers.map((buffer, binding) => ({ binding, resource: { buffer } }));
+  }
   get gpuBufferBytes(): number { return this.disposed ? 0 : this.traceData.gpuBufferBytes + this.probeCache.gpuBufferBytes + this.reflectionCache.gpuBufferBytes + this.composer.gpuBufferBytes; }
   get gpuTextureBytes(): number { return this.disposed ? 0 : this.probeCache.gpuTextureBytes + this.reflectionCache.gpuTextureBytes + this.composer.gpuTextureBytes; }
   get initialUploadBytes(): number { return this.traceData.gpuBufferBytes + this.probeCache.initialUploadBytes + this.reflectionCache.initialUploadBytes; }
@@ -105,7 +115,7 @@ class ReflectionEffect implements RasterGiProvider {
     if (resetWorld && this.revision === 0xffffffff) throw new StrataError('UNSUPPORTED_LIMIT', 'Reflection world revisions exhausted; recreate the scene.');
     const settingsChanged = Object.entries(controls).some(([key, value]) => key !== 'resetHistory' && value !== this.controls[key as keyof NormalizedReflectionControls]);
     if (changed) {
-      const next = createReflectionScene({ doorOpen: gi.doorOpen ?? state.doorOpen,
+      const next = this.sceneFactory({ doorOpen: gi.doorOpen ?? state.doorOpen,
         wallColor: gi.wallColor ?? state.wallColor, lightIntensity: gi.lightIntensity ?? state.lightIntensity,
         objectOffset: controls.objectOffset, roughness: controls.roughness });
       refitGiTraceData(this.traceData, next); this.scene = next; this.traceDirty = true;

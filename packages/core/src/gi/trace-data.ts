@@ -12,6 +12,8 @@ export interface GiTraceHit {
 }
 export interface GiTraceData {
   scene: GiSceneData;
+  /** Permanently resident non-box source, with local IDs; independent of render-page residency. */
+  readonly staticTriangles: readonly GiTriangle[];
   readonly nodeData: ArrayBuffer; readonly triangleData: ArrayBuffer; readonly boxData: ArrayBuffer;
   readonly materialData: ArrayBuffer; readonly uniformData: ArrayBuffer;
   readonly triangleOrder: readonly number[];
@@ -42,6 +44,29 @@ function validateScene(scene: GiSceneData): void {
     || scene.light.radiance.some(v => !Number.isFinite(v) || v < 0 || v > 1000)) invalid('invalid light.');
 }
 
+function copyStaticTriangles(scene: GiSceneData, input: readonly GiTriangle[]): readonly GiTriangle[] {
+  if (!Array.isArray(input) || input.length + scene.boxes.length * 12 > giTraceLimits.triangles) invalid('static triangles exceed fixed primitive limits.');
+  const vector = (value: GiVec3): GiVec3 => {
+    if (!Array.isArray(value) || value.length !== 3 || value.some(v => !Number.isFinite(v) || Math.abs(v) > 1000)) invalid('invalid static triangle vector.');
+    return Object.freeze(value.map(Math.fround)) as unknown as GiVec3;
+  };
+  return Object.freeze(input.map((triangle, id) => {
+    if (!triangle || triangle.id !== id || !Number.isInteger(triangle.materialId) || !scene.materials[triangle.materialId]
+      || !Number.isInteger(triangle.boxId) || triangle.boxId < 0
+      || (triangle.boxId >= scene.boxes.length && triangle.boxId !== 0xffff_fffe)) invalid('invalid static triangle identity/material.');
+    const p0 = vector(triangle.p0); const p1 = vector(triangle.p1); const p2 = vector(triangle.p2);
+    const normal = vector(triangle.normal); const geometric = cross(subtract(p1, p0), subtract(p2, p0));
+    const area = Math.hypot(...geometric);
+    if (area <= 1e-10 || Math.abs(Math.hypot(...normal) - 1) > 0.00001 || dot(normal, geometric) / area < 0.9999) invalid('degenerate static triangle or inconsistent normal/winding.');
+    return Object.freeze({ id, boxId: triangle.boxId, materialId: triangle.materialId, p0, p1, p2, normal });
+  }));
+}
+
+function sourceTriangles(scene: GiSceneData, staticTriangles: readonly GiTriangle[]): GiTriangle[] {
+  const boxes = triangulateGiScene(scene); const offset = boxes.length;
+  return [...boxes, ...staticTriangles.map(triangle => ({ ...triangle, id: offset + triangle.id }))];
+}
+
 function triangleBounds(triangles: readonly GiTriangle[], ids: readonly number[]): { min: number[]; max: number[] } {
   const min = [Infinity, Infinity, Infinity]; const max = [-Infinity, -Infinity, -Infinity];
   for (const id of ids) for (const point of [triangles[id]!.p0, triangles[id]!.p1, triangles[id]!.p2]) {
@@ -51,9 +76,10 @@ function triangleBounds(triangles: readonly GiTriangle[], ids: readonly number[]
 }
 
 /** Tiny deterministic median BVH; construction is not a per-frame dense runtime job. */
-export function buildGiTraceData(scene: GiSceneData): GiTraceData {
+export function buildGiTraceData(scene: GiSceneData, staticTriangles: readonly GiTriangle[] = []): GiTraceData {
   validateScene(scene);
-  const triangles = triangulateGiScene(scene);
+  const persistent = copyStaticTriangles(scene, staticTriangles);
+  const triangles = sourceTriangles(scene, persistent);
   const nodes: Node[] = [{ min: [], max: [], first: 0, count: 0 }];
   const order: number[] = [];
   let maxDepth = 0;
@@ -80,7 +106,7 @@ export function buildGiTraceData(scene: GiSceneData): GiTraceData {
   const boxData = new ArrayBuffer(scene.boxes.length * giTraceStrides.box);
   const materialData = new ArrayBuffer(scene.materials.length * giTraceStrides.material);
   const uniformData = new ArrayBuffer(giTraceStrides.uniform);
-  const data: GiTraceData = { scene, nodeData, triangleData, boxData, materialData, uniformData,
+  const data: GiTraceData = { scene, staticTriangles: persistent, nodeData, triangleData, boxData, materialData, uniformData,
     triangleOrder: Object.freeze(order), nodeCount: nodes.length, triangleCount: triangles.length, boxCount: scene.boxes.length,
     materialCount: scene.materials.length, maxDepth,
     gpuBufferBytes: nodeData.byteLength + triangleData.byteLength + boxData.byteLength + materialData.byteLength + uniformData.byteLength };
@@ -94,7 +120,7 @@ function setVector(view: DataView, offset: number, value: GiVec3): void { for (l
 export function refitGiTraceData(data: GiTraceData, scene: GiSceneData): void {
   validateScene(scene);
   if (scene.boxes.length !== data.boxCount || scene.materials.length !== data.materialCount) invalid('refit cannot change topology.');
-  const triangles = triangulateGiScene(scene);
+  const triangles = sourceTriangles(scene, data.staticTriangles);
   const packed = new DataView(data.triangleData);
   data.triangleOrder.forEach((id, index) => {
     const triangle = triangles[id]!; const at = index * 64;
@@ -152,9 +178,9 @@ function intersectTriangle(ray: GiRay, p0: GiVec3, e1: GiVec3, e2: GiVec3): numb
 }
 
 /** Independent source-triangle scan, without packed nodes or BVH ordering. */
-export function traceGiBruteForce(scene: GiSceneData, ray: GiRay): GiTraceHit {
+export function traceGiBruteForce(scene: GiSceneData, ray: GiRay, staticTriangles: readonly GiTriangle[] = []): GiTraceHit {
   validateGiRay(ray);
-  const triangles = triangulateGiScene(scene);
+  const triangles = sourceTriangles(scene, staticTriangles);
   let result = miss(ray);
   for (const triangle of triangles) {
     const distance = intersectTriangle(ray, triangle.p0, subtract(triangle.p1, triangle.p0), subtract(triangle.p2, triangle.p0));
@@ -227,7 +253,8 @@ function boxNormal(box: GiBox, point: GiVec3): GiVec3 {
 }
 
 /** Deliberately bounded comparison candidate; reports nonconvergence instead of claiming a miss. */
-export function traceGiSdf(scene: GiSceneData, ray: GiRay): GiTraceHit {
+export function traceGiSdf(scene: GiSceneData, ray: GiRay, staticTriangles: readonly GiTriangle[] = []): GiTraceHit {
+  if (staticTriangles.length) invalid('box SDF cannot represent static triangle geometry.');
   validateGiRay(ray);
   let distance = ray.tMin; let primitiveTests = 0;
   for (let step = 0; step < giTraceLimits.sdfSteps; step++) {

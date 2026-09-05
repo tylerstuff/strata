@@ -7,7 +7,7 @@ import type { CameraFrame } from './raster-math.js';
 import { presentationShader, rasterShader } from './raster-shaders.js';
 import { TemporalResolve } from './temporal-resolve.js';
 import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from './raster-types.js';
-import type { RasterGeometryProvider } from './geometry-provider.js';
+import type { RasterGeometryProvider, RasterGeometryGroup } from './geometry-provider.js';
 import type { RasterGiProvider } from './gi-provider.js';
 
 const bufferUsage = { copyDestination: 0x8, index: 0x10, vertex: 0x20, uniform: 0x40 };
@@ -49,6 +49,14 @@ interface Targets {
   readonly views: RasterOutputs;
 }
 
+interface GeometryPipeline {
+  readonly provider: RasterGeometryProvider | undefined;
+  readonly rasterBindings: GPUBindGroup;
+  readonly shadowBindings: GPUBindGroup;
+  readonly rasterPipeline: GPURenderPipeline;
+  readonly shadowPipeline: GPURenderPipeline;
+}
+
 interface StaticResources {
   readonly buffers: readonly GPUBuffer[];
   readonly textures: readonly GPUTexture[];
@@ -58,10 +66,7 @@ interface StaticResources {
   readonly frameUniform: GPUBuffer;
   readonly presentationUniform: GPUBuffer;
   readonly shadowView: GPUTextureView;
-  readonly rasterBindings: GPUBindGroup;
-  readonly shadowBindings: GPUBindGroup;
-  readonly rasterPipeline: GPURenderPipeline;
-  readonly shadowPipeline: GPURenderPipeline;
+  readonly geometryPipelines: readonly GeometryPipeline[];
   readonly presentationPipeline: GPURenderPipeline;
   readonly bufferBytes: number;
   readonly initialUploadBytes: number;
@@ -84,11 +89,16 @@ export class RasterRenderer {
     private readonly temporal: TemporalResolve,
     private readonly instanceCount: number,
     private readonly halfExtent: number,
-    private readonly geometry?: RasterGeometryProvider,
+    private readonly geometry?: RasterGeometryProvider | RasterGeometryGroup,
     private readonly gi?: RasterGiProvider,
   ) { this.lightMatrix = geometry?.lightMatrix ?? createLightMatrix(halfExtent); }
 
-  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider, gi?: RasterGiProvider): Promise<RasterRenderer> {
+  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider | RasterGeometryGroup, gi?: RasterGiProvider): Promise<RasterRenderer> {
+    const providers = geometry ? ('providers' in geometry ? [...geometry.providers] : [geometry]) : [];
+    if (geometry && (!providers.length || new Set(providers).size !== providers.length || providers.filter(provider => provider.selectionPass).length > 1
+      || !Number.isFinite(geometry.halfExtent) || geometry.halfExtent <= 0 || geometry.lightMatrix.length !== 16 || !geometry.lightMatrix.every(Number.isFinite))) {
+      throw new StrataError('INVALID_OPTIONS', 'A geometry group needs unique providers and at most one selection pass.');
+    }
     const data = geometry ? undefined : buildProceduralScene(options);
     if (device.limits.maxTextureDimension2D < shadowSize) {
       throw new StrataError('UNSUPPORTED_LIMIT', `Raster shadows require ${shadowSize}-pixel textures.`);
@@ -121,31 +131,35 @@ export class RasterRenderer {
           { shaderLocation: 5, format: 'float32x4', offset: 32 },
         ] },
       ];
-      const module = device.createShaderModule({ label: 'Strata PBR and shadow shader', code: rasterShader + (geometry?.shaderSource ?? '') });
       const presentModule = device.createShaderModule({ label: 'Strata tone mapping and debug shader', code: presentationShader });
-      const [rasterPipeline, shadowPipeline, presentationPipeline] = await Promise.all([
-        device.createRenderPipelineAsync({
-          label: 'Strata PBR MRT pipeline', layout: 'auto',
-          vertex: { module, entryPoint: geometry?.vertexEntryPoint ?? 'vertexMain', buffers: geometry ? geometry.vertexBuffers ?? [] : vertexBuffers },
-          fragment: { module, entryPoint: geometry?.fragmentEntryPoint ?? 'fragmentMain', targets: [
-            { format: 'rgba16float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }, { format: 'rgba16float' },
-          ] },
-          primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
-          depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
-        }),
-        device.createRenderPipelineAsync({
-          label: 'Strata directional shadow pipeline', layout: 'auto',
-          vertex: { module, entryPoint: geometry?.shadowEntryPoint ?? 'shadowMain', buffers: geometry ? geometry.vertexBuffers ?? [] : vertexBuffers },
-          primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
-          depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
-        }),
-        device.createRenderPipelineAsync({
-          label: 'Strata presentation pipeline', layout: 'auto',
-          vertex: { module: presentModule, entryPoint: 'vertexMain' },
-          fragment: { module: presentModule, entryPoint: 'fragmentMain', targets: [{ format }] },
-          primitive: { topology: 'triangle-list' },
-        }),
-      ]);
+      const presentationPromise = device.createRenderPipelineAsync({
+        label: 'Strata presentation pipeline', layout: 'auto',
+        vertex: { module: presentModule, entryPoint: 'vertexMain' },
+        fragment: { module: presentModule, entryPoint: 'fragmentMain', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      const pipelinePairsPromise = Promise.all((providers.length ? providers : [undefined]).map(async provider => {
+        const module = device.createShaderModule({ label: 'Strata PBR and shadow shader', code: rasterShader + (provider?.shaderSource ?? '') });
+        const [rasterPipeline, shadowPipeline] = await Promise.all([
+          device.createRenderPipelineAsync({
+            label: 'Strata PBR MRT pipeline', layout: 'auto',
+            vertex: { module, entryPoint: provider?.vertexEntryPoint ?? 'vertexMain', buffers: provider ? provider.vertexBuffers ?? [] : vertexBuffers },
+            fragment: { module, entryPoint: provider?.fragmentEntryPoint ?? 'fragmentMain', targets: [
+              { format: 'rgba16float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }, { format: 'rgba16float' },
+            ] },
+            primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+            depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+          }),
+          device.createRenderPipelineAsync({
+            label: 'Strata directional shadow pipeline', layout: 'auto',
+            vertex: { module, entryPoint: provider?.shadowEntryPoint ?? 'shadowMain', buffers: provider ? provider.vertexBuffers ?? [] : vertexBuffers },
+            primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+            depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
+          }),
+        ]);
+        return { provider, rasterPipeline, shadowPipeline };
+      }));
+      const [presentationPipeline, pipelinePairs] = await Promise.all([presentationPromise, pipelinePairsPromise]);
       const vertices = data ? buffer('Strata PBR vertices', data.vertices.byteLength, bufferUsage.vertex) : undefined;
       const indices = data ? buffer('Strata PBR indices', data.indices.byteLength, bufferUsage.index) : undefined;
       const instances = data ? buffer('Strata PBR instances', data.instances.byteLength, bufferUsage.vertex) : undefined;
@@ -165,21 +179,24 @@ export class RasterRenderer {
       const shadowView = shadowTexture.createView();
       const materialSampler = device.createSampler({ label: 'Strata repeating material sampler', addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear' });
       const shadowSampler = device.createSampler({ label: 'Strata shadow comparison sampler', compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' });
-      const shadowBindings = device.createBindGroup({ label: 'Strata shadow frame', layout: shadowPipeline.getBindGroupLayout(0),
-        entries: [{ binding: 0, resource: { buffer: frameUniform } }] });
-      const rasterBindings = device.createBindGroup({ label: 'Strata PBR materials and light', layout: rasterPipeline.getBindGroupLayout(0), entries: [
-        { binding: 0, resource: { buffer: frameUniform } },
-        ...(geometry?.usesMaterialTextures === false ? [] : [
-          { binding: 1, resource: baseTexture.createView() }, { binding: 2, resource: mrTexture.createView() },
-          { binding: 3, resource: materialSampler },
-        ]), { binding: 4, resource: shadowView }, { binding: 5, resource: shadowSampler },
-      ] });
+      const geometryPipelines = pipelinePairs.map(({ provider, rasterPipeline, shadowPipeline }) => {
+        const shadowBindings = device.createBindGroup({ label: 'Strata shadow frame', layout: shadowPipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: { buffer: frameUniform } }] });
+        const rasterBindings = device.createBindGroup({ label: 'Strata PBR materials and light', layout: rasterPipeline.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: frameUniform } },
+          ...(provider?.usesMaterialTextures === false ? [] : [
+            { binding: 1, resource: baseTexture.createView() }, { binding: 2, resource: mrTexture.createView() },
+            { binding: 3, resource: materialSampler },
+          ]), { binding: 4, resource: shadowView }, { binding: 5, resource: shadowSampler },
+        ] });
+        return { provider, rasterPipeline, shadowPipeline, rasterBindings, shadowBindings };
+      });
       temporal = await TemporalResolve.create(device);
-      geometry?.attachPipelines(rasterPipeline, shadowPipeline);
+      for (const pair of geometryPipelines) pair.provider?.attachPipelines(pair.rasterPipeline, pair.shadowPipeline);
       const geometryBytes = data ? data.vertices.byteLength + data.indices.byteLength + data.instances.byteLength : 0;
       return new RasterRenderer(device, {
         buffers, textures, vertices, indices, instances, frameUniform, presentationUniform,
-        shadowView, shadowBindings, rasterBindings, rasterPipeline, shadowPipeline, presentationPipeline,
+        shadowView, geometryPipelines, presentationPipeline,
         bufferBytes: geometryBytes + frameUniformBytes + presentationUniformBytes,
         initialUploadBytes: geometryBytes + material.baseColor.byteLength + material.metallicRoughness.byteLength,
       }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry, gi);
@@ -190,8 +207,8 @@ export class RasterRenderer {
     }
   }
 
-  get initialUploadBytes(): number { return this.resources.initialUploadBytes + this.temporal.initialUploadBytes + (this.geometry?.initialUploadBytes ?? 0) + (this.gi?.initialUploadBytes ?? 0); }
-  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes + (this.geometry?.gpuBufferBytes ?? 0) + (this.gi?.gpuBufferBytes ?? 0); }
+  get initialUploadBytes(): number { return this.resources.initialUploadBytes + this.temporal.initialUploadBytes + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.initialUploadBytes ?? 0), 0) + (this.gi?.initialUploadBytes ?? 0); }
+  get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.gpuBufferBytes ?? 0), 0) + (this.gi?.gpuBufferBytes ?? 0); }
   get gpuTextureBytes(): number {
     if (this.disposed) return 0;
     return shadowSize * shadowSize * 4 + materialSize * materialSize * 8
@@ -204,7 +221,7 @@ export class RasterRenderer {
   get directTexture(): GPUTexture | undefined { return this.targets?.textures[0]; }
 
   passNames(controls: RasterControls = {}): readonly RasterPassName[] {
-    const geometryPass: RasterPassName[] = this.geometry?.selectionPass ? ['selection'] : [];
+    const geometryPass: RasterPassName[] = this.resources.geometryPipelines.some(pair => pair.provider?.selectionPass) ? ['selection'] : [];
     return [
       ...(this.gi?.active ? this.gi.preparePassNames ?? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, 'shadow', 'raster',
       ...(this.gi?.active ? this.gi.composePassNames ?? ['gi-shade'] as const : []),
@@ -257,7 +274,8 @@ export class RasterRenderer {
     const previousTime = reset ? timeSeconds : this.previousState?.time ?? timeSeconds;
     const targets = this.resize(width, height);
     const giPrepared = this.gi?.active ? this.gi.prepare(encoder, camera, width, height, timeSeconds, timestamps) : undefined;
-    const prepared = this.geometry?.prepare(encoder, camera, width, height, reset, settings, timestamps.selection);
+    const prepared = this.resources.geometryPipelines.map(pair => pair.provider?.prepare(encoder, camera, width, height, reset, settings,
+      pair.provider?.selectionPass ? timestamps.selection : undefined));
     const frameData = new Float32Array(frameUniformBytes / 4);
     frameData.set(camera.viewProjection, 0); frameData.set(previous.viewProjection, 16);
     frameData.set(camera.view, 32); frameData.set(previous.view, 48);
@@ -269,19 +287,22 @@ export class RasterRenderer {
     new Uint32Array(presentationData).set([debugIndex, this.gi?.active ? 1 : 0]);
     new Float32Array(presentationData).set([camera.far, 1], 2);
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
-    const drawGeometry = (pass: GPURenderPassEncoder, pipeline: GPURenderPipeline, bindings: GPUBindGroup): void => {
-      pass.setPipeline(pipeline); pass.setBindGroup(0, bindings);
-      if (this.geometry) this.geometry.draw(pass, pipeline === this.resources.shadowPipeline ? 'shadow' : 'raster');
-      else {
-        pass.setVertexBuffer(0, this.resources.vertices!); pass.setVertexBuffer(1, this.resources.instances!);
-        pass.setIndexBuffer(this.resources.indices!, 'uint16'); pass.drawIndexed(36, this.instanceCount);
+    const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow'): void => {
+      for (const pair of this.resources.geometryPipelines) {
+        pass.setPipeline(phase === 'shadow' ? pair.shadowPipeline : pair.rasterPipeline);
+        pass.setBindGroup(0, phase === 'shadow' ? pair.shadowBindings : pair.rasterBindings);
+        if (pair.provider) pair.provider.draw(pass, phase);
+        else {
+          pass.setVertexBuffer(0, this.resources.vertices!); pass.setVertexBuffer(1, this.resources.instances!);
+          pass.setIndexBuffer(this.resources.indices!, 'uint16'); pass.drawIndexed(36, this.instanceCount);
+        }
       }
       pass.end();
     };
     const shadow = encoder.beginRenderPass({ label: 'Strata directional shadow', colorAttachments: [],
       depthStencilAttachment: { view: this.resources.shadowView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
       ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
-    drawGeometry(shadow, this.resources.shadowPipeline, this.resources.shadowBindings);
+    drawGeometry(shadow, 'shadow');
     const raster = encoder.beginRenderPass({ label: 'Strata PBR and shared geometry outputs', colorAttachments: [
       { view: targets.views.hdr, clearValue: { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.normal, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
@@ -289,12 +310,12 @@ export class RasterRenderer {
       { view: targets.views.motion, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
     ], depthStencilAttachment: { view: targets.views.depth, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
     ...(timestamps.raster ? { timestampWrites: timestamps.raster } : {}) });
-    drawGeometry(raster, this.resources.rasterPipeline, this.resources.rasterBindings);
+    drawGeometry(raster, 'raster');
     let resolved = targets.views.hdr;
-    let drawCalls = (prepared?.drawCalls ?? 2) + 1;
-    let dispatchCalls = (prepared?.dispatchCalls ?? 0) + (giPrepared?.dispatchCalls ?? 0);
-    let uploadBytes = frameUniformBytes + presentationUniformBytes + (prepared?.uploadBytes ?? 0) + (giPrepared?.uploadBytes ?? 0);
-    let triangles = (prepared?.triangles ?? this.instanceCount * 24) + 1;
+    let drawCalls = prepared.reduce((sum, value) => sum + (value?.drawCalls ?? 2), 0) + 1;
+    let dispatchCalls = prepared.reduce((sum, value) => sum + (value?.dispatchCalls ?? 0), 0) + (giPrepared?.dispatchCalls ?? 0);
+    let uploadBytes = frameUniformBytes + presentationUniformBytes + prepared.reduce((sum, value) => sum + (value?.uploadBytes ?? 0), 0) + (giPrepared?.uploadBytes ?? 0);
+    let triangles = prepared.reduce((sum, value) => sum + (value?.triangles ?? this.instanceCount * 24), 0) + 1;
     if (this.gi?.active) {
       const composed = this.gi.compose(encoder, targets.views, camera, width, height, timeSeconds, settings, timestamps);
       resolved = composed.view; dispatchCalls += composed.dispatchCalls; uploadBytes += composed.uploadBytes;
@@ -331,7 +352,7 @@ export class RasterRenderer {
     if (this.disposed) return;
     this.disposed = true;
     this.temporal.dispose();
-    this.geometry?.dispose();
+    for (const pair of this.resources.geometryPipelines) pair.provider?.dispose();
     this.gi?.dispose();
     for (const resource of [...this.resources.buffers, ...this.resources.textures, ...(this.targets?.textures ?? [])]) resource.destroy();
     this.targets = undefined;

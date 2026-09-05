@@ -15,7 +15,7 @@ concurrency:
 jobs:
   runtime:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -75,6 +75,16 @@ jobs:
           STRATA_TEST_HEADED: '1'
       - name: Validate reflection benchmark reports
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke -- --renderer reflections
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate integrated streaming, offscreen lighting, and lifecycle
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:integrated
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate integrated benchmark reports with a fresh generated fixture
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke -- --renderer integrated --generated-fixture
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'

@@ -76,3 +76,27 @@ Defaults are receiver camera, static lighting, GI/TAA enabled, 156 source triang
 The world path records `reflection-trace` and `reflection-resolve` between raster and shared composition. An empty or skipped trace update still records its timing pass, with zero trace dispatches. Other modes skip both passes. The report preserves the configured and actual scheduled candidate ceilings; unread GPU hit/failure/history counts remain null. A candidate slot can fail the material mask and issue no ray, so its count is not measured ray throughput. Source view is green for a fresh represented-world hit, orange for history, blue for the probe approximation, magenta for exhaustion and black for none. `probe-only` is a low-frequency approximation, not evidence of sharp reflections.
 
 Reflection allocations are 512 buffer bytes plus 88 bytes per low-resolution pixel. Fresh never-world off/probe-only scenes have only 1×1 placeholders; disabling a previously active cache retains its history allocation. Shared trace/probe/composition memory is counted once in total allocations. See [the reflection guide](reflections.md) for the complete layout and limitations. The final screenshot is outside measurement: 240 held-time submissions with GI enabled, 32 for reflections with GI disabled, and 8 in smoke mode. Smoke is not a convergence or performance result.
+
+## Integrated courtyard comparisons
+
+Cook the fixed procedural courtyard and its persistent tracing sidecar outside Git:
+
+```sh
+cargo run --package strata-geometry-cooker --release --locked -- \
+  --seed 1337 --tiles 4 --cells 64 --trace-proxy \
+  --output "$HOME/Downloads/Strata-Cooked-Geometry/integrated-courtyard-v1-s1337-t4-c64"
+export STRATA_BENCHMARK_ASSET_DIR="$HOME/Downloads/Strata-Cooked-Geometry"
+npm run benchmark -- --renderer integrated \
+  --manifest integrated-courtyard-v1-s1337-t4-c64/manifest.json \
+  --require-ac-performance
+```
+
+The proxy URL defaults to `trace-proxy.json` beside that manifest; `--trace-proxy relative/path/trace-proxy.json` can specify it explicitly. The cooker emits 131,072 unique terrain triangles in 80 pages (5 MiB), including three pinned root pages. A 1 MiB pool is the default. The source's scale0.125 and translation[0,-1.625,0] place its highest possible point below the room floor underside. A distinct 2,048-triangle proxy remains resident while those render pages stream. Its measured maximum vertical error is0.1255053m and conservative bound0.1895959m; neither bounds normal, shadow or radiometric error. The shared BVH contains2,204 triangles, including156 exact room/rigid-object triangles, with184,640 explicitly allocated tracing bytes.
+
+`integrated-streamed-courtyard-v1` uses one camera, shared shadow/MRT targets, local room probes and selected reflections. The default tour follows a recorded60-second path from the receiver room through the courtyard and around the terrain. The mandatory `integrated-tour` scenario moves the emissive object sinusoidally from2–6seconds, closes the door at4 and opens it at8, turns the sun off at14 and restores it at18. Camera and scenario use the same explicit simulation time, restarted at zero for each measured window. All feature comparisons preserve these events; world changes reset lighting history, and their stalls/repopulation remain in the recorded distributions.
+
+Repeat the command with exactly one change for each comparison: `--gi off`, `--reflections off`, `--geometry-mode resident-lod` (no streaming), and `--temporal off`. `--geometry-mode mesh-lod` adds the conventional CPU-selected mesh reference; `resident-full` holds finest terrain detail. Keep the camera, seed, terrain color, error, resolution, trace budgets, warm-up, capture duration and power profile fixed. `--terrain-color neutral` is a diagnostic material comparison that updates raster and tracing together. `--camera receiver|overview|terrain-witness` provides fixed diagnostic views; those are separate workloads from the tour.
+
+Start with fixed720p and1080p. Dynamic resolution is disabled and recorded as such. Assess the60 FPS requirement from end-to-end callback/submission distributions, stalls and GPU timing coverage; report misses and dominant costs. The fully enabled GPU terrain path has10 timed passes, up to7 compute dispatches and5+TAA draws. Terrain triangle counts retain their delayed `sourceFrameId`; the frame total additionally includes312 current room raster/shadow triangles and fullscreen triangles. Both source hashes, proxy errors and representation limits are recorded. No collision is implemented; the fixed probe grid does not provide general outdoor GI. This courtyard is a bounded integration test, not evidence of Switch2-equivalent scene complexity or visual quality.
+
+Use the separate functional harness for cold-cache offscreen contribution, cuts, delayed delivery, eviction, resize and lighting-latency evidence. CI can additionally exercise the complete report path with `npm run benchmark:smoke -- --renderer integrated --generated-fixture`. That option cooks a fresh bounded temporary asset, serves only its allowlisted pages and two exact proxy files, then removes it. It never enables external asset collections in CI. Smoke timing and screenshot settling are not performance or convergence evidence.

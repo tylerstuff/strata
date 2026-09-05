@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { distribution, normalizeOptions, summarizeFrames, type FrameSample } from '../../benchmarks/src/metrics.js';
+import { integratedScenario } from '../../benchmarks/src/integrated-scenario.js';
 
 describe('benchmark measurements', () => {
   it('uses nearest-rank percentiles and preserves missing GPU measurements as null', () => {
@@ -96,5 +97,28 @@ describe('reflection benchmark controls', () => {
       { reflectionRoughness: 0.351 }, { reflectionMaxDistance: 33 }, { reflectionUpdateEvery: 1.5 }]) {
       expect(() => normalizeOptions({ renderer: 'reflections', ...patch } as Parameters<typeof normalizeOptions>[0])).toThrow();
     }
+  });
+});
+
+describe('integrated courtyard benchmark controls', () => {
+  const input = { renderer: 'integrated', manifestUrl: '/external-assets/courtyard/manifest.json',
+    traceProxyUrl: '/external-assets/courtyard/trace-proxy.json' } as const;
+  it('uses one recorded camera/scenario across independent feature ablations', () => {
+    for (const patch of [{}, { giEnabled: false }, { reflectionMode: 'off' as const }, { geometryMode: 'resident-lod' as const },
+      { geometryMode: 'mesh-lod' as const }, { temporal: false }]) {
+      expect(normalizeOptions({ ...input, ...patch })).toMatchObject({ cameraMode: 'tour', giScenario: 'integrated-tour',
+        instanceCount: 0, seed: 1337, poolBytes: 1024 * 1024, terrainColor: 'green', ...patch });
+    }
+    expect(integratedScenario(3).reflections?.objectOffset).toBeCloseTo(0.4);
+    expect(integratedScenario(4).gi?.doorOpen).toBe(false);
+    expect(integratedScenario(8).gi?.doorOpen).toBe(true);
+    expect(integratedScenario(14).gi?.lightIntensity).toBe(0);
+    expect(integratedScenario(18).gi?.lightIntensity).toBe(1);
+    expect(integratedScenario(63)).toEqual(integratedScenario(3));
+  });
+  it('rejects incomplete source identity and incompatible benchmark scenes before capture', () => {
+    expect(() => normalizeOptions({ renderer: 'integrated', manifestUrl: input.manifestUrl })).toThrow(/traceProxyUrl/);
+    for (const patch of [{ seed: 1 }, { giScenario: 'static' as const }, { cameraMode: 'coverage' as const },
+      { terrainColor: 'red' as never }, { reflectionMaxRays: 0 }]) expect(() => normalizeOptions({ ...input, ...patch })).toThrow();
   });
 });

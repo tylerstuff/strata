@@ -1,4 +1,4 @@
-import type { GeometryMode, GeometryTelemetry, RasterControls, GiTelemetry, ReflectionTelemetry, ReflectionMode } from '@strata-engine/core';
+import type { GeometryMode, GeometryTelemetry, RasterControls, GiTelemetry, ReflectionTelemetry, ReflectionMode, IntegratedTelemetry } from '@strata-engine/core';
 
 export interface Distribution {
   count: number;
@@ -45,6 +45,7 @@ export interface FrameSample {
   geometry?: GeometryTelemetry;
   gi?: GiTelemetry;
   reflections?: ReflectionTelemetry;
+  integrated?: IntegratedTelemetry;
   uploadBytes: number;
   allocatedGpuBufferBytes: number;
   allocatedGpuTextureBytes: number;
@@ -75,19 +76,21 @@ export interface BenchmarkOptions {
   durationSeconds: number;
   seed: number;
   instanceCount: number;
-  renderer: 'diffuse' | 'raster' | 'virtual' | 'gi' | 'reflections';
+  renderer: 'diffuse' | 'raster' | 'virtual' | 'gi' | 'reflections' | 'integrated';
   temporal: boolean;
   debugView: NonNullable<RasterControls['debugView']>;
   manifestUrl?: string;
+  traceProxyUrl?: string;
+  terrainColor: 'green' | 'neutral';
   geometryMode: GeometryMode;
   poolBytes: number;
   pixelError: number;
   pageLoadDelayMs: number;
-  cameraMode: 'tour' | 'coverage' | 'receiver' | 'overview';
+  cameraMode: 'tour' | 'coverage' | 'receiver' | 'overview' | 'terrain-witness';
   giEnabled: boolean;
   probesPerUpdate: number;
   raysPerProbe: number;
-  giScenario: 'static' | 'door-light';
+  giScenario: 'static' | 'door-light' | 'integrated-tour';
   reflectionMode: ReflectionMode;
   reflectionResolutionScale: 0.25 | 0.5 | 1;
   reflectionMaxRays: number;
@@ -99,26 +102,30 @@ export interface BenchmarkOptions {
 }
 
 export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): BenchmarkOptions {
+  const integrated = input.renderer === 'integrated';
+  const lighting = input.renderer === 'gi' || input.renderer === 'reflections' || integrated;
   const result: BenchmarkOptions = {
     width: input.width ?? 1280,
     height: input.height ?? 720,
     warmupSeconds: input.warmupSeconds ?? 30,
     durationSeconds: input.durationSeconds ?? 60,
     seed: input.seed ?? 1337,
-    instanceCount: input.renderer === 'gi' || input.renderer === 'reflections' || input.renderer === 'virtual' ? 0 : input.instanceCount ?? 512,
+    instanceCount: lighting || input.renderer === 'virtual' ? 0 : input.instanceCount ?? 512,
     renderer: input.renderer ?? 'diffuse',
     temporal: input.temporal ?? true,
     debugView: input.debugView ?? 'final',
     ...(input.manifestUrl === undefined ? {} : { manifestUrl: input.manifestUrl }),
+    ...(input.traceProxyUrl === undefined ? {} : { traceProxyUrl: input.traceProxyUrl }),
+    terrainColor: input.terrainColor ?? 'green',
     geometryMode: input.geometryMode ?? 'streamed',
-    poolBytes: input.poolBytes ?? 8 * 1024 * 1024,
+    poolBytes: input.poolBytes ?? (integrated ? 1 : 8) * 1024 * 1024,
     pixelError: input.pixelError ?? 2,
     pageLoadDelayMs: input.pageLoadDelayMs ?? 0,
     cameraMode: input.cameraMode ?? (input.renderer === 'reflections' ? 'receiver' : input.renderer === 'gi' ? 'overview' : 'tour'),
     giEnabled: input.giEnabled ?? true,
     probesPerUpdate: input.probesPerUpdate ?? 32,
     raysPerProbe: input.raysPerProbe ?? 64,
-    giScenario: input.giScenario ?? (input.renderer === 'reflections' ? 'static' : 'door-light'),
+    giScenario: input.giScenario ?? (integrated ? 'integrated-tour' : input.renderer === 'reflections' ? 'static' : 'door-light'),
     reflectionMode: input.reflectionMode ?? 'world', reflectionResolutionScale: input.reflectionResolutionScale ?? 0.25,
     reflectionMaxRays: input.reflectionMaxRays ?? 32768, reflectionRoughness: input.reflectionRoughness ?? 0.08,
     reflectionMaxDistance: input.reflectionMaxDistance ?? 16, reflectionUpdateEvery: input.reflectionUpdateEvery ?? 1,
@@ -133,33 +140,39 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     throw new RangeError('Warm-up must be 0–600 seconds and capture must be 0–1800 seconds (exclusive of zero).');
   }
   if (!Number.isInteger(result.seed) || result.seed < 0 || result.seed > 0xffff_ffff
-    || !Number.isInteger(result.instanceCount) || result.instanceCount < (result.renderer === 'gi' || result.renderer === 'reflections' || result.renderer === 'virtual' ? 0 : 1) || result.instanceCount > 16_384) {
+    || !Number.isInteger(result.instanceCount) || result.instanceCount < (lighting || result.renderer === 'virtual' ? 0 : 1) || result.instanceCount > 16_384) {
     throw new RangeError('Use a uint32 seed and 1–16384 instances.');
   }
-  if ((result.renderer === 'gi' || result.renderer === 'reflections') && result.seed !== 1337) throw new RangeError('The GI fixture uses fixed probe seed 1337.');
+  if (lighting && result.seed !== 1337) throw new RangeError('The GI fixture uses fixed probe seed 1337.');
   if (!['performance', 'sustained', 'smoke'].includes(result.mode)) throw new RangeError('Unknown benchmark mode.');
-  if (!['diffuse', 'raster', 'virtual', 'gi', 'reflections'].includes(result.renderer) || typeof result.temporal !== 'boolean'
+  if (!['diffuse', 'raster', 'virtual', 'gi', 'reflections', 'integrated'].includes(result.renderer) || typeof result.temporal !== 'boolean'
     || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility', 'reflections', 'reflection-source'].includes(result.debugView)) {
     throw new RangeError('Unknown renderer, temporal setting, or debug view.');
   }
   if (result.renderer === 'diffuse' && result.debugView !== 'final') throw new RangeError('Debug views require the raster renderer.');
-  if (result.renderer === 'virtual') {
+  if (result.renderer === 'virtual' || integrated) {
     if (!result.manifestUrl || typeof result.manifestUrl !== 'string') throw new RangeError('Virtual geometry requires manifestUrl.');
     if (!['streamed', 'resident-lod', 'resident-full', 'mesh-lod'].includes(result.geometryMode)
-      || !['tour', 'coverage'].includes(result.cameraMode)) throw new RangeError('Unknown geometry mode or camera.');
+      || !(integrated ? ['tour', 'receiver', 'overview', 'terrain-witness'] : ['tour', 'coverage']).includes(result.cameraMode)) throw new RangeError('Unknown geometry mode or camera.');
     if (!Number.isSafeInteger(result.poolBytes) || result.poolBytes < 65536
       || !Number.isFinite(result.pixelError) || result.pixelError <= 0 || result.pixelError > 1000
       || !Number.isFinite(result.pageLoadDelayMs) || result.pageLoadDelayMs < 0 || result.pageLoadDelayMs > 60000) {
       throw new RangeError('Use a positive geometry pool/error and a bounded page delay.');
     }
   }
-  if ((result.renderer === 'gi' || result.renderer === 'reflections') && (typeof result.giEnabled !== 'boolean' || !['static', 'door-light'].includes(result.giScenario)
-    || !['overview', 'receiver', 'tour'].includes(result.cameraMode)
+  if (integrated && (!result.traceProxyUrl || typeof result.traceProxyUrl !== 'string' || !['green', 'neutral'].includes(result.terrainColor))) {
+    throw new RangeError('Integrated geometry requires traceProxyUrl and a supported terrain color.');
+  }
+  if (integrated && result.geometryMode === 'streamed' && result.poolBytes >= 5 * 1024 * 1024) {
+    throw new RangeError('The integrated streamed source must exceed its page pool; use a resident comparison for full residency.');
+  }
+  if (lighting && (typeof result.giEnabled !== 'boolean' || !(integrated ? ['integrated-tour'] : ['static', 'door-light']).includes(result.giScenario)
+    || !(integrated ? ['overview', 'receiver', 'tour', 'terrain-witness'] : ['overview', 'receiver', 'tour']).includes(result.cameraMode)
     || !Number.isInteger(result.probesPerUpdate) || result.probesPerUpdate < 1 || result.probesPerUpdate > 128
     || !Number.isInteger(result.raysPerProbe) || result.raysPerProbe < 16 || result.raysPerProbe > 128)) {
     throw new RangeError('GI requires a supported camera/scenario and bounded probe/ray budget.');
   }
-  if (result.renderer === 'reflections' && (!['off', 'probe-only', 'world'].includes(result.reflectionMode)
+  if ((result.renderer === 'reflections' || integrated) && (!['off', 'probe-only', 'world'].includes(result.reflectionMode)
     || ![0.25, 0.5, 1].includes(result.reflectionResolutionScale)
     || !Number.isInteger(result.reflectionMaxRays) || result.reflectionMaxRays < 1 || result.reflectionMaxRays > 131072
     || !Number.isFinite(result.reflectionRoughness) || result.reflectionRoughness < 0 || result.reflectionRoughness > 0.35

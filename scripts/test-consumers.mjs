@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { cp, lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +14,8 @@ const softwareGpu = process.env.STRATA_TEST_SOFTWARE_GPU === '1';
 const artifactSuffix = softwareGpu ? '-software' : '';
 const giModuleMarker = 'Strata one-bounce software probe trace';
 const reflectionModuleMarker = 'Strata bounded software reflections';
+const integratedModuleMarker = 'Integrated scenes require cooked terrain/proxy URLs';
+const integratedFixture = join(temporary, 'integrated-fixture');
 let browser;
 const servers = [];
 
@@ -64,6 +66,15 @@ async function openConsumer(url, options = {}) {
     if (unsupported) Object.defineProperty(navigator, 'gpu', { value: undefined });
   }, options);
   const page = await context.newPage();
+  // The test's procedural cooker output stays outside both the package and uploaded artifacts.
+  await page.route('**/__integrated__/**', async route => {
+    const path = new URL(route.request().url()).pathname.split('/__integrated__/')[1];
+    if (!path || !/^(manifest\.json|trace-proxy\.json|trace-proxy\.bin|pages\/\d{6}\.bin)$/.test(path)) {
+      await route.fulfill({ status: 404, body: 'Unknown generated fixture asset' }); return;
+    }
+    await route.fulfill({ contentType: path.endsWith('.json') ? 'application/json' : 'application/octet-stream',
+      body: await readFile(join(integratedFixture, path)) });
+  });
   page.setDefaultTimeout(30_000);
   const modules = []; const moduleReads = [];
   context.on('response', (response) => {
@@ -157,6 +168,7 @@ async function checkConsumer(kind, url) {
 
     // Dynamic import must remain lazy in both the native ESM package and Vite's production output.
     const defaultModules = await loadedModules();
+    assert.equal(defaultModules.some(module => module.source.includes(integratedModuleMarker)), false, `${kind}: default consumer fetched integrated geometry`);
     assert.equal(defaultModules.some(module => module.source.includes(giModuleMarker)), false,
       `${kind}: the default consumer eagerly fetched GI implementation code`);
     assert.equal(defaultModules.some(module => module.source.includes(reflectionModuleMarker)), false,
@@ -215,11 +227,31 @@ async function checkConsumer(kind, url) {
     assert.deepEqual(reflection.metrics.reflections, reflected);
     const reflectionModules = (await loadedModules()).filter(module => module.source.includes(reflectionModuleMarker));
     assert.ok(reflectionModules.length > 0, `${kind}: opting into reflections did not load its separate implementation`);
+    assert.equal((await loadedModules()).some(module => module.source.includes(integratedModuleMarker)), false,
+      `${kind}: separate reflection proof fetched integrated geometry`);
+    const integrated = await page.evaluate(() => strataTest.exerciseScene({ renderer: 'integrated',
+      manifestUrl: '/__integrated__/manifest.json', traceProxyUrl: '/__integrated__/trace-proxy.json',
+      cameraMode: 'receiver', poolBytes: 1024 * 1024, probesPerUpdate: 16, raysPerProbe: 32 },
+    { gi: { enabled: true }, reflections: { mode: 'world' } }));
+    assert.equal(integrated.metrics.drawCalls, 5); assert.equal(integrated.metrics.dispatchCalls, 7);
+    assert.equal(integrated.telemetry.gpuErrorCount, 0, integrated.telemetry.lastGpuError ?? undefined);
+    assert.equal(integrated.telemetry.geometry.sourceTriangleCount, 131072);
+    assert.equal(integrated.telemetry.geometry.sourceRootPageCount, 3);
+    assert.equal(integrated.telemetry.geometry.coverageMissingTiles, 0);
+    assert.equal(integrated.telemetry.gi.traceGeometryBytes, 184640);
+    assert.equal(integrated.telemetry.reflections.traceGeometryBytes, 184640);
+    assert.equal(integrated.telemetry.integrated.persistentProxyTriangles, 2048);
+    assert.equal(integrated.telemetry.integrated.totalTraceTriangles, 2204);
+    assert.equal(integrated.telemetry.integrated.collisionRepresentation, 'none');
+    assert.ok((await loadedModules()).some(module => module.source.includes(integratedModuleMarker)),
+      `${kind}: integrated scene did not load its optional implementation`);
     const cleared = await page.evaluate(() => strataTest.exerciseScene(null));
     assert.equal(cleared.metrics.dispatchCalls, 0);
     assert.equal(cleared.telemetry.allocatedGpuBufferBytes, 0);
     assert.equal(cleared.telemetry.allocatedGpuTextureBytes, 0);
     assert.equal(cleared.telemetry.reflections, undefined);
+    assert.equal(cleared.telemetry.integrated, undefined);
+    assert.equal(cleared.telemetry.geometry, undefined);
     assert.equal((await page.evaluate(() => strataTest.dispose())).workers, 0);
     console.log(`${kind}: default/diffuse skipped GI and reflections; GI skipped reflections; opt-in GI loaded ${giModules.length} module(s) and reflections loaded ${reflectionModules.length} module(s), rendered, and released resources`);
 
@@ -249,6 +281,9 @@ async function checkConsumer(kind, url) {
 
 try {
   await mkdir(artifacts, { recursive: true });
+  // Contributor-side fixture generation; the installed runtime has no Rust/build dependency.
+  run('cargo', ['run', '--locked', '--release', '--quiet', '--package', 'strata-geometry-cooker', '--',
+    '--output', integratedFixture, '--tiles', '4', '--cells', '64', '--seed', '1337', '--trace-proxy'], root);
   const [packed] = JSON.parse(run('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temporary], join(root, 'packages', 'core')));
   const files = new Set(packed.files.map((file) => file.path));
   for (const required of ['dist/index.js', 'dist/index.d.ts', 'dist/worker.js', 'dist/strata_runtime.wasm']) {
@@ -258,12 +293,16 @@ try {
   assert.equal(optionalGiFiles.length, 1, 'Packed ESM distribution must contain one separate GI entry chunk');
   const optionalReflectionFiles = [...files].filter(file => /^dist\/reflection-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
   assert.equal(optionalReflectionFiles.length, 1, 'Packed ESM distribution must contain one separate reflection entry chunk');
+  const optionalIntegratedFiles = [...files].filter(file => /^dist\/integrated-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
+  assert.equal(optionalIntegratedFiles.length, 1, 'Packed ESM distribution must contain one separate integrated entry chunk');
   const archive = join(temporary, packed.filename);
   const indexSource = run('tar', ['-xOf', archive, 'package/dist/index.js'], root);
   assert.ok(indexSource.includes(`import("./${optionalGiFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import the shipped GI chunk');
   assert.equal(indexSource.includes(giModuleMarker), false, 'Package entry must not inline GI implementation code');
   assert.ok(indexSource.includes(`import("./${optionalReflectionFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import the shipped reflection chunk');
   assert.equal(indexSource.includes(reflectionModuleMarker), false, 'Package entry must not inline reflection implementation code');
+  assert.ok(indexSource.includes(`import("./${optionalIntegratedFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import its integrated chunk');
+  assert.equal(indexSource.includes(integratedModuleMarker), false, 'Package entry must not inline integrated geometry');
   const manifest = JSON.parse(run('tar', ['-xOf', archive, 'package/package.json'], root));
   for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
     assert.equal(manifest.scripts?.[lifecycle], undefined, `Consumers must not need a ${lifecycle} build`);

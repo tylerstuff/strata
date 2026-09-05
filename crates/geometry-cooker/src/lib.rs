@@ -1,4 +1,6 @@
 mod hash;
+mod trace_proxy;
+pub use trace_proxy::{CookedTraceProxy, cook_trace_proxy, write_trace_proxy};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;

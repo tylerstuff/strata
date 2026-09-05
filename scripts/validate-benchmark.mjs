@@ -41,6 +41,10 @@ const giEvents = [
 function validateGiWorkload(run, prefix) {
   const { workload, quality } = run;
   ensure(workload.giEnabled === quality.giEnabled && workload.giScenario === quality.giScenario, `${prefix} GI quality differs from its workload`);
+  if (workload.renderer === 'integrated') {
+    ensure(run.assetTraffic.externalAssetsUsed === true, `${prefix} integrated fixture must record cooked asset traffic`);
+    return; // Its exact motion/door/light schedule is constrained by integratedQuality.
+  }
   ensure(run.assetTraffic.externalAssetsUsed === false, `${prefix} GI fixture must not claim external asset traffic`);
   const expected = workload.giScenario === 'static' ? [] : giEvents;
   ensure(quality.events.length === expected.length && expected.every((event, index) => {
@@ -51,7 +55,8 @@ function validateGiWorkload(run, prefix) {
 
 function validateGiFrame(run, frame, prior, prefix) {
   const gi = frame.gi;
-  const reflections = run.workload.renderer === 'reflections';
+  const integrated = run.workload.renderer === 'integrated';
+  const reflections = run.workload.renderer === 'reflections' || integrated;
   const composeActive = gi.enabled || (reflections && run.workload.reflectionMode !== 'off');
   const { probesPerUpdate, raysPerProbe } = run.quality;
   const rayBudget = probesPerUpdate * raysPerProbe;
@@ -65,15 +70,18 @@ function validateGiFrame(run, frame, prior, prefix) {
   // Null means the GPU result has not been read. Never turn that absence into a measured zero.
   ensure(gi.traceFailures === null || gi.traceFailures === 0, `${prefix} records GI traversal failures`);
   if (gi.validProbeCount !== null) ensure(gi.validProbeCount <= Math.min(384, gi.probeUpdatesSinceReset), `${prefix} GI valid-probe count exceeds updated coverage`);
-  ensure(frame.triangleCountSourceFrameId === frame.frameId, `${prefix} GI geometry counters have a mismatched source frame`);
+  if (!integrated) ensure(frame.triangleCountSourceFrameId === frame.frameId, `${prefix} GI geometry counters have a mismatched source frame`);
   const dispatches = (gi.enabled ? 2 : 0) + Number(composeActive)
     + (reflections && run.workload.reflectionMode === 'world' ? 1 + Number(frame.reflections.scheduledCandidates > 0) : 0);
-  ensure(frame.drawCalls === 3 + Number(run.workload.temporal) && frame.dispatchCalls === dispatches
+  if (!integrated) ensure(frame.drawCalls === 3 + Number(run.workload.temporal) && frame.dispatchCalls === dispatches
     && frame.triangles === (reflections ? 313 : 265) + Number(run.workload.temporal), `${prefix} GI draw/dispatch/triangle counts do not match the fixture`);
 
-  const phase = run.workload.giScenario === 'static' ? 0 : Math.floor((frame.elapsedMs / 1000) % 60 / 10);
-  ensure(gi.doorOpen === (phase !== 1) && gi.wallColor === (phase === 5 ? 'neutral' : 'red')
-    && gi.lightIntensity === (phase === 3 ? 0.2 : 1), `${prefix} GI world state differs from the scenario at this frame`);
+  // Match the shared simulation helper's modulo arithmetic at exact event boundaries.
+  const phase = integrated ? ((frame.elapsedMs / 1000 % 60) + 60) % 60 : run.workload.giScenario === 'static' ? 0 : Math.floor((frame.elapsedMs / 1000) % 60 / 10);
+  ensure(gi.doorOpen === (integrated ? !(phase >= 4 && phase < 8) : phase !== 1)
+    && gi.wallColor === (!integrated && phase === 5 ? 'neutral' : 'red')
+    && gi.lightIntensity === (integrated ? phase >= 14 && phase < 18 ? 0 : 1 : phase === 3 ? 0.2 : 1), `${prefix} GI world state differs from the scenario at this frame`);
+  if (integrated) close(frame.reflections.objectOffset, phase >= 2 && phase < 6 ? 0.4 * Math.sin((phase - 2) * Math.PI / 2) : 0, `${prefix} integrated object motion`);
   if (gi.enabled) {
     ensure(gi.sourceFrameId === frame.frameId && gi.submittedFrames === frame.frameId && gi.framesSinceReset >= 1
       && gi.cacheEpoch === gi.worldRevision, `${prefix} GI cache epoch or source frame is inconsistent`);
@@ -83,13 +91,14 @@ function validateGiFrame(run, frame, prior, prefix) {
   }
   if (prior) {
     const previous = prior.gi;
-    const changed = gi.doorOpen !== previous.doorOpen || gi.wallColor !== previous.wallColor || gi.lightIntensity !== previous.lightIntensity;
+    const changed = gi.doorOpen !== previous.doorOpen || gi.wallColor !== previous.wallColor || gi.lightIntensity !== previous.lightIntensity
+      || (integrated && frame.reflections.objectOffset !== prior.reflections.objectOffset);
     ensure(frame.frameId === prior.frameId + 1, `${prefix} GI capture skipped a submitted frame`);
     ensure(gi.worldRevision === previous.worldRevision + Number(changed), `${prefix} GI world revision does not match scene changes`);
     if (gi.enabled) ensure(gi.framesSinceReset === (changed ? 1 : previous.framesSinceReset + 1), `${prefix} GI cache age did not reset or advance correctly`);
   }
   // Median subdivision with <=4 triangles per leaf: 156 triangles produce 119 nodes.
-  const traceBytes = reflections ? 119 * 32 + 156 * 64 + 13 * 48 + 5 * 32 + 48 : 11392;
+  const traceBytes = integrated ? 1335 * 32 + 2204 * 64 + 13 * 48 + 6 * 32 + 48 : reflections ? 119 * 32 + 156 * 64 + 13 * 48 + 5 * 32 + 48 : 11392;
   ensure(gi.traceGeometryBytes === traceBytes && gi.cacheBufferBytes === 6368 + rayBudget * 32
     && gi.cacheTextureBytes === 1966080 && gi.composeBufferBytes === 96
     && gi.composeTextureBytes === (composeActive ? run.resolution.width * run.resolution.height * 8 : 0), `${prefix} GI allocation estimates violate the fixed layout`);
@@ -99,6 +108,7 @@ function validateGiFrame(run, frame, prior, prefix) {
 
 function validateReflectionFrame(run, frame, prior, prefix) {
   const reflected = frame.reflections; const gi = frame.gi; const quality = run.quality;
+  if (run.workload.renderer !== 'integrated') ensure(reflected.objectOffset === 0, `${prefix} fixed reflection benchmark moved its object`);
   const world = quality.reflectionMode === 'world'; const active = world || quality.reflectionMode === 'probe-only' || gi.enabled;
   ensure(run.workload.reflectionMode === quality.reflectionMode && reflected.mode === quality.reflectionMode,
     `${prefix} reflection mode differs from its workload`);
@@ -151,9 +161,41 @@ function validateReflectionFrame(run, frame, prior, prefix) {
       ensure((reset && reflected.framesSinceReset === 1) || (reflected.cacheEpoch === previous.cacheEpoch
         && reflected.framesSinceReset === previous.framesSinceReset + 1), `${prefix} reflection epoch and age did not advance consistently`);
       if (gi.worldRevision !== prior.gi.worldRevision) ensure(reset, `${prefix} changed reflection world reused an old cache epoch`);
-      else if (run.workload.cameraPath !== 'reflections-tour-v1') ensure(!reset, `${prefix} static reflection camera unexpectedly reset its cache`);
+      else if (!['reflections-tour-v1', 'integrated-tour-v1'].includes(run.workload.cameraPath)) ensure(!reset, `${prefix} static reflection camera unexpectedly reset its cache`);
     }
   }
+}
+
+function validateIntegratedFrame(run, frame, prefix) {
+  const info = frame.integrated; const geometry = frame.geometry; const quality = run.quality;
+  ensure(info.cameraPath === run.workload.cameraPath && info.terrainColor === run.workload.terrainColor
+    && quality.terrainColor === info.terrainColor && quality.geometryMode === run.workload.geometryMode,
+  `${prefix} integrated scene differs from its workload`);
+  ensure(Object.entries(info).every(([key, value]) => quality.representation[key] === value), `${prefix} integrated tracing representation changed during capture`);
+  close(info.proxyMaxVerticalError, (0.07 * (64 / 3 + 1 / 3) + 0.0001) * 0.125, `${prefix} proxy bound`);
+  ensure(info.proxyMeasuredMaxVerticalError <= info.proxyMaxVerticalError, `${prefix} measured proxy error exceeds its bound`);
+  const asset = run.metadata.geometryAsset;
+  if (asset) ensure(info.proxySourceManifestSha256 === asset.manifestSha256
+    && info.proxyPayloadSha256 === asset.traceProxy?.mesh?.sha256, `${prefix} tracing proxy does not match external source metadata`);
+  ensure(geometry.cameraPath === run.workload.cameraPath && geometry.geometryMode === quality.geometryMode
+    && geometry.sourceSeed === 1337 && geometry.sourceTilesPerSide === 4 && geometry.sourceCellsPerTile === 64
+    && geometry.sourceTriangleCount === 131072 && geometry.sourcePageCount === 80 && geometry.sourceRootPageCount === 3
+    && geometry.uniqueCompiledBytes === run.workload.uniqueCompiledBytes,
+  `${prefix} integrated geometry source changed or differs from the fixture`);
+  ensure(geometry.pixelError === quality.pixelError && geometry.pageLoadDelayMs === quality.pageLoadDelayMs,
+    `${prefix} integrated geometry budget differs from its quality settings`);
+  const mesh = quality.geometryMode === 'mesh-lod';
+  if (mesh) ensure(geometry.poolBytes === 0 && geometry.residentPages === 0 && geometry.packedGeometryBytes > 0,
+    `${prefix} conventional geometry claims a page pool or lacks packed geometry`);
+  else if (quality.geometryMode === 'streamed') ensure(geometry.poolBytes < geometry.uniqueCompiledBytes,
+    `${prefix} streamed integrated source must exceed its resident page pool`);
+  else ensure(geometry.residentPages === 80 && geometry.capacityPages === 80, `${prefix} resident comparison lacks source pages`);
+  const active = frame.gi.enabled || frame.reflections.mode !== 'off'; const world = frame.reflections.mode === 'world';
+  const dispatches = Number(!mesh) * 2 + Number(frame.gi.enabled) * 2 + Number(active) + Number(world) + Number(world && frame.reflections.scheduledCandidates > 0);
+  ensure(frame.dispatchCalls === dispatches && frame.drawCalls === (mesh ? geometry.visibleTiles + 19 : 5) + Number(run.workload.temporal),
+    `${prefix} integrated draw/dispatch counts differ from its submitted providers`);
+  ensure(frame.triangles === geometry.selectedTriangles + geometry.shadowTriangles + 313 + Number(run.workload.temporal),
+    `${prefix} integrated triangle count does not combine delayed terrain and current room counts`);
 }
 
 /** Validate a completed session and the relationships JSON Schema cannot express. */
@@ -172,8 +214,9 @@ export function validateBenchmarkReport(report) {
     ensure(run.mode === report.mode, `${prefix} mode differs from the session`);
     ensure((run.resolution.width === 1280 && run.resolution.height === 720)
       || (run.resolution.width === 1920 && run.resolution.height === 1080), `${prefix} has a mismatched resolution pair`);
-    const virtual = run.workload.renderer === 'virtual';
-    const reflections = run.workload.renderer === 'reflections';
+    const integrated = run.workload.renderer === 'integrated';
+    const virtual = run.workload.renderer === 'virtual' || integrated;
+    const reflections = run.workload.renderer === 'reflections' || integrated;
     const gi = run.workload.renderer === 'gi' || reflections;
     ensure(run.workload.seed <= 0xffff_ffff && (virtual || gi ? run.workload.instanceCount === 0
       : run.workload.instanceCount >= 1 && run.workload.instanceCount <= 16_384), `${prefix} has an invalid procedural workload`);
@@ -217,6 +260,7 @@ export function validateBenchmarkReport(report) {
       }
       if (gi) validateGiFrame(run, frame, frames[frameIndex - 1], `${prefix}.frames[${frameIndex}]`);
       if (reflections) validateReflectionFrame(run, frame, frames[frameIndex - 1], `${prefix}.frames[${frameIndex}]`);
+      if (integrated) validateIntegratedFrame(run, frame, `${prefix}.frames[${frameIndex}]`);
       if (frame.gpuSpanMs !== undefined || frame.gpuPassIntervals !== undefined) {
         ensure(frame.gpuPassIntervals !== undefined && frame.gpuSpanMs !== undefined, `${prefix} GPU span requires pass intervals`);
         const intervals = Object.entries(frame.gpuPassIntervals);
@@ -267,6 +311,8 @@ export function validateBenchmarkReport(report) {
     }
     if (reflections) ensure(Object.entries(frames.at(-1).reflections).every(([key, value]) => run.allocations.reflections[key] === value),
       `${prefix} final reflection telemetry differs from the last submitted frame`);
+    if (integrated) ensure(Object.entries(frames.at(-1).integrated).every(([key, value]) => run.allocations.integrated[key] === value),
+      `${prefix} final integrated telemetry differs from the last submitted frame`);
     const intervalTotal = frames.reduce((sum, frame) => sum + frame.frameIntervalMs, 0);
     close(capture.actualDurationMs, intervalTotal, `${prefix} capture duration`);
     ensure(capture.actualDurationMs + 1e-5 >= capture.requestedDurationSeconds * 1000, `${prefix} ended before its requested capture duration`);
