@@ -51,7 +51,7 @@ function summarize(name: string, canvas: HTMLCanvasElement): Capture {
 }
 
 /** Freeze the current presented source before the RAF callback returns; fence the same submission afterwards. */
-async function frame(engine: Engine, canvas: HTMLCanvasElement, options: RenderOptions, captureName?: string) {
+async function frame(engine: Engine, canvas: HTMLCanvasElement, options: RenderOptions, captureName?: string, expectedIdleError?: string) {
   const copy = captureName ? document.createElement('canvas') : undefined;
   if (copy) { copy.width = canvas.width; copy.height = canvas.height; }
   let metrics!: FrameMetrics;
@@ -63,9 +63,11 @@ async function frame(engine: Engine, canvas: HTMLCanvasElement, options: RenderO
       resolve();
     } catch (error) { reject(error); }
   })), 'Public frame RAF');
-  await engine.waitForIdle(15_000);
+  let idleError: string | undefined;
+  try { await engine.waitForIdle(15_000); } catch (error) { if (!expectedIdleError) throw error; idleError = code(error); }
+  require(idleError === expectedIdleError, `Expected idle result ${expectedIdleError ?? 'success'}, received ${idleError ?? 'success'}.`);
   require(engine.getTelemetry().gpuErrorCount === 0, `Public engine GPU error: ${engine.getTelemetry().lastGpuError}`);
-  return { metrics, capture: copy ? summarize(captureName!, copy) : undefined, telemetry: engine.getTelemetry() };
+  return { metrics, capture: copy ? summarize(captureName!, copy) : undefined, telemetry: engine.getTelemetry(), idleError };
 }
 
 function counters(engine: Engine, expected: number) {
@@ -175,6 +177,12 @@ export async function validateImportedProgressive() {
     require(imageError(settled).rmseDisplayBytes < 6 && imageError(settled).meanErrorDisplayBytes.every(v => Math.abs(v) < 3),
       'The aggregate 64-sample image must approach the single-counted sky reference within the predeclared display-space bounds.');
     const atCap = counters(engine, 16 * 16 * limits.maxSamples);
+    const ordinaryProgressiveAllocations = [engine.getTelemetry().allocatedGpuBufferBytes, engine.getTelemetry().allocatedGpuTextureBytes];
+    const unsupportedBefore = engine.getTelemetry(); let unsupportedDenoise = '';
+    try { engine.render({ ...onOptions, imported: { ...controls, background: [1, 0, 1], indirect: { enabled: true, denoise: 'spatial' } } }); }
+    catch (error) { unsupportedDenoise = code(error); }
+    require(unsupportedDenoise === 'UNSUPPORTED_FEATURE' && same(engine.getTelemetry(), unsupportedBefore),
+      'The ordinary six-binding scene must reject spatial mode before changing any public scene/control state.');
     for (let i = 0; i < 3; i++) await frame(engine, canvas, onOptions);
     const capped = await frame(engine, canvas, onOptions, 'sky-capped'); captures.push(capped.capture!);
     const capCounters = counters(engine, 16 * 16 * limits.maxSamples);
@@ -282,6 +290,81 @@ export async function validateImportedProgressive() {
     require(same(emissionDefault.capture!.pixels, emissionOff.capture!.pixels), 'Default exposure must return emission to its original byte values.');
     cases.push({ name: 'public-direct-final-exposure-numeric', expectedEmissionTwo, actualMeanRgb: emissionDirectTwo.capture!.meanRgb,
       absoluteDisplayByteTolerance: 1.5, definedBeforeGpuObservation: true });
+
+    // Independent opt-in lifetime: existing ordinary-path cases above keep their
+    // original numeric limits, six storage bindings and presentation behavior.
+    const spatialLimits = { ...limits, maxPixels: 1048576, maxSamples: 8, spatialDenoise: true };
+    const spatialReceipt = await engine.setScene({ renderer: 'imported', asset, indirect: spatialLimits });
+    await stage('spatial');
+    for (let i = 0; i < spatialLimits.maxSamples; i++) await frame(engine, canvas, onOptions);
+    const spatialOff = await frame(engine, canvas, onOptions, 'spatial-capability-off'); captures.push(spatialOff.capture!);
+    const spatialBefore = counters(engine, 16 * 16 * spatialLimits.maxSamples);
+    const spatialAllocations = [engine.getTelemetry().allocatedGpuBufferBytes, engine.getTelemetry().allocatedGpuTextureBytes];
+    require(spatialBefore.spatialDenoise === true && spatialBefore.denoise === 'off'
+      && !('spatialDenoise' in spatialBefore.limits), 'Lifetime capability must be explicit and independent from numeric limits and initial mode.');
+    require(spatialAllocations[0] === ordinaryProgressiveAllocations[0]! + 16 + 32 * 256
+      && spatialAllocations[1] === ordinaryProgressiveAllocations[1], 'Optional guides must add exactly one 16-byte header plus 32 bytes per pixel, with no new texture.');
+    const spatialOptions: RenderOptions = { ...onOptions, imported: { ...controls, indirect: { enabled: true, denoise: 'spatial' } } };
+    const buildsBeforeToggle = workerEvents.filter(value => value.type === 'build-static-bvh').length;
+    const spatialOn = await frame(engine, canvas, spatialOptions, 'spatial-capability-on'); captures.push(spatialOn.capture!);
+    const spatialCounter = counters(engine, 16 * 16 * spatialLimits.maxSamples);
+    require(spatialCounter.denoise === 'spatial' && spatialCounter.presentationRevision === spatialBefore.presentationRevision + 1,
+      'The first spatial submission must identify its presentation revision.');
+    require(spatialCounter.spatialDiagnostics?.filteredPixels === 256 && spatialCounter.spatialDiagnostics?.guideBypassPixels === 0
+      && spatialCounter.spatialDiagnostics?.hdrFaultChannels === 0,
+      'Every covered floor pixel must produce a valid primary guide and enter reconstruction without a presentation fault.');
+    const persistent = await frame(engine, canvas, onOptions, 'spatial-mode-omitted'); captures.push(persistent.capture!);
+    require(same(persistent.capture!.pixels, spatialOn.capture!.pixels) && counters(engine, 2048).denoise === 'spatial',
+      'Omitting denoise must retain spatial mode and its capped image.');
+    const noImported = await frame(engine, canvas, { temporal: true });
+    require(noImported.telemetry.imported!.indirect!.progress.denoise === 'spatial', 'Omitting imported controls must also retain the mode.');
+    const offAgain = await frame(engine, canvas, { ...onOptions, imported: { ...controls, indirect: { enabled: true, denoise: 'off' } } }, 'spatial-off-restored');
+    captures.push(offAgain.capture!); const spatialAfter = counters(engine, 2048);
+    require(same(offAgain.capture!.pixels, spatialOff.capture!.pixels), 'Disabling reconstruction must restore the exact capped raw presentation.');
+    require(spatialAfter.revision === spatialBefore.revision && spatialAfter.attempted === spatialBefore.attempted
+      && spatialAfter.completed === spatialBefore.completed && spatialAfter.presentationRevision === spatialBefore.presentationRevision + 2,
+      'Mode switches must preserve raw sample counts and accumulation revision.');
+    require(same([engine.getTelemetry().allocatedGpuBufferBytes, engine.getTelemetry().allocatedGpuTextureBytes], spatialAllocations)
+      && workerEvents.filter(value => value.type === 'build-static-bvh').length === buildsBeforeToggle,
+      'Mode changes must not allocate new targets or build another BVH.');
+    const invalidDenoise: Record<string, unknown>[] = [];
+    for (const mode of [null, 'temporal', true]) {
+      const before = engine.getTelemetry(); let rejection = '';
+      try { engine.render({ ...onOptions, imported: { ...controls, background: [1, 0, 1], indirect: { enabled: true, denoise: mode } } } as never); }
+      catch (error) { rejection = code(error); }
+      require(rejection === 'INVALID_OPTIONS' && same(engine.getTelemetry(), before), 'Malformed denoise must reject atomically before any imported control change.');
+      invalidDenoise.push({ mode, rejection });
+    }
+    const beforeSpatialResize = engine.getTelemetry(), beforeSpatialSize = [canvas.width, canvas.height]; let spatialResize = '';
+    try { engine.resize(257, 256); } catch (error) { spatialResize = code(error); }
+    require(spatialResize === 'UNSUPPORTED_LIMIT' && same(engine.getTelemetry(), beforeSpatialResize) && same([canvas.width, canvas.height], beforeSpatialSize),
+      'The 65,536-pixel lifetime capability cap applies while filtering is off, even with maxPixels 1,048,576.');
+    cases.push({ name: 'public-spatial-capability-and-capped-mode-lifecycle', receipt: spatialReceipt, spatialLimits,
+      ordinaryProgressiveAllocations, spatialAllocations, spatialBefore, spatialCounter, spatialAfter, unsupportedDenoise, invalidDenoise, spatialResize,
+      scope: 'Public capped counters and exact restored presentation; raw buffer bit identity and detailed filter numerics belong to separate internal shader tests.' });
+
+    // A finite direct HDR value deliberately exceeds the optional presentation
+    // ceiling. Failure is visible in independent diagnostics, never raw samples.
+    const overRange = floorAsset([1, 0, 0]);
+    const faultAsset = { ...overRange, materials: [{ ...overRange.materials[0]!, emissiveStrength: 65504 }] };
+    const faultReceipt = await engine.setScene({ renderer: 'imported', asset: faultAsset, indirect: spatialLimits });
+    const faultControls: RenderOptions = { temporal: true, imported: { ...noSky, indirect: { enabled: true, denoise: 'spatial' } } };
+    const fault = await frame(engine, canvas, faultControls, 'spatial-hdr-fault-marker', 'PRESENTATION_HDR_FAULT'); captures.push(fault.capture!);
+    const faultCounters = counters(engine, 256);
+    require(engine.state === 'ready' && (faultCounters.spatialDiagnostics?.hdrFaultChannels ?? 0) > 0,
+      'A current HDR fault must leave the engine ready and publish separate presentation diagnostics.');
+    const faultOff = await frame(engine, canvas, { ...faultControls, imported: { ...noSky, indirect: { enabled: true, denoise: 'off' } } }, 'spatial-off-hdr-fault-marker', 'PRESENTATION_HDR_FAULT');
+    captures.push(faultOff.capture!); const faultOffCounters = counters(engine, 512);
+    require(faultOffCounters.denoise === 'off' && (faultOffCounters.spatialDiagnostics?.hdrFaultChannels ?? 0) > 0,
+      'Disabling filtering must not hide an invalid raw HDR result on a capability-enabled scene.');
+    const healthyReceipt = await engine.setScene({ renderer: 'imported', asset, indirect: spatialLimits });
+    const recovered = await frame(engine, canvas, onOptions, 'spatial-fault-new-scene-recovered'); captures.push(recovered.capture!);
+    const recoveredCounters = counters(engine, 256);
+    require(recoveredCounters.spatialDiagnostics?.hdrFaultChannels === 0 && engine.state === 'ready',
+      'A healthy replacement must clear the retired scene presentation fault without poisoning GPU state.');
+    cases.push({ name: 'public-spatial-presentation-fault-and-recovery', faultReceipt, healthyReceipt,
+      faultCode: fault.idleError, faultCounters, faultOffCode: faultOff.idleError, faultOffCounters, recoveredCounters,
+      actualGpuErrorCount: engine.getTelemetry().gpuErrorCount, knownPrimaryLinearHdr: [65504, 0, 0], conservativePresentationMaximum: 65472 });
 
     let posted!: (id: number) => void;
     const observedPost = new Promise<number>(resolve => { posted = resolve; });

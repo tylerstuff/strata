@@ -6,3 +6,5 @@ export type {
 } from './imported/imported-types.js';
 export { estimateImportedTextureAllocation } from './imported/imported-texture-plan.js';
 export type { ImportedTextureAllocationOptions, ImportedTextureAllocationRecord, ImportedTextureAllocationEstimate } from './imported/imported-texture-plan.js';
+
+export type { ImportedIndirectOptions, ImportedIndirectTraceOptions, ImportedIndirectDenoise, ImportedIndirectProgress, ImportedIndirectReadback, ImportedSpatialDiagnostics } from './imported/imported-indirect-types.js';

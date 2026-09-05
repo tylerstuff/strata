@@ -39,11 +39,22 @@ export interface ImportedIndirectEnvironment {
   readonly constantRadiance?: ImportedVec3;
 }
 export interface ImportedIndirectOptions {
+  /** Explicit presentation capability: seven storage bindings and a 65,536-pixel lifetime cap. */
+  readonly spatialDenoise?: boolean;
   readonly maxPixels?: number;
   readonly pixelBatch?: number;
   readonly maxSamples?: number;
   readonly maxVisits?: number;
   readonly seed?: number;
+}
+/** Numeric transport limits; presentation capability never participates in reset keys. */
+export type ImportedIndirectTraceOptions = Omit<ImportedIndirectOptions, 'spatialDenoise'>;
+export type ImportedIndirectDenoise = 'off' | 'spatial';
+export interface ImportedSpatialDiagnostics {
+  readonly filteredPixels: number;
+  readonly fallbackChannels: number;
+  readonly hdrFaultChannels: number;
+  readonly guideBypassPixels: number;
 }
 export interface ImportedIndirectCreateOptions {
   readonly source: ImportedIndirectSource;
@@ -57,6 +68,12 @@ export interface ImportedIndirectProgress {
   /** Changes only when a reset frame is submitted. */
   readonly revision: number;
   readonly submittedFrames: number;
+  /** Engine frame identity of the last submitted composition, never a sample count. */
+  readonly submittedFrameId: number | null;
+  readonly spatialDenoise: boolean;
+  readonly denoise: ImportedIndirectDenoise;
+  /** Changes on presentation control edits, without resetting transport. */
+  readonly presentationRevision: number;
   readonly batchCursor: number;
   readonly width: number;
   readonly height: number;
@@ -66,9 +83,11 @@ export interface ImportedIndirectProgress {
   readonly normalMode: 'geometric';
   readonly textureLod: 0;
   /** Scheduling limits, not measured samples per pixel. */
-  readonly limits: Required<ImportedIndirectOptions>;
+  readonly limits: Required<ImportedIndirectTraceOptions>;
 }
 export interface ImportedIndirectReadback extends ImportedIndirectProgress {
+  /** Per-composition diagnostics, tagged with this readback's mode/frame/revision. */
+  readonly spatialDiagnostics?: ImportedSpatialDiagnostics;
   /** GPU counters in this accumulation revision. Attempts are not accepted-only normalization. */
   readonly attempted: number;
   readonly completed: number;

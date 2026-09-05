@@ -276,6 +276,43 @@ describe('engine lifecycle', () => {
     engine.dispose();
   });
 
+  it('rechecks optional capability dimensions at async scene completion before retiring the current scene', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    fixture.canvas.width = 16; fixture.canvas.height = 16;
+    const old = { initialUploadBytes: 0, gpuBufferBytes: 16, gpuTextureBytes: 0, dispose: vi.fn() };
+    const wait = deferred<ImportedRendererType>();
+    const load = vi.spyOn(ImportedRenderer, 'create').mockResolvedValueOnce(old as unknown as ImportedRendererType).mockReturnValueOnce(wait.promise);
+    const engine = await ready(); const receipt = await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset });
+    const pending = engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true, maxPixels: 1048576 } });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
+    await flushMicrotasks(); expect(load).toHaveBeenCalledTimes(2);
+    // Canvas ownership cannot prevent an external DOM resize during worker/GPU creation.
+    fixture.canvas.width = 257; fixture.canvas.height = 256;
+    const candidate = { hasIndirect: true, initialUploadBytes: 0, gpuBufferBytes: 32, gpuTextureBytes: 0,
+      validateSize: vi.fn((width: number, height: number) => { if (width * height > 65536) throw new StrataError('UNSUPPORTED_LIMIT', 'lifetime spatial capability'); }), dispose: vi.fn() };
+    wait.resolve(candidate as unknown as ImportedRendererType); await rejected;
+    expect(candidate.validateSize).toHaveBeenCalledWith(257, 256); expect(candidate.dispose).toHaveBeenCalledOnce();
+    expect(old.dispose).not.toHaveBeenCalled(); expect(engine.getTelemetry().scene?.identity.sceneGeneration).toBe(receipt.sceneGeneration);
+    expect(engine.getTelemetry().allocatedGpuBufferBytes).toBe(16);
+    engine.dispose(); expect(old.dispose).toHaveBeenCalledOnce(); expect(candidate.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('preserves the presentation fault code and permits healthy scene replacement without a GPU error', async () => {
+    const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
+    const fault = { hasIndirect: true, initialUploadBytes: 0, gpuBufferBytes: 0, gpuTextureBytes: 0, validateSize: vi.fn(),
+      readIndirectProgress: vi.fn(async () => { throw new StrataError('PRESENTATION_HDR_FAULT', 'finite presentation range exceeded'); }), dispose: vi.fn() };
+    const healthy = { ...fault, readIndirectProgress: vi.fn(async () => {}), dispose: vi.fn() };
+    vi.spyOn(ImportedRenderer, 'create').mockResolvedValueOnce(fault as unknown as ImportedRendererType).mockResolvedValueOnce(healthy as unknown as ImportedRendererType);
+    const engine = await ready(); await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true } });
+    await expect(engine.waitForIdle()).rejects.toMatchObject({ code: 'PRESENTATION_HDR_FAULT' });
+    expect(engine.state).toBe('ready'); expect(engine.getTelemetry()).toMatchObject({ gpuErrorCount: 0, lastGpuError: null });
+    const next = await engine.setScene({ renderer: 'imported', asset: {} as ImportedAsset, indirect: { spatialDenoise: true } });
+    await expect(engine.waitForIdle()).resolves.toBeUndefined();
+    expect(fault.dispose).toHaveBeenCalledOnce(); expect(healthy.readIndirectProgress).toHaveBeenCalledOnce();
+    expect(engine.getTelemetry().scene?.identity.sceneGeneration).toBe(next.sceneGeneration); expect(engine.state).toBe('ready');
+    engine.dispose(); expect(healthy.dispose).toHaveBeenCalledOnce();
+  });
+
   it('keeps a direct-only replacement behind the cancelled worker acknowledgement barrier', async () => {
     const { ImportedRenderer } = await import('../../packages/core/src/imported/imported-renderer.js');
     const acknowledgement = deferred<void>();

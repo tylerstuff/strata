@@ -7,7 +7,7 @@ import { ImportedGeometry } from './imported-geometry.js';
 import type { ImportedAsset, ImportedControls, ImportedSceneOptions, ImportedTelemetry } from './imported-types.js';
 import type { CpuRuntime } from '../internal/cpu-runtime.js';
 import type { ImportedIndirectEffect } from './imported-indirect-effect.js';
-import type { ImportedIndirectReadback } from './imported-indirect-types.js';
+import type { ImportedIndirectProgress, ImportedIndirectReadback } from './imported-indirect-types.js';
 
 type Controls = RasterControls & { imported?: ImportedControls };
 interface CreationContext { readonly cpu: CpuRuntime; readonly width: number; readonly height: number; readonly additionalResidentCpuBytes: number; }
@@ -44,12 +44,15 @@ export class ImportedRenderer {
     let prepared: Awaited<ReturnType<typeof import('./static-trace-data.js')['prepareImportedStaticTrace']>> | undefined;
     let result: Awaited<ReturnType<CpuRuntime['buildStaticBvh']>> | undefined;
     let effectModule: typeof import('./imported-indirect-effect.js') | undefined;
+    let spatialDenoise = false;
     let indirectOptions: ReturnType<typeof import('./imported-indirect-options.js')['normalizeImportedIndirectOptions']> | undefined;
     if (options.indirect !== undefined) {
       if (!context) throw new StrataError('INVALID_OPTIONS', 'Progressive imported lighting requires the engine CPU runtime and viewport.');
       const preflight = await import('./imported-indirect-options.js'); checkAbort(options.signal);
       indirectOptions = preflight.normalizeImportedIndirectOptions(options.indirect);
       preflight.validateImportedIndirectSize(device.limits, context.width, context.height, indirectOptions);
+      spatialDenoise = preflight.normalizeImportedSpatialDenoise(options.indirect);
+      preflight.validateImportedIndirectCapability(device.limits, context.width, context.height, spatialDenoise);
       const source = await import('./static-trace-data.js'); checkAbort(options.signal);
       await context.cpu.waitForStaticBvhIdle(); checkAbort(options.signal);
       prepared = await source.prepareImportedStaticTrace(options.asset, device.limits, {
@@ -71,7 +74,7 @@ export class ImportedRenderer {
         const lighting = geometry.lighting;
         indirect = await effectModule.ImportedIndirectEffect.create(device, {
           source: { nodes: new Uint8Array(result.nodes), triangles: new Uint8Array(result.triangles), vertices: prepared.vertices, indices: prepared.indices },
-          material: geometry.borrowIndirectMaterial(prepared.sourceMaterialIndex), lighting, environment: incident(lighting), options: indirectOptions,
+          material: geometry.borrowIndirectMaterial(prepared.sourceMaterialIndex), lighting, environment: incident(lighting), options: { ...indirectOptions, spatialDenoise },
           ...(options.signal ? { signal: options.signal } : {}),
         });
         geometry.useIndirectBaseline();
@@ -91,7 +94,7 @@ export class ImportedRenderer {
     if (!this.indirect || !this.traceSummary) return base;
     const progress = this.indirect.progress;
     return { ...base, indirect: { mode: 'progressive-diffuse', temporal: false, rasterAmbient: 'disabled', rasterEnvironment: 'disabled',
-      progress, sampleCounters: this.counters?.revision === progress.revision && !progress.pendingReset ? this.counters : null, ...this.traceSummary } };
+      progress, sampleCounters: this.counters && this.matchesReadback(this.counters, progress) ? this.counters : null, ...this.traceSummary } };
   }
   get outputs(): RasterOutputs | undefined { return this.raster.outputs; }
   get directTexture(): GPUTexture | undefined { return this.raster.directTexture; }
@@ -99,19 +102,36 @@ export class ImportedRenderer {
   get hasIndirect(): boolean { return this.indirect !== undefined; }
   validateSize(width: number, height: number): void { this.indirect?.validateSize(width, height); }
   async readIndirectProgress(): Promise<void> {
-    if (this.counterReadback) return this.counterReadback;
-    if (!this.indirect || this.indirect.progress.pendingReset || !this.indirect.progress.submittedFrames) return;
-    const effect = this.indirect;
-    const operation = effect.readProgress().then(counters => {
-      if (!this.disposed && counters.revision === effect.progress.revision && !effect.progress.pendingReset) this.counters = counters;
-    }, cause => {
-      // Retirement during an idle diagnostic must not report the replacement
-      // engine as disposed. A live scene's readback failure remains an error.
-      if (!this.disposed) throw cause;
-    });
-    const pending = operation.finally(() => { if (this.counterReadback === pending) this.counterReadback = undefined; });
-    this.counterReadback = pending;
-    return pending;
+    // An earlier idle request may have copied frame A before this caller fenced
+    // frame B. Join A, then obtain B's header rather than accepting stale data.
+    if (this.counterReadback) await this.counterReadback;
+    if (this.disposed || !this.indirect) return;
+    const effect = this.indirect, progress = effect.progress;
+    if (progress.pendingReset || progress.pendingFrame || !progress.submittedFrames) return;
+    if (!this.counters || !this.matchesReadback(this.counters, progress)) {
+      if (!this.counterReadback) {
+        const operation = effect.readProgress().then(counters => {
+          if (!this.disposed && this.matchesReadback(counters, effect.progress)) this.counters = counters;
+        }, cause => {
+          // Retirement must not report the replacement engine as disposed.
+          if (!this.disposed) throw cause;
+        });
+        const pending = operation.finally(() => { if (this.counterReadback === pending) this.counterReadback = undefined; });
+        this.counterReadback = pending;
+      }
+      await this.counterReadback;
+    }
+    // Only a currently matching result may reject. A completed older promise
+    // never carries a presentation fault into a later frame or display mode.
+    if (!this.disposed && this.counters && this.matchesReadback(this.counters, effect.progress)
+      && this.counters.spatialDiagnostics?.hdrFaultChannels) {
+      throw new StrataError('PRESENTATION_HDR_FAULT', 'Imported indirect composition exceeds the explicit spatial capability HDR domain [0, 65472]; inspect spatialDiagnostics.hdrFaultChannels. Raw transport is unchanged.');
+    }
+  }
+  private matchesReadback(readback: ImportedIndirectReadback, progress: ImportedIndirectProgress): boolean {
+    return !progress.pendingReset && !progress.pendingFrame && readback.revision === progress.revision
+      && readback.submittedFrameId === progress.submittedFrameId && readback.presentationRevision === progress.presentationRevision
+      && readback.denoise === progress.denoise;
   }
   private configure(controls: Controls): Controls {
     normalizeRasterControls(controls);
@@ -120,12 +140,16 @@ export class ImportedRenderer {
       throw new StrataError('INVALID_OPTIONS', 'Imported indirect controls require a boolean enabled.');
     }
     if (!this.indirect && input?.indirect !== undefined) throw new StrataError('UNSUPPORTED_FEATURE', 'Create the imported scene with indirect options before enabling progressive lighting.');
+    if (input?.indirect?.denoise !== undefined) this.indirect!.validateDenoise(input.indirect.denoise);
     if (this.indirect && input?.presentation === 'ground') throw new StrataError('UNSUPPORTED_FEATURE', 'Progressive imported lighting traces the model only; ground participation is unsupported.');
     const reset = this.geometry.update(input); this.forceReset = this.forceReset || reset;
     if (this.indirect) {
       const lighting = this.geometry.lighting;
       this.indirect.updateLighting(lighting, incident(lighting));
-      if (input?.indirect) this.indirect.setEnabled(input.indirect.enabled);
+      if (input?.indirect) {
+        if (input.indirect.denoise !== undefined) this.indirect.setDenoise(input.indirect.denoise);
+        this.indirect.setEnabled(input.indirect.enabled);
+      }
       return { ...controls, temporal: false };
     }
     return controls;
@@ -141,7 +165,7 @@ export class ImportedRenderer {
     }
     catch (cause) { this.cancelFrame(); throw cause; }
   }
-  submitted(_frameId: number): void { this.indirect?.submitted(); this.geometry.submitted(); this.forceReset = false; }
+  submitted(frameId: number): void { this.indirect?.submitted(frameId); this.geometry.submitted(); this.forceReset = false; }
   cancelFrame(): void { this.indirect?.cancelFrame(); this.geometry.cancelFrame(); this.forceReset = true; }
   dispose(): void { if (this.disposed) return; this.disposed = true; this.raster.dispose(); }
 }

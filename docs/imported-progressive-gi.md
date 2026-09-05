@@ -85,3 +85,112 @@ Each pixel's accumulator occupies 32 bytes, the composed HDR target 8 bytes, and
 Generated validation covers original source IDs and barycentrics, small triangles and grazing rays, visibility budgets, an offscreen colored rectangle with an independent form-factor reference, blocked openings and secondary-light occlusion, visible versus bounced environment, emission/color-space interpretation, and effect lifecycle. Explicit-point shader fixtures are distinguished from tests with valid camera matrices. Deterministic sampled-ray agreement is reported separately from a distribution's analytic mean; a fixed hash sequence is not assumed to be IID.
 
 Actual-house acceptance needs a fixed interior camera, verified source/texture identities, zero unexplained invalid or exhausted paths and a clear blocked/offscreen transport witness. Those assets, BVHs and captures remain external. Generated tests and a small reference scene do not establish gallery-wide quality, 60 FPS or superiority over another renderer.
+
+## Optional spatial reconstruction experiment
+
+A scene can explicitly retain geometric guides for a bounded presentation filter:
+
+```ts
+engine.resize(320, 180);
+await engine.setScene({
+  renderer: 'imported', asset,
+  indirect: { maxSamples: 64, spatialDenoise: true },
+});
+engine.render({ imported: { indirect: { enabled: true, denoise: 'spatial' } } });
+await engine.waitForIdle();
+// Retain the same samples and guides for an unfiltered comparison.
+engine.render({ imported: { indirect: { enabled: true, denoise: 'off' } } });
+```
+
+`spatialDenoise` is a creation capability, separately normalized from numeric trace
+limits. It requires seven storage bindings and imposes a 65,536-pixel lifetime
+viewport cap, including when filtering is off. Admission checks precede source
+preparation and repeat at resize and final asynchronous commitment. There is no
+implicit fallback. Without this capability, the original six-binding shader,
+resource layout and tracing limits remain in use. Requesting `spatial` without it
+rejects before geometry or lighting changes.
+
+`denoise` initially defaults to `off` and persists when omitted. Providing indirect
+controls still requires `enabled`. Changing only this filter does not reset or
+retrace transport or upload source geometry. Ordinary submitted-frame and batch
+cursor advancement continues, including at the sample cap. Pausing/re-enabling
+indirect lighting retains its existing reset behavior.
+
+The optional buffer contains a 16-byte diagnostic header and 32 bytes per pixel:
+exact primary diffuse reflectance, the BVH triangle index and normal orientation,
+exact primary point and a local world-space pixel footprint. This adds 1,843,216
+bytes at 320×180, or 2,097,168 bytes at the capability cap. Guides are populated
+alongside the original validated primary hit, before secondary tracing, without
+another random sample or ray. A guide failure bypasses reconstruction without
+changing raw sample status. Records clear with accumulation; the diagnostic header
+clears each composition. The original 32-byte estimator records and 16-byte sample
+counter buffer remain unchanged. Diagnostic staging adds 16 bytes while mapped.
+
+Composition performs one 5×5 positive binomial gather of indirect illumination,
+then remodulates the exact center reflectance. It does not average direct HDR,
+authored color texture, shadow alpha or final shaded color. The recovered quantity
+is `(sum / samples) / rho`, or irradiance divided by pi; no additional pi is used.
+Zero-reflectance donor channels provide no incident information and are omitted;
+a zero-reflectance center stays zero. Completed black estimates retain denominator
+weight. A completed zero center can reconstruct illumination from compatible
+neighbors while its raw state remains zero. Background, untraced, invalid and
+exhausted centers remain direct-only.
+
+Donors must have compatible geometric normals and material IDs, symmetric tangent
+plane distance within the declared footprint/coordinate allowance, and bounded
+world distance for their screen separation. The kernel is the outer product of
+`[1, 4, 6, 4, 1]`. Normal agreement must be at least 0.95; its power-32 weight is
+clamped to [0.125, 1]. Both point-to-plane distances must fit
+`0.05 * min(footprints) + 8 * 2^-23 * (maxAbs(P) + maxAbs(Q) + extent(A) + extent(B))`.
+World separation must not exceed `(screenDistance + 1.5) * max(footprints)`. Footprints intersect actual adjacent
+inverse-projection near/far rays with the primary tangent plane, including for
+orthographic cameras. They reject grazing or out-of-domain solves. Triangle IDs
+need not match, so triangulation edges are not intentionally preserved. Material
+agreement is currently vacuous because admission permits one used material.
+The additional guide helpers bound matrix components to 2^20, homogeneous ray
+components to 2^24, absolute ray homogeneous w to at least 2^-20, dehomogenized
+points to 2^20 and footprints to [2^-40, 2^20]. A ray with absolute tangent-plane
+cosine below 0.1 is rejected. These are conservative admission bounds for the
+optional guide computation, not added restrictions on raw transport.
+These guards are heuristic: thin surfaces inside their tolerance and lighting
+boundaries on one plane can still mix. This filter is biased reconstruction and
+cannot infer illumination absent from all nearby samples.
+
+The capability uses a conservative composed HDR domain of 0..65472, including
+filter-off mode. Raw mean and direct-plus-raw composition are proved safe before
+filtering; newly introduced positive demodulation and weighted arithmetic have
+explicit lower/upper bounds before operations. Tiny positive reflectance below
+2^-16 falls back to the raw channel, without clamping albedo. An unsafe eligible
+donor causes whole-channel raw fallback, rather than omitting its potentially
+bright contribution. Signed zero stays zero. Filter-only arithmetic failures use
+the already-proved raw result. This contract covers new reconstruction arithmetic
+within its explicit input domain; it cannot recover arbitrary upstream
+indeterminate shader arithmetic. The optional storage view reads sums and rho as
+integer words without changing their byte layout, so positive subnormal values
+cannot silently become completed zero before classification. For samples 1..1024,
+a positive raw sum must satisfy `samples * 2^-126 <= sum <= samples * 65504`
+before division. A positive donor additionally requires
+`sum >= samples * rho * 2^-90` before demodulation. Incident illumination stays
+below 2^32, the total kernel weight at most 256 and weighted sums below 2^40.
+Raw composition must satisfy `rawMean <= 65472 - direct` before addition;
+remodulation must satisfy `candidateI <= (65472 - direct) / centerRho` before
+multiplication. Filter fallback counters count at most once per channel and
+composition, even with multiple unsafe donors.
+
+If raw composition itself cannot fit that domain, the pixel displays a diagnostic
+marker and `waitForIdle()` rejects with `PRESENTATION_HDR_FAULT`. Raw samples and
+sample counters are unchanged, and this is not reported as device loss. Following
+a valid new scene, reset or control submission, a stale diagnostic cannot poison
+the new frame. `sampleCounters.spatialDiagnostics` contains four per-composition
+counts: `filteredPixels`, `fallbackChannels`, `hdrFaultChannels` and
+`guideBypassPixels`. Filtered pixels count centers with at least one channel
+entering the gather, including a later fallback; guide bypass counts spatial-mode
+centers whose guide is invalid. The readback carries its actual submitted frame ID, accumulation
+revision, denoiser mode and presentation revision. Telemetry publishes it only
+when those tags match the current submitted presentation. Runtime presentation
+control edits do not relabel an older GPU header.
+
+This is an experimental option with an actual-house visual acceptance hold. It
+has no real-time performance, general denoising quality or convergence claim.
+The sampler, source, material and light definitions remain unchanged so its effect
+can be judged independently.
