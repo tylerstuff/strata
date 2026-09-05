@@ -355,6 +355,79 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     assert.ok(engine.frames.slice(frameCount).every(frame => frame.options.temporal === false));
   });
 
+  test('exposure defaults to zero, accepts both endpoints and resets without altering scene controls or forcing a camera cut', async () => {
+    loadHook = async url => asset(url, [{ id: 'walk', name: 'Walk', duration: 4 }]);
+    await runtime.selectModel(model());
+    assert.equal(runtime.getState().settings.exposureEV, 0);
+    assert.equal(engine.frames.at(-1).options.exposureEV, 0);
+    assert.equal(runtime.getState().submittedView.exposureEV, 0);
+    await runtime.setAnimation({ clipId: 'walk', timeSeconds: 1.25, loop: false, playing: false });
+    await runtime.setLightingPreset('daylight'); await runtime.setEnvironment({ preset: 'studio', intensity: 2 });
+    const original = runtime.getState(), source = engine.scene;
+    for (const exposureEV of [-16, 16, 1.25, 0]) {
+      const revision = runtime.getState().viewRevision;
+      await runtime.setExposureEV(exposureEV);
+      const changed = runtime.getState(), frame = engine.frames.at(-1);
+      assert.equal(changed.viewRevision, revision + 1);
+      assert.deepEqual(changed.settings, { ...original.settings, exposureEV });
+      assert.deepEqual(frame.options.imported, original.settings.effective);
+      assert.equal(frame.options.exposureEV, exposureEV); assert.equal(frame.options.cameraCut, false);
+      assert.equal(frame.options.temporal, original.settings.temporal);
+      assert.deepEqual(changed.sceneCommit, original.sceneCommit); assert.equal(engine.scene, source);
+      assert.equal(changed.submittedView.exposureEV, exposureEV); assert.equal(changed.submittedView.frameId, frame.frameId);
+      assert.deepEqual(changed.viewport, original.viewport);
+    }
+    assert.equal(engine.sceneCalls.length, 1); assert.equal(loadCalls.length, 1); assert.deepEqual(engine.resizeCalls, []);
+    const receipt = await runtime.captureState(1);
+    assert.equal(receipt.state.settings.exposureEV, 0); assert.equal(receipt.state.submittedView.exposureEV, 0);
+    assert.equal(receipt.state.submittedView.frameId, receipt.state.frame.frameId);
+  });
+
+  test('invalid exposure rejects before changing ready settings, frame identity or source', async () => {
+    await runtime.selectModel(model()); await runtime.setExposureEV(2);
+    const before = runtime.getState(), source = engine.scene;
+    for (const value of [undefined, null, NaN, Infinity, -Infinity, -16.0001, 16.0001, '1', 1n, new Number(1), [], {}]) {
+      await assert.rejects(runtime.setExposureEV(value), /finite number from -16 to 16/);
+      assert.deepEqual(runtime.getState(), before); assert.equal(engine.scene, source);
+    }
+  });
+
+  test('progressive exposure waits for live counters and preserves the accumulation revision and readback across capture', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive'); runtime.setLive(true);
+    const original = runtime.getState(), accumulation = original.progressive.telemetry.progress.revision;
+    const live = engine.holdFence(); tick(1000); await live.entered.promise;
+    const frames = engine.frames.length, exposure = runtime.setExposureEV(2.5);
+    assert.equal(engine.frames.length, frames, 'Exposure cannot submit while the live counter readback is pending');
+    const fence = engine.holdFence(); live.done.resolve(); await fence.entered.promise;
+    const submitted = runtime.getState();
+    assert.equal(engine.maximumActiveFences, 1);
+    assert.equal(engine.frames.at(-1).options.exposureEV, 2.5); assert.equal(engine.frames.at(-1).options.cameraCut, false);
+    assert.deepEqual(engine.frames.at(-1).options.imported, original.settings.effective);
+    assert.equal(submitted.progressive.telemetry.progress.revision, accumulation);
+    assert.equal(submitted.progressive.telemetry.sampleCounters.revision, accumulation, 'Exposure does not invalidate already collected scene-linear counters');
+    fence.done.resolve(); await exposure;
+    const receipt = await runtime.captureState(2);
+    assert.equal(receipt.state.settings.exposureEV, 2.5); assert.equal(receipt.state.submittedView.exposureEV, 2.5);
+    assert.equal(receipt.state.progressive.telemetry.progress.revision, accumulation);
+    assert.equal(receipt.state.progressive.telemetry.sampleCounters.revision, accumulation);
+    for (const [key, value] of Object.entries(engine.counterValues)) assert.equal(receipt.state.progressive.telemetry.sampleCounters[key], value);
+    assert.ok(engine.frames.slice(-3).every(frame => frame.options.exposureEV === 2.5 && frame.options.cameraCut === false));
+    assert.deepEqual(receipt.state.sceneCommit, original.sceneCommit);
+  });
+
+  test('exposure persists across texture recreation, ordinary/progressive mode changes and model selection', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setExposureEV(-3);
+    for (const change of [() => runtime.setTextureCap(2048), () => runtime.setSceneMode('progressive'),
+      () => runtime.setTextureCap(4096), () => runtime.selectModel(model('next')), () => runtime.setSceneMode('ordinary')]) {
+      await change();
+      assert.equal(runtime.getState().settings.exposureEV, -3);
+      assert.equal(runtime.getState().submittedView.exposureEV, -3);
+      assert.equal(engine.frames.at(-1).options.exposureEV, -3);
+    }
+  });
+
   test('shading and environment controls are explicit, preserve other controls, and match capture state', async () => {
     await runtime.selectModel(model());
     const original = runtime.getState(), scene = engine.scene;
