@@ -114,8 +114,9 @@ pool (393,216 bytes), greedy eviction temporarily selects the 256-triangle root;
 retention keeps the 8,192-triangle complete fine level and explicitly reports the
 blocked target. At nine pages (589,824 bytes), both policies keep the fine level
 through partial replacement uploads and switch only once all three target pages
-are resident. Every depth pixel matches independent ordinary-vertex geometry,
-all 50,176 covered pixels remain covered, and history rejection occurs on topology
+are resident. All 50,176 sampled interior pixels remain covered and their depth
+differs from independent ordinary-vertex geometry by less than 0.000002. The
+16-pixel image border is outside these assertions. History rejection occurs on topology
 changes rather than on mere desired-LOD changes. These are fixed-demand cases;
 incidental shared-page protection is covered by the independent CPU tests.
 
