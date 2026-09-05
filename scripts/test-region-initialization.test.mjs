@@ -1,8 +1,89 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { canonicalJson, parseRegionInitializationArgs, validateHardwareEnvironment, validatePreparedEvidence,
+import { boundedRegionOperation, canonicalJson, parseRegionInitializationArgs, validateHardwareEnvironment, validatePreparedEvidence,
   REGION_EXECUTION_PLAN, REGION_FIXTURE_IDENTITIES } from './test-region-initialization.mjs';
+
+function controlledDeadline() {
+  let time = 100, callback, clears = 0, fires = 0;
+  const token = {};
+  return {
+    clock: { now: () => time, setTimer: action => { callback = action; return token; },
+      clearTimer: value => { assert.equal(value, token); clears++; } },
+    moveTo: value => { time = value; },
+    fireTimer: () => { fires++; callback(); },
+    get clears() { return clears; }, get fires() { return fires; },
+  };
+}
+function deferredResult() {
+  let resolve, reject;
+  const promise = new Promise((accept, fail) => { resolve = accept; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+test('bounded runner accepts observed completion strictly before its monotonic deadline', async () => {
+  const time = controlledDeadline(), original = deferredResult();
+  const pending = boundedRegionOperation(() => original.promise, 'controlled operation', 10, time.clock);
+  await Promise.resolve(); time.moveTo(109); original.resolve('accepted');
+  assert.equal(await pending, 'accepted'); assert.equal(time.fires, 0); assert.equal(time.clears, 1);
+});
+
+for (const [name, observedTime] of [['exactly at', 110], ['after', 111]]) {
+  test(`bounded runner rejects completion ${name} the deadline even when the timer never fires`, async () => {
+    const time = controlledDeadline(), original = deferredResult(); let starts = 0;
+    const pending = boundedRegionOperation(() => { starts++; return original.promise; }, 'controlled operation', 10, time.clock);
+    await Promise.resolve(); assert.equal(starts, 1);
+    time.moveTo(observedTime); original.resolve('overdue result');
+    await assert.rejects(pending, /controlled operation exceeded 10ms/);
+    assert.equal(time.fires, 0); assert.equal(time.clears, 1);
+  });
+
+  test(`bounded runner does not start work admitted ${name} the deadline`, async () => {
+    const time = controlledDeadline(); let starts = 0;
+    const pending = boundedRegionOperation(() => { starts++; return 'must not run'; }, 'controlled admission', 10, time.clock);
+    time.moveTo(observedTime);
+    await assert.rejects(pending, /controlled admission exceeded 10ms/);
+    assert.equal(starts, 0); assert.equal(time.fires, 0); assert.equal(time.clears, 1);
+  });
+}
+
+test('bounded runner counts synchronous invocation time against the original deadline', async () => {
+  const time = controlledDeadline();
+  await assert.rejects(boundedRegionOperation(() => { time.moveTo(110); return 'overdue'; }, 'synchronous invocation', 10, time.clock),
+    /synchronous invocation exceeded 10ms/);
+  assert.equal(time.fires, 0); assert.equal(time.clears, 1);
+});
+
+test('bounded runner rechecks admission when time expires after observing fulfillment', async () => {
+  const time = controlledDeadline(), original = deferredResult();
+  const clock = { ...time.clock, now: () => {
+    const sampled = time.clock.now();
+    // Fulfillment is sampled in time, then the continuation is delayed to the boundary.
+    if (sampled === 109) time.moveTo(110);
+    return sampled;
+  } };
+  const pending = boundedRegionOperation(() => original.promise, 'delayed continuation', 10, clock);
+  await Promise.resolve(); time.moveTo(109); original.resolve('completed before deadline');
+  await assert.rejects(pending, /delayed continuation exceeded 10ms/);
+  assert.equal(time.fires, 0); assert.equal(time.clears, 1);
+});
+
+test('bounded runner preserves an original failure and clears its timer', async () => {
+  const time = controlledDeadline(), failure = new Error('original operation failed');
+  await assert.rejects(boundedRegionOperation(() => Promise.reject(failure), 'controlled failure', 10, time.clock), error => error === failure);
+  assert.equal(time.clears, 1);
+});
+
+test('bounded runner timer can reject without detaching original settlement', async () => {
+  const time = controlledDeadline(), original = deferredResult(); let settled = false;
+  const pending = boundedRegionOperation(() => original.promise.finally(() => { settled = true; }), 'pending operation', 10, time.clock);
+  await Promise.resolve(); time.moveTo(110); time.fireTimer();
+  await assert.rejects(pending, /pending operation exceeded 10ms/);
+  assert.equal(settled, false); assert.equal(time.clears, 1);
+  original.reject(new Error('late original rejection'));
+  await assert.rejects(original.promise, /late original rejection/);
+  await Promise.resolve(); assert.equal(settled, true);
+});
 
 test('region runner imports as helpers and accepts only explicit prepare or frozen execution modes', () => {
   const prepared = parseRegionInitializationArgs(['--prepare-only', '--output', '/tmp/region-prepared']);

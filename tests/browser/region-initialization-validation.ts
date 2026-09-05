@@ -7,6 +7,7 @@ import type { RegionDescriptor } from '../../packages/core/src/geometry/region-i
 import { GeometryTransferBudget } from '../../packages/core/src/geometry/transfer-budget.js';
 import type { VirtualSceneOptions } from '../../packages/core/src/geometry/virtual-types.js';
 import { RasterRenderer } from '../../packages/core/src/rendering/raster-renderer.js';
+import { RegionValidationDeadline } from './region-validation-deadline.js';
 
 interface SourceInput {
   readonly id: string;
@@ -110,12 +111,17 @@ interface BorrowedEntry { readonly owner: { readonly incarnation: number; readon
 
 /** Explicit native entry point. CPU preparation never calls this function. */
 export async function runRegionInitializationValidation(input: RegionInitializationValidationInput) {
+  const startedAt = performance.now();
   const preparation = prepareRegionInitializationValidation(input);
-  const preparationSha256 = await digest(new TextEncoder().encode(canonicalJson(preparation)));
+  const deadline = new RegionValidationDeadline(startedAt + preparation.gates.totalDeadlineMs);
+  const assertTime = (): void => deadline.assertOpen();
+  const bounded = <T>(start: () => Promise<T>, milliseconds = 10_000): Promise<T> => deadline.bounded(start, milliseconds);
+  const checkedDigest = (bytes: Uint8Array<ArrayBuffer>): Promise<string> => bounded(() => digest(bytes), preparation.gates.totalDeadlineMs);
+  const preparationSha256 = await checkedDigest(new TextEncoder().encode(canonicalJson(preparation)));
   require(preparationSha256 === input.expectedPreparationHash, 'Browser preparation differs from the frozen canonical preparation hash.');
   const report: Record<string, unknown> = { schema: 'strata-region-initialization-webgpu-v1', passed: false, performanceEvidence: false,
     preparation, preparationSha256, errors: [], frames: [], initializationFrames: [], lifecycle: [], comparisons: [], images: {}, sourceReceipts: [] };
-  const errors = report.errors as string[]; const deadline = performance.now() + preparation.gates.totalDeadlineMs;
+  const errors = report.errors as string[];
   const buffers: BufferRecord[] = []; const textures: TextureRecord[] = []; const writes: WriteRecord[] = [];
   const requests: RequestRecord[] = []; const controls: Control[] = []; const pendingFetches = new Set<Promise<Response>>();
   const queueSubmissions: { owner: string; phase: string; commandBufferCount: number; labels: string[] }[] = [];
@@ -131,14 +137,7 @@ export async function runRegionInitializationValidation(input: RegionInitializat
     lateDeviceDestroyed: false, lateDeviceCleanupArmed: false };
   let owner = 'harness'; let phase = 'setup'; let hostFrame: number | null = null; let frameId = 0; let submissions = 0;
   let totalDraws = 0; let totalDispatches = 0; let forcedResourceCleanup = 0;
-  const assertTime = (): void => require(performance.now() < deadline, 'Validation exceeded its preregistered 180-second bound.');
-  const bounded = async <T>(operation: Promise<T>, milliseconds = 10_000): Promise<T> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try { return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Bounded browser operation timed out.')), Math.min(milliseconds, Math.max(1, deadline - performance.now())));
-    })]); } finally { clearTimeout(timer); }
-  };
-  const nextFrame = (): Promise<void> => bounded(new Promise(resolve => requestAnimationFrame(() => resolve())), 5_000);
+  const nextFrame = (): Promise<void> => bounded(() => new Promise(resolve => requestAnimationFrame(() => resolve())), 5_000);
   const own = <T>(nextOwner: string, nextPhase: string, action: () => T): T => {
     const previousOwner = owner; const previousPhase = phase; owner = nextOwner; phase = nextPhase;
     const reset = (): void => { owner = previousOwner; phase = previousPhase; };
@@ -163,12 +162,12 @@ export async function runRegionInitializationValidation(input: RegionInitializat
     require(telemetry.requests <= transferLimits.maxRequests, 'Shared request capacity was exceeded.');
     for (const key of ['pageStagingBytes', 'transientBytes', 'residentBytes', 'gpuBufferBytes'] as const) require(telemetry[key] <= transferLimits[key], `Shared ${key} capacity was exceeded.`);
   };
-  const settleWithoutAdvancing = async (done: () => boolean): Promise<void> => {
-    const until = performance.now() + preparation.gates.initializationDeadlineMs;
-    while (!done()) { assertTime(); require(performance.now() < until, 'Original ownership did not settle within its stage deadline.');
-      const count = writes.length; await nextFrame(); require(writes.length === count, 'Asynchronous work wrote without a host advance.'); }
-  };
+  const settleWithoutAdvancing = (done: () => boolean): Promise<void> => deadline.stage({
+    milliseconds: preparation.gates.initializationDeadlineMs, done,
+    wait: async () => { const count = writes.length; await nextFrame(); require(writes.length === count, 'Asynchronous work wrote without a host advance.'); },
+  });
   const advance = (name: string, coordinator: RegionInitializationCoordinator, budget: GeometryTransferBudget): void => {
+    assertTime();
     require(frameId < preparation.gates.maximumInitializationFrames, 'Coordinator exceeded 600 total host advances.');
     hostFrame = ++frameId; const frame = budget.beginFrame(frameId); const before = writes.length;
     try {
@@ -181,14 +180,11 @@ export async function runRegionInitializationValidation(input: RegionInitializat
         coordinator: coordinator.snapshot(), budget: budget.telemetry });
     } finally { hostFrame = null; }
   };
-  const drive = async (name: string, coordinator: RegionInitializationCoordinator, budget: GeometryTransferBudget, done: (snapshot: Snapshot) => boolean): Promise<void> => {
-    const until = performance.now() + preparation.gates.initializationDeadlineMs;
-    while (!done(coordinator.snapshot())) {
-      assertTime(); require(performance.now() < until, 'Coordinator stage exceeded 60 seconds.');
-      const count = writes.length; await nextFrame(); require(writes.length === count, 'Initialization wrote asynchronously between host allowances.');
-      advance(name, coordinator, budget);
-    }
-  };
+  const drive = (name: string, coordinator: RegionInitializationCoordinator, budget: GeometryTransferBudget, done: (snapshot: Snapshot) => boolean): Promise<void> => deadline.stage({
+    milliseconds: preparation.gates.initializationDeadlineMs, done: () => done(coordinator.snapshot()),
+    wait: async () => { const count = writes.length; await nextFrame(); require(writes.length === count, 'Initialization wrote asynchronously between host allowances.'); },
+    advance: () => advance(name, coordinator, budget),
+  });
   const deliverControl = (control: Control): void => {
     if (control.delivered) return;
     control.delivered = true;
@@ -198,6 +194,7 @@ export async function runRegionInitializationValidation(input: RegionInitializat
     } }), { headers: { 'content-length': String(control.bytes) } }));
   };
   const fetchFor = (requestOwner: string, state?: { coordinator: () => RegionInitializationCoordinator; budget: GeometryTransferBudget }, aba = false): typeof fetch => async (resource, options) => {
+    assertTime();
     const url = new URL(resource instanceof Request ? resource.url : String(resource), location.href);
     const sourceIndex = input.sources.findIndex(source => url.pathname.startsWith(`/__region-init__/${source.id}/`));
     const alias = url.pathname.split('/')[2]; const index = sourceIndex === -1 && ['corrupt-manifest', 'corrupt-root'].includes(alias ?? '') ? 3 : sourceIndex;
@@ -245,46 +242,52 @@ export async function runRegionInitializationValidation(input: RegionInitializat
     return entries[0]!.provider!;
   };
   const retireRenderer = async (provider: GpuGeometry): Promise<void> => {
-    await bounded(provider.whenDisposedAndSettled());
+    await bounded(() => provider.whenDisposedAndSettled());
     const raster = renderers.get(provider); require(raster, 'Retired provider lost its retained renderer.');
     raster!.dispose(); renderers.delete(provider);
   };
   try {
-    const adapterRequest = navigator.gpu.requestAdapter(); acquisition.adapterPending = true;
-    adapterOperation = adapterRequest.finally(() => { acquisition.adapterPending = false; });
-    const adapter = await bounded(adapterOperation); require(adapter, 'WebGPU adapter unavailable.');
+    const adapter = await bounded(() => {
+      const adapterRequest = navigator.gpu.requestAdapter(); acquisition.adapterPending = true;
+      adapterOperation = adapterRequest.finally(() => { acquisition.adapterPending = false; });
+      return adapterOperation;
+    });
+    require(adapter, 'WebGPU adapter unavailable.');
     require(!adapter!.info.isFallbackAdapter, 'The native proof requires a non-fallback adapter.');
     report.adapter = { vendor: adapter!.info.vendor, architecture: adapter!.info.architecture, device: adapter!.info.device,
       description: adapter!.info.description, isFallbackAdapter: adapter!.info.isFallbackAdapter };
     require(/apple/i.test(adapter!.info.vendor) && /metal/i.test(adapter!.info.architecture), 'The frozen native proof requires the Apple Metal adapter profile.');
-    const deviceRequest = adapter!.requestDevice(); acquisition.devicePending = true;
     // Retain the original acquisition chain beyond the deadline race. A device
     // arriving after cleanup began is owned and destroyed by this callback.
-    deviceOperation = deviceRequest.then(value => {
-      device = value;
-      if (acquisition.cleanupStarted) {
-        intentionallyDestroyed = true;
-        try { value.destroy(); acquisition.deviceDestroyed = true; acquisition.lateDeviceDestroyed = true; }
-        catch (cause) { errors.push(`Late device cleanup: ${message(cause)}`); }
-      }
-      return value;
-    }).finally(() => { acquisition.devicePending = false; });
-    const gpu = await bounded(deviceOperation);
+    const gpu = await bounded(() => {
+      const deviceRequest = adapter!.requestDevice(); acquisition.devicePending = true;
+      deviceOperation = deviceRequest.then(value => {
+        device = value;
+        if (acquisition.cleanupStarted) {
+          intentionallyDestroyed = true;
+          try { value.destroy(); acquisition.deviceDestroyed = true; acquisition.lateDeviceDestroyed = true; }
+          catch (cause) { errors.push(`Late device cleanup: ${message(cause)}`); }
+        }
+        return value;
+      }).finally(() => { acquisition.devicePending = false; });
+      return deviceOperation;
+    });
     gpu.addEventListener('uncapturederror', event => errors.push(event.error.message));
     void gpu.lost.then(info => { if (!intentionallyDestroyed) errors.push(`Unexpected device loss: ${info.reason}: ${info.message}`); });
     gpu.pushErrorScope('out-of-memory'); gpu.pushErrorScope('validation');
     const createBuffer = gpu.createBuffer.bind(gpu); const createTexture = gpu.createTexture.bind(gpu);
     const writeBuffer = gpu.queue.writeBuffer.bind(gpu.queue); const submit = gpu.queue.submit.bind(gpu.queue);
     const computePipeline = gpu.createComputePipelineAsync.bind(gpu); const renderPipeline = gpu.createRenderPipelineAsync.bind(gpu);
-    replace(gpu, 'createComputePipelineAsync', (description: GPUComputePipelineDescriptor) => observeNative(computePipeline(description)));
-    replace(gpu, 'createRenderPipelineAsync', (description: GPURenderPipelineDescriptor) => observeNative(renderPipeline(description)));
+    replace(gpu, 'createComputePipelineAsync', (description: GPUComputePipelineDescriptor) => { assertTime(); return observeNative(computePipeline(description)); });
+    replace(gpu, 'createRenderPipelineAsync', (description: GPURenderPipelineDescriptor) => { assertTime(); return observeNative(renderPipeline(description)); });
     replace(gpu, 'createBuffer', (description: GPUBufferDescriptor) => {
+      assertTime();
       const resource = createBuffer(description);
       const record: BufferRecord = { resource, owner, phase, label: description.label ?? '', size: description.size, usage: description.usage, destroys: 0 };
       buffers.push(record); const destroy = resource.destroy.bind(resource);
       replace(resource, 'destroy', () => { destroy(); record.destroys++; });
       const map = resource.mapAsync.bind(resource);
-      replace(resource, 'mapAsync', (mode: GPUMapModeFlags, offset?: number, size?: number) => observeNative(map(mode, offset, size)));
+      replace(resource, 'mapAsync', (mode: GPUMapModeFlags, offset?: number, size?: number) => { assertTime(); return observeNative(map(mode, offset, size)); });
       require(resource.usage === description.usage, 'Observer changed native buffer usage.');
       if (phase === 'initialization') {
         const reserved = coordinators.reduce((sum, state) => sum + state.budget.telemetry.gpuBufferBytes, 0);
@@ -294,12 +297,14 @@ export async function runRegionInitializationValidation(input: RegionInitializat
       return resource;
     });
     replace(gpu, 'createTexture', (description: GPUTextureDescriptor) => {
+      assertTime();
       const resource = createTexture(description); const record: TextureRecord = { resource, owner, label: description.label ?? '', format: description.format, usage: description.usage, destroys: 0 };
       textures.push(record); const destroy = resource.destroy.bind(resource);
       replace(resource, 'destroy', () => { destroy(); record.destroys++; });
       require(resource.usage === description.usage, 'Observer changed native texture usage.'); return resource;
     });
     replace(gpu.queue, 'writeBuffer', (buffer: GPUBuffer, offset: number, data: AllowSharedBufferSource, dataOffset = 0, size?: number) => {
+      assertTime();
       writeBuffer(buffer, offset, data, dataOffset, size);
       const view = ArrayBuffer.isView(data); const elementBytes = view && 'BYTES_PER_ELEMENT' in data ? Number(data.BYTES_PER_ELEMENT) : 1;
       const bytes = new Uint8Array(view ? data.buffer : data, (view ? data.byteOffset : 0) + dataOffset * elementBytes,
@@ -308,6 +313,7 @@ export async function runRegionInitializationValidation(input: RegionInitializat
       require(!initializationGuard || (hostFrame !== null && phase === 'initialization'), 'Native initialization write occurred outside a host allowance.');
     });
     replace(gpu.queue, 'submit', (commands: Iterable<GPUCommandBuffer>) => {
+      assertTime();
       const commandBuffers = [...commands]; submit(commandBuffers);
       queueSubmissions.push({ owner, phase, commandBufferCount: commandBuffers.length, labels: commandBuffers.map(buffer => buffer.label) });
     });
@@ -323,24 +329,26 @@ export async function runRegionInitializationValidation(input: RegionInitializat
       require(accepted.every(write => write.owner === expectedOwner && write.phase === expectedPhase), 'Provider initialization writes have an unexpected owner or phase.');
       require(accepted.reduce((sum, write) => sum + write.bytes.byteLength, 0) === expected.expectedInitialUploadBytes, 'Provider accepted queue bytes disagree with preparation.');
       const root = accepted.filter(write => write.buffer === privateBuffers.cache.buffer);
-      require(root.length === 1 && root[0]!.offset === 0 && root[0]!.bytes.byteLength === pageBytes && await digest(root[0]!.bytes) === source.pageHashes[0]!.sha256, 'Ready provider root arguments differ from its authenticated source.');
+      require(root.length === 1 && root[0]!.offset === 0 && root[0]!.bytes.byteLength === pageBytes && await checkedDigest(root[0]!.bytes) === source.pageHashes[0]!.sha256, 'Ready provider root arguments differ from its authenticated source.');
       const packed = new Uint8Array(expected.metadataBytes); let offset = 0;
       for (const write of accepted.filter(value => value.buffer === privateBuffers.resources.metadata)) {
         require(write.offset === offset, 'Metadata CPU arguments have a gap or overlap.'); packed.set(write.bytes, offset); offset += write.bytes.byteLength;
       }
       const metadata = buildGeometryMetadata(manifests[sourceIndex]!, 2).words;
-      require(offset === packed.byteLength && await digest(packed) === await digest(new Uint8Array(metadata.buffer)), 'Ready metadata arguments differ from the production packer.');
+      require(offset === packed.byteLength && await checkedDigest(packed) === await checkedDigest(new Uint8Array(metadata.buffer)), 'Ready metadata arguments differ from the production packer.');
       (report.sourceReceipts as unknown[]).push({ owner: expectedOwner, source: source.id, manifestSha256: source.manifestSha256,
         meaning: 'CPU arguments accepted by native queue; no pool or metadata readback', acceptedQueueBytes: expected.expectedInitialUploadBytes,
-        metadataArgumentSha256: await digest(packed), rootArgumentSha256: await digest(root[0]!.bytes), telemetry: provider.geometryTelemetry });
+        metadataArgumentSha256: await checkedDigest(packed), rootArgumentSha256: await checkedDigest(root[0]!.bytes), telemetry: provider.geometryTelemetry });
     };
     const render = async (sourceIndex: number, provider: GpuGeometry, renderOwner: string): Promise<Capture> => {
       assertTime(); initializationGuard = false;
-      const creation = own(`raster:${renderOwner}`, 'raster-setup', () => RasterRenderer.create(gpu, 'rgba8unorm', {}, provider)
-        .then(raster => { renderers.set(provider, raster); return raster; }));
-      rendererOperations.add(creation);
-      void creation.then(() => rendererOperations.delete(creation), () => rendererOperations.delete(creation));
-      const raster = await bounded(creation);
+      const raster = await bounded(() => {
+        const creation = own(`raster:${renderOwner}`, 'raster-setup', () => RasterRenderer.create(gpu, 'rgba8unorm', {}, provider)
+          .then(raster => { renderers.set(provider, raster); return raster; }));
+        rendererOperations.add(creation);
+        void creation.then(() => rendererOperations.delete(creation), () => rendererOperations.delete(creation));
+        return creation;
+      });
       const { width, height } = framePlan; const bytesPerRow = width * 4; const bytes = bytesPerRow * height;
       const target = own(renderOwner, 'diagnostic', () => gpu.createTexture({ label: 'Region initialization presentation witness', size: [width, height], format: 'rgba8unorm', usage: 16 | 1 }));
       const readback = own(renderOwner, 'diagnostic', () => gpu.createBuffer({ label: 'Region initialization color/depth readback', size: bytes * 2, usage: 1 | 8 }));
@@ -356,7 +364,7 @@ export async function runRegionInitializationValidation(input: RegionInitializat
         encoder.copyTextureToBuffer({ texture: target }, { buffer: readback, bytesPerRow }, [width, height]);
         encoder.copyTextureToBuffer({ texture: depth!, aspect: 'depth-only' }, { buffer: readback, offset: bytes, bytesPerRow }, [width, height]);
         own(renderOwner, 'render-submit', () => gpu.queue.submit([encoder.finish()])); provider.submitted(++submissions);
-        await bounded(Promise.all([provider.flushFeedback(), readback.mapAsync(1)]));
+        await bounded(() => Promise.all([provider.flushFeedback(), readback.mapAsync(1)]));
         const mapped = new Uint8Array(readback.getMappedRange()); const color = mapped.slice(0, bytes); const depthBytes = mapped.slice(bytes);
         readback.unmap(); const depths = new Float32Array(depthBytes.buffer); const telemetry = { ...provider.geometryTelemetry };
         require(telemetry.sourceFrameId === submissions && telemetry.visibleTiles === 4, 'Native selection feedback has the wrong frame or visible tile count.');
@@ -379,13 +387,14 @@ export async function runRegionInitializationValidation(input: RegionInitializat
           }
         }
         require(interiorSamples === preparation.gates.expectedInteriorSamples, 'Interior sample count changed.');
-        const depthSha256 = await digest(depthBytes); const colorSha256 = await digest(color);
+        const depthSha256 = await checkedDigest(depthBytes); const colorSha256 = await checkedDigest(color);
         const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
         const context = canvas.getContext('2d')!; const output = context.createImageData(width, height); output.data.set(color); context.putImageData(output, 0, 0);
         (report.images as Record<string, string>)[renderOwner.replaceAll(':', '-')] = canvas.toDataURL('image/png');
         (report.frames as unknown[]).push({ owner: renderOwner, source: expected.id, ...framePlan, submission: submissions, stats, telemetry,
           statsTriangleCountSourceFrameId: prior.sourceFrameId, statsTriangleCountSourceMeaning: 'Pre-encode feedback; current native counts are in post-submission telemetry.',
           coveredPixels, interiorSamples, colorSha256, depthSha256 });
+        assertTime();
         return { color, depth: depths, depthSha256 };
       } finally { try { readback.unmap(); } catch { /* Failed mapping is still cleaned up. */ } readback.destroy(); target.destroy(); initializationGuard = true; }
     };
@@ -399,13 +408,15 @@ export async function runRegionInitializationValidation(input: RegionInitializat
         maxConcurrentRequests: 2, maxCompletedBytes: pageBytes, maxRetries: 0, requestTimeoutMs: 120_000, uploadBudgetBytes: pageBytes,
         fetch: fetchFor(referenceOwner), signal: creationController.signal,
       };
-      const operation = own(referenceOwner, 'eager-initialization', () => GpuGeometry.create(gpu, manifests[index]!, url, eagerOptions)
-        .then(provider => { eagerProviders.add(provider); return provider; }));
-      creationOperations.add(operation); void operation.then(() => creationOperations.delete(operation), () => creationOperations.delete(operation));
-      const provider = await bounded(operation, 60_000);
+      const provider = await bounded(() => {
+        const operation = own(referenceOwner, 'eager-initialization', () => GpuGeometry.create(gpu, manifests[index]!, url, eagerOptions)
+          .then(provider => { eagerProviders.add(provider); return provider; }));
+        creationOperations.add(operation); void operation.then(() => creationOperations.delete(operation), () => creationOperations.delete(operation));
+        return operation;
+      }, 60_000);
       await verifyProvider(index, provider, referenceOwner, 'eager-initialization');
       references.push(await render(index, provider, referenceOwner));
-      renderers.get(provider)!.dispose(); renderers.delete(provider); await bounded(provider.whenDisposedAndSettled()); eagerProviders.delete(provider);
+      renderers.get(provider)!.dispose(); renderers.delete(provider); await bounded(() => provider.whenDisposedAndSettled()); eagerProviders.delete(provider);
     }
     require(new Set(references.map(capture => capture.depthSha256)).size === 4, 'Distinct source references produced identical native depth identities.');
     initializationGuard = true;
@@ -481,7 +492,7 @@ export async function runRegionInitializationValidation(input: RegionInitializat
     require(coordinator.snapshot().startedEntries === 6 && coordinator.snapshot().peakLiveEntries === 2, 'ABA plus four successful sources have incorrect lifetime counts.');
     (report.lifecycle as unknown[]).push({ name: 'four-source-two-slot-turnover', firstReady: first, secondReady: coordinator.snapshot(), budget: budget.telemetry,
       successfulAcceptedQueueBytes: mainAccepted, secondPairAdmissionOrder: requests.filter(request => request.owner === 'coordinator:main' && request.kind === 'manifest' && ['seed-53', 'seed-54'].includes(request.source)).map(request => request.source) });
-    coordinator.dispose(); await bounded(coordinator.whenDisposedAndSettled());
+    coordinator.dispose(); await bounded(() => coordinator.whenDisposedAndSettled());
     for (const provider of secondProviders) await retireRenderer(provider);
     require(noBudget(budget) && coordinator.snapshot().liveEntries === 0 && coordinator.snapshot().retainedManifestBytes === 0 && coordinator.snapshot().settledEntries === 6, 'Main coordinator disposal did not settle all six original lifetimes.');
 
@@ -499,7 +510,7 @@ export async function runRegionInitializationValidation(input: RegionInitializat
       require(!accepted.some(write => write.label === 'Strata fixed geometry page pool'), 'Corrupted root arguments reached a native pool upload.');
       if (kind === 'corrupt-manifest') require(buffers.length === bufferStart && accepted.length === 0 && /SHA-256/.test(failed.regions[0]!.error ?? ''), 'Corrupted manifest did not fail before geometry allocation.');
       else require(accepted.reduce((sum, write) => sum + write.bytes.byteLength, 0) === 1216 && /page failed validation or loading/.test(failed.regions[0]!.error ?? ''), 'Corrupted root did not fail after exactly the bounded metadata/selection writes.');
-      const writesAtTerminal = writes.length; failureCoordinator.dispose(); await bounded(failureCoordinator.whenDisposedAndSettled());
+      const writesAtTerminal = writes.length; failureCoordinator.dispose(); await bounded(() => failureCoordinator.whenDisposedAndSettled());
       await nextFrame(); require(writes.length === writesAtTerminal && queueSubmissions.length === submissionStart, 'Corruption cleanup wrote or submitted stale work.');
       require(noBudget(failureBudget) && failureCoordinator.snapshot().liveEntries === 0 && failureCoordinator.snapshot().retainedManifestBytes === 0, 'Corrupt-source ownership did not settle.');
       require(buffers.slice(bufferStart).every(buffer => buffer.destroys === 1), 'Corrupt-source native buffers were not destroyed exactly once.');
@@ -508,40 +519,43 @@ export async function runRegionInitializationValidation(input: RegionInitializat
     }
     require(submissions === 8 && queueSubmissions.length === 8 && queueSubmissions.every(value => value.commandBufferCount === 1 && value.phase === 'render-submit')
       && totalDraws === 24 && totalDispatches === 16, 'Actual native render submission/draw/dispatch counts differ from preparation.');
-    await bounded(gpu.queue.onSubmittedWorkDone());
-    const validation = await bounded(gpu.popErrorScope()); const allocation = await bounded(gpu.popErrorScope());
+    await bounded(() => gpu.queue.onSubmittedWorkDone());
+    const validation = await bounded(() => gpu.popErrorScope()); const allocation = await bounded(() => gpu.popErrorScope());
     require(!validation && !allocation, `WebGPU error scope: ${validation?.message ?? allocation?.message}`);
     require(errors.length === 0 && pendingFetches.size === 0 && controls.every(control => control.cancelSettled), 'Native errors or original controlled/fetch operations remain.');
     require(buffers.every(buffer => buffer.destroys === 1) && textures.every(texture => texture.destroys === 1), 'Native resource ownership did not end with exactly one destroy call.');
-    report.passed = true;
+    assertTime(); report.passed = true;
   } catch (cause) { report.failure = message(cause); }
   finally {
     acquisition.cleanupStarted = true;
     acquisition.lateDeviceCleanupArmed = acquisition.devicePending;
-    try { await bounded(Promise.allSettled([...(adapterOperation ? [adapterOperation] : []), ...(deviceOperation ? [deviceOperation] : [])])); }
+    try { await bounded(() => Promise.allSettled([...(adapterOperation ? [adapterOperation] : []), ...(deviceOperation ? [deviceOperation] : [])])); }
     catch (cause) { errors.push(message(cause)); }
     for (const controller of creationControllers) controller.abort();
     for (const state of coordinators) state.coordinator.dispose();
     for (const control of controls) { deliverControl(control); control.cancellation.resolve(); }
-    try { await bounded(Promise.allSettled([...creationOperations, ...rendererOperations])); } catch (cause) { errors.push(message(cause)); }
+    try { await bounded(() => Promise.allSettled([...creationOperations, ...rendererOperations])); } catch (cause) { errors.push(message(cause)); }
     for (const provider of eagerProviders) provider.dispose();
-    try { await bounded(Promise.all([...coordinators.map(state => state.coordinator.whenDisposedAndSettled()), ...[...eagerProviders].map(provider => provider.whenDisposedAndSettled())])); }
+    try { await bounded(() => Promise.all([...coordinators.map(state => state.coordinator.whenDisposedAndSettled()), ...[...eagerProviders].map(provider => provider.whenDisposedAndSettled())])); }
     catch (cause) { errors.push(message(cause)); }
-    for (const [provider, raster] of renderers) { try { raster.dispose(); await bounded(provider.whenDisposedAndSettled()); } catch (cause) { errors.push(message(cause)); } }
+    for (const [provider, raster] of renderers) { try { raster.dispose(); await bounded(() => provider.whenDisposedAndSettled()); } catch (cause) { errors.push(message(cause)); } }
     renderers.clear(); eagerProviders.clear();
-    try { await bounded(Promise.allSettled([...pendingFetches])); } catch (cause) { errors.push(message(cause)); }
+    try { await bounded(() => Promise.allSettled([...pendingFetches])); } catch (cause) { errors.push(message(cause)); }
     for (const record of [...buffers, ...textures]) if (!record.destroys) {
       forcedResourceCleanup++; try { record.resource.destroy(); } catch (cause) { errors.push(message(cause)); }
     }
-    try { await bounded(Promise.allSettled([...nativeOperations])); } catch (cause) { errors.push(message(cause)); }
+    try { await bounded(() => Promise.allSettled([...nativeOperations])); } catch (cause) { errors.push(message(cause)); }
     if (device && !acquisition.deviceDestroyed) {
-      try { await bounded(device.queue.onSubmittedWorkDone()); } catch (cause) { errors.push(message(cause)); }
+      try { await bounded(() => device!.queue.onSubmittedWorkDone()); } catch (cause) { errors.push(message(cause)); }
       intentionallyDestroyed = true; device.destroy(); acquisition.deviceDestroyed = true;
     }
     report.nativeAcquisition = acquisition;
     report.nativeResources = { buffers: buffers.map(({ resource: _resource, ...record }) => record), textures: textures.map(({ resource: _resource, ...record }) => record),
       liveBuffers: buffers.filter(buffer => !buffer.destroys).length, liveTextures: textures.filter(texture => !texture.destroys).length, forcedResourceCleanup };
-    report.queueWrites = await Promise.all(writes.map(async ({ buffer: _buffer, bytes, ...record }) => ({ ...record, bytes: bytes.byteLength, argumentSha256: await digest(bytes) })));
+    try {
+      report.queueWrites = await bounded(() => Promise.all(writes.map(async ({ buffer: _buffer, bytes, ...record }) => ({ ...record,
+        bytes: bytes.byteLength, argumentSha256: await checkedDigest(bytes) }))), preparation.gates.totalDeadlineMs);
+    } catch (cause) { errors.push(`Queue receipt hashing: ${message(cause)}`); }
     report.queueReceiptMeaning = 'Copied CPU arguments after successful native writeBuffer calls; no pool/metadata readback or execution-completion claim.';
     report.requests = requests;
     report.requestReceiptMeaning = 'Request settled means the injected/native fetch promise returned a Response or rejected; original body/hash/cancellation cleanup is established separately by coordinator/provider settlement barriers.';
@@ -552,6 +566,7 @@ export async function runRegionInitializationValidation(input: RegionInitializat
     report.controlledLifetimes = controls.map(control => ({ source: control.record.source, delivered: control.delivered, aborted: control.signal.aborted,
       cancelStarted: control.cancelStarted, cancelSettled: control.cancelSettled }));
     for (const undo of restore.reverse()) undo();
+    try { assertTime(); } catch (cause) { errors.push(`Final browser success: ${message(cause)}`); }
     if (errors.length || forcedResourceCleanup || acquisition.adapterPending || acquisition.devicePending || pendingFetches.size || creationOperations.size || rendererOperations.size || nativeOperations.size || controls.some(control => !control.cancelSettled)
       || coordinators.some(state => !noBudget(state.budget) || state.coordinator.snapshot().liveEntries !== 0)) report.passed = false;
   }

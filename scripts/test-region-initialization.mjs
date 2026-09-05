@@ -145,11 +145,26 @@ function errorDetails(error) {
   return error instanceof Error ? { name: error.name, message: error.message, stack: error.stack ?? null,
     ...(error.details === undefined ? {} : { details: error.details }) } : { message: String(error) };
 }
-async function bounded(promise, label, timeoutMs) {
+/** Timer wakeup is a fallback; only an observed result strictly before the deadline is admitted. */
+export async function boundedRegionOperation(start, label, timeoutMs, {
+  now = () => performance.now(), setTimer = setTimeout, clearTimer = clearTimeout,
+} = {}) {
+  assert(Number.isFinite(timeoutMs) && timeoutMs > 0, 'A positive finite operation timeout is required.');
+  const deadline = now() + timeoutMs;
+  const timeoutError = () => new Error(`${label} exceeded ${timeoutMs}ms.`);
+  const beforeDeadline = () => { if (!(now() < deadline)) throw timeoutError(); };
   let timer;
-  try { return await Promise.race([promise, new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms.`)), timeoutMs);
-  })]); } finally { clearTimeout(timer); }
+  try {
+    // A factory includes invocation time and can be denied before it starts.
+    // Keep rejection handlers on the original operation after a timeout wins.
+    const operation = Promise.resolve().then(() => { beforeDeadline(); return start(); })
+      .then(value => { beforeDeadline(); return value; });
+    const value = await Promise.race([operation, new Promise((_, reject) => {
+      timer = setTimer(() => reject(timeoutError()), Math.max(0, deadline - now()));
+    })]);
+    // Other queued work can consume the remaining time after fulfillment.
+    beforeDeadline(); return value;
+  } finally { clearTimer(timer); }
 }
 async function fileHashes(paths) {
   return Promise.all(paths.map(async path => {
@@ -404,7 +419,7 @@ export async function main(argv = process.argv.slice(2)) {
       page.on('console', message => { if (message.type() === 'error') report.browserErrors.push(message.text()); });
       const navigation = await page.goto(`${server.url}${htmlPath}`, { timeout: 30000 }); assert(navigation?.ok());
       report.stage = 'direct-webgpu'; report.gpuExecutionAttempted = true; await persist();
-      report.browserResult = await bounded(page.evaluate(async ({ path, input }) => {
+      report.browserResult = await boundedRegionOperation(() => page.evaluate(async ({ path, input }) => {
         try { const harness = await import(path); return await harness.runRegionInitializationValidation(input); }
         catch (error) { return { passed: false, failure: { name: error?.name, message: error?.message ?? String(error), stack: error?.stack ?? null, details: error?.details ?? null } }; }
       }, { path: scriptPath, input: { ...input, expectedPreparationHash: report.preparationSha256 } }), 'Native region proof', REGION_EXECUTION_PLAN.directTimeoutMs);
@@ -430,7 +445,7 @@ export async function main(argv = process.argv.slice(2)) {
       assert.equal(rendered.drawCalls, 24); assert.equal(rendered.dispatchCalls, 16);
       assert.deepEqual(Object.keys(rendered.images).sort(), REGION_FIXTURE_IDENTITIES.flatMap(source => [`coordinator-${source.id}`, `eager-${source.id}`]).sort());
       assert.deepEqual(rendered.errors, []);
-      await bounded(Promise.all([...routeHandlers]), 'Original route handler settlement', REGION_EXECUTION_PLAN.routeCleanupTimeoutMs);
+      await boundedRegionOperation(() => Promise.all([...routeHandlers]), 'Original route handler settlement', REGION_EXECUTION_PLAN.routeCleanupTimeoutMs);
       assert.equal(routeHandlers.size, 0, 'Routes remained active before runner cleanup.');
       report.httpOwnershipBeforeRunnerCleanup = { heldRoutes: 0, originalHandlers: routeHandlers.size,
         policy: 'All allowlisted responses fulfilled normally; controlled ABA holds belong to the harness.' };
@@ -442,11 +457,11 @@ export async function main(argv = process.argv.slice(2)) {
   } catch (error) { report.status = 'failed'; report.failure = errorDetails(error); }
   finally {
     if (routeHandlers.size) report.cleanupErrors.push({ message: `${routeHandlers.size} original route handlers required runner cleanup.` });
-    try { await bounded(Promise.all([...routeHandlers]), 'Original route cleanup', REGION_EXECUTION_PLAN.routeCleanupTimeoutMs); }
+    try { await boundedRegionOperation(() => Promise.all([...routeHandlers]), 'Original route cleanup', REGION_EXECUTION_PLAN.routeCleanupTimeoutMs); }
     catch (error) { report.cleanupErrors.push(errorDetails(error)); }
     for (const [name, resource] of [['context', context], ['browser', browser], ['server', server]]) {
       if (!resource) continue;
-      try { await bounded(resource.close(), `${name} cleanup`, REGION_EXECUTION_PLAN.resourceCleanupTimeoutMs); }
+      try { await boundedRegionOperation(() => resource.close(), `${name} cleanup`, REGION_EXECUTION_PLAN.resourceCleanupTimeoutMs); }
       catch (error) { report.cleanupErrors.push({ resource: name, ...errorDetails(error) }); }
     }
     if (fixtureDirectory) {
