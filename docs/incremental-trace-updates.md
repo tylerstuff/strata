@@ -1,10 +1,12 @@
 # Bounded trace updates for rigid fixtures
 
-[Issue #20](https://github.com/tylerstuff/strata/issues/20) tracks this CPU correctness
-slice for the legacy GI, selected-reflection and integrated courtyard fixtures.
-Browser correctness and a matched hardware performance comparison are separate
-gates. No frame-rate or elapsed CPU-cost improvement is established by the work
-and byte counters described here.
+[Issue #20](https://github.com/tylerstuff/strata/issues/20) tracks bounded trace
+maintenance for the legacy GI, selected-reflection and integrated courtyard
+fixtures. Browser correctness and performance are separate gates. The
+[matched M2 comparison](benchmarks/2026-09-06-m2-trace-maintenance.md) meets the
+reviewed CPU and upload targets; its independent 720p captures contain lighting
+differences that remain a separate visual qualification. Work and byte counters
+alone do not establish elapsed cost or presented frame rate.
 
 ## Representation and ownership
 
@@ -231,9 +233,10 @@ Hardware report SHA256: `f9b5e5f7cebbb397d01df526d35d2c43307f55b8fb0d6f4fc735934
 Complete plan-delta audit SHA256: `eaf08e2bd1f540dd733bb3c4ab5fee462e2881ae9eee8e6ecfd858e40914055a`.
 The [issue receipt](https://github.com/tylerstuff/strata/issues/20#issuecomment-5553908388)
 records exact source, external artifact paths, independent audits and limitations.
-The BigInt full control is correctness-only. Issue #20 remains open for the
-matched 30-second warmup / 60-second 720p and 1080p performance comparison using
-the original 1 MiB workload and a production-policy full maintenance control.
+The BigInt full control is correctness-only. The subsequent
+[matched performance receipt](benchmarks/2026-09-06-m2-trace-maintenance.md) uses
+a separately qualified production-policy full maintenance control and the
+original 1 MiB workload. It does not relabel this earlier correctness run.
 ## Matched performance preparation
 
 `tests/helpers/full-trace-performance-updater.ts` supplies a separate diagnostic
