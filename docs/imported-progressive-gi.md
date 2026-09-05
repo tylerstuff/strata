@@ -72,7 +72,7 @@ and passing generated fixtures do not clear this gallery promotion hold.
 
 `ImportedIndirectEffect` implements the existing `RasterGiProvider`. Root integration owns CPU preparation, material handles, controls and activation. It must disable raster TAA to provide an unjittered camera, zero ordinary ambient fill and exclude diffuse SH IBL while this effect is active. Interior correctness comparisons also keep specular IBL off. Both the GI-on and matched GI-off references need the same direct baseline. These exclusions prevent double counting or unoccluded fill from appearing through walls.
 
-`prepare()` and `compose()` encode work; the owner must call `submitted()` only after successful queue submission, or `cancelFrame()` on failure. Camera, resolution, lighting, environment and option changes reset accumulation. Enabling after a pause also resets it. A failed frame forces a reset before reuse. Composing adds only accumulated indirect radiance to the current direct HDR, preserving direct-light and texture detail.
+`prepare()` and `compose()` encode work; the owner calls `submitted()` only after queue submission returns, or `cancelFrame()` on a synchronous failure. Returned submission describes queued work, not a GPU validation receipt. Camera, resolution, lighting, environment and option changes reset accumulation. Enabling after a pause also resets it. A cancelled frame forces a reset before reuse. The optional shared-primary epoch also has terminal invalidation for asynchronous GPU errors, described below. Composing adds only accumulated indirect radiance to the current direct HDR, preserving direct-light and texture detail.
 
 The first preview uses full-resolution per-pixel accumulation with bounded batches; it does not upsample lighting across surface boundaries. Defaults are 262,144 pixels, 4,096 scheduled pixel updates per frame, 64 samples per pixel and 4,096 node visits per query. These are workload bounds, not timing guarantees. The integration can explicitly choose a 640×360 or 320×180 preview. It must preflight `maxPixels` before activation; an oversized resize rejects before changing resources. CPU progress describes submitted scheduling, while GPU readback reports attempted, completed, exhausted and invalid samples. Frame count is not a convergence measurement.
 
@@ -88,7 +88,8 @@ Actual-house acceptance needs a fixed interior camera, verified source/texture i
 
 ## Optional spatial reconstruction experiment
 
-A scene can explicitly retain geometric guides for a bounded presentation filter:
+A scene can explicitly enable the `shared-primary-v1` numerical baseline, whose
+authoritative primary records support a bounded presentation filter:
 
 ```ts
 engine.resize(320, 180);
@@ -116,15 +117,90 @@ retrace transport or upload source geometry. Ordinary submitted-frame and batch
 cursor advancement continues, including at the sample cap. Pausing/re-enabling
 indirect lighting retains its existing reset behavior.
 
-The optional buffer contains a 16-byte diagnostic header and 32 bytes per pixel:
-exact primary diffuse reflectance, the BVH triangle index and normal orientation,
-exact primary point and a local world-space pixel footprint. This adds 1,843,216
-bytes at 320×180, or 2,097,168 bytes at the capability cap. Guides are populated
-alongside the original validated primary hit, before secondary tracing, without
-another random sample or ray. A guide failure bypasses reconstruction without
-changing raw sample status. Records clear with accumulation; the diagnostic header
-clears each composition. The original 32-byte estimator records and 16-byte sample
-counter buffer remain unchanged. Diagnostic staging adds 16 bytes while mapped.
+The optional buffer contains a 16-byte diagnostic header and 32 bytes per pixel,
+stored as eight u32 words: primary diffuse-rho f32 bits, metadata, world-point f32
+bits and footprint f32 bits. This adds 1,843,216 bytes at 320×180, or 2,097,168 bytes
+at the capability cap. Metadata carries the packed triangle ID (bits 0–19), guide
+validity (20), normal flip (21), primary state (22–24) and query-issued flag (25).
+Bits 26–31 are reserved. All IDs through `0xfffff` are available; the maximum is
+not a sentinel. The immutable triangle normal plus the flip bit supplies the
+oriented normal without renormalization.
+
+After current raster depth is available, a separate `gi-primary` compute pass
+prepares only the scheduled first-sweep batch. The following transport pass loads
+the stored rho, point, ID and orientation. Composition loads those same input
+words; neither consumer independently reconstructs primary material or position.
+Primary preparation consumes no random dimensions. Later sweeps reuse the records
+and omit the primary query/pass. At 320×180 with a 4,096-pixel batch, the first
+sweep has 15 primary dispatches, including a final 256-pixel batch. This reduces
+repeated primary work but adds first-sweep pass and storage overhead; it is not a
+measured frame-rate improvement.
+
+READY and guide-valid are independent: a valid primary with an unavailable or
+grazing footprint still traces, then uses raw presentation fallback. Unscheduled
+records remain all-zero UNINITIALIZED and cannot receive neighbor illumination.
+BACKGROUND maps to raw status 4 before attempts increment. EXHAUSTED maps to raw
+2, and INVALID or unexpected scheduled UNINITIALIZED maps to raw 3. A covered
+raster primary miss is INVALID, never environment light. Reserved states and
+contradictory metadata are invalid data. Only transport owns raw/counter writes;
+cached terminal failures increment attempt/failure counts once. READY followed by
+a secondary/visibility failure still remains raw unknown and direct-only.
+
+Records clear with accumulation; the diagnostic header clears each composition.
+The 32-byte estimator records and 16-byte sample counter buffer retain their byte
+layouts. Diagnostic staging adds 16 bytes while mapped. The former in-trace guide
+candidate failed actual-house raw preservation and remains a failed historical
+experiment. `shared-primary-v1` intentionally establishes a new optional numerical
+baseline; it does not promise legacy cross-binary raw hashes. Within this new
+design, denoise off/on must preserve every raw-state, sample-counter and primary
+record word. The ordinary six-binding `legacy-inline-primary-v1` shader remains
+unchanged.
+
+### Primary numerical admission and cache lifetime
+
+The optional path additionally scans indexed UV/COLOR RGB components for finite
+magnitude at most 2^30 before indirect GPU allocation/upload, without copying
+source arrays. Common imported geometry and its borrowed material views can
+already exist; a failed or cancelled scan disposes that uncommitted geometry.
+The scan yields in bounded chunks and can be cancelled. Signed source COLOR is
+permitted; the interpolated color must be nonnegative. Uploaded camera and inverse
+matrix coefficients must be finite with magnitude at most 2^30 before encoding.
+These are optional primary restrictions, independent of the tighter guide bounds.
+
+The primary shader bounds inputs before each newly introduced arithmetic stage:
+homogeneous values at most 2^33, `abs(w) >= 2^-30`, and predivision numerator bounds
+establish endpoint magnitude at most 2^30. Endpoint subtraction and squared length
+have f32 overflow headroom; admitted squared length is `[2^-60,2^64)`. Barycentric
+u/v are bounded before forming weights, then each weight must lie in
+`[-2^-20,1+2^-20]`, without clamping. Existing source positions remain bounded by
+8192. Interpolation products are bounded before evaluating point/UV/COLOR; actual
+color is admitted in `[0,2^33]`. Material samples/factors lie in `[0,1]`, so the
+unchanged rho multiplication order has bounded intermediates before the final
+`[0,65504]` output check. Projection also has predivision guards before applying
+the existing raster-depth tolerance `2e-5`. Per-pixel failures become INVALID.
+These checks prevent overflow in the new operations within this domain; they do
+not certify cancellation accuracy, underflow/subnormal preservation or inherited
+traversal/offset robustness. Tiny-rho filtering thresholds do not reject primary
+transport. No new normal-map, material, ray-cone or sampling support is implied.
+
+Progress names the numerical baseline. Optional `primary` progress separately
+tracks queued preparation and its generation/state. Its frontier never wraps:
+cursor zero/frontier zero is initial, while cursor zero/frontier N is a completed
+queued first sweep, including one-batch viewports. Encoded-but-unsubmitted work
+does not advance the frontier. Shared resets and synchronous cancellation make
+old callbacks stale; the next successful submission clears raw and primary state
+and restarts from zero. Denoise and exposure controls are presentation-only and
+do not change the primary generation or transport schedule.
+
+An asynchronous current-device GPU error terminally faults the optional epoch,
+invalidates its queued progress/readbacks and prevents further consumption. The
+engine retains fail-closed behavior; dispose/recreate is required for recovery.
+Already queued frames may have executed before notification and cannot be rolled
+back or treated as accepted evidence. Queue-fence rejection is terminal; timeout
+is not proof of rejection. Stale tagged callbacks cannot publish into a newer
+generation, but an unscoped current-device error cannot safely be assigned to an
+old retired scene and ignored. Queue completion alone is not a per-frame
+validation receipt.
 
 Composition performs one 5×5 positive binomial gather of indirect illumination,
 then remodulates the exact center reflectance. It does not average direct HDR,
@@ -192,5 +268,10 @@ control edits do not relabel an older GPU header.
 
 This is an experimental option with an actual-house visual acceptance hold. It
 has no real-time performance, general denoising quality or convergence claim.
-The sampler, source, material and light definitions remain unchanged so its effect
-can be judged independently.
+Primary staging and its disclosed admission define a new optional baseline;
+the fixed hash sampler, seed/attempt indexing, source, material meaning and light
+definitions remain unchanged. Acceptance requires independent geometric/material
+references (including single/double-sided front/back hits), exact filter-toggle
+raw preservation within this baseline, and matched actual-house images at the
+existing camera, lights and 64 samples per pixel. Historical failures remain
+failures; CPU tests alone cannot clear the visual or GPU-validation hold.

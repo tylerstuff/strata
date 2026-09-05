@@ -207,3 +207,150 @@ describe('optional imported spatial reconstruction data and lifecycle', () => {
     expect(effect.gpuBufferBytes).toBe(0); expect(effect.gpuTextureBytes).toBe(0);
   });
 });
+
+describe('shared primary queue frontier and terminal epoch lifecycle', () => {
+  it('admits optional source attributes before pipeline creation while leaving legacy admission unchanged', async () => {
+    const input = capabilityOptions(); input.source.vertices[6] = 2 ** 31;
+    const optional = gpu();
+    await expect(ImportedIndirectEffect.create(optional.device, input)).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
+    expect(optional.raw.createComputePipelineAsync).not.toHaveBeenCalled(); expect(optional.raw.createBindGroupLayout).not.toHaveBeenCalled();
+    expect(optional.raw.queue.writeBuffer).not.toHaveBeenCalled(); expect(optional.buffers).toHaveLength(0);
+    const legacy = gpu(), ordinary = await make(legacy, { ...input, options: { ...input.options, spatialDenoise: false } });
+    expect(ordinary.progress.numericBaseline).toBe('legacy-inline-primary-v1'); expect(ordinary.progress.primary).toBeUndefined();
+    expect(legacy.raw.createComputePipelineAsync).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([2 ** 31, 2 ** -31])('rejects an oversized actual camera or inverse (%s) before pending state or writes', async scale => {
+    const g = gpu(), effect = await make(g); submit(effect, g); const previous = effect.progress;
+    const cam = camera(); cam.viewProjection[0] = scale;
+    const e = g.encoder(), buffers = g.buffers.length, textures = g.textures.length, writes = g.raw.queue.writeBuffer.mock.calls.length;
+    expect(() => effect.prepare(e as unknown as GPUCommandEncoder, cam, 7, 3, 0, {})).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+    expect(effect.progress).toEqual(previous); expect(g.buffers).toHaveLength(buffers); expect(g.textures).toHaveLength(textures);
+    expect(g.raw.queue.writeBuffer).toHaveBeenCalledTimes(writes); expect(e.beginComputePass).not.toHaveBeenCalled();
+    submit(effect, g, encode(effect, g), 2); expect(effect.progress.primary?.queuedPrimaryPixels).toBe(16);
+    const ordinaryGpu = gpu(), ordinary = await make(ordinaryGpu, options());
+    expect(() => encode(ordinary, ordinaryGpu, cam)).not.toThrow(); ordinary.cancelFrame();
+  });
+
+  it('distinguishes initial cursor zero from a complete one-batch queued primary sweep', async () => {
+    const g = gpu(), input = capabilityOptions(); const effect = await make(g, { ...input, options: { ...input.options, pixelBatch: 64 } });
+    expect(effect.progress).toMatchObject({ numericBaseline: 'shared-primary-v1', batchCursor: 0, primary: { state: 'empty', queuedPrimaryPixels: 0 } });
+    expect(effect.composePassNames).toEqual(['gi-primary', 'gi-trace', 'gi-shade']);
+    expect(g.raw.createComputePipelineAsync.mock.calls.map(([p]) => p.compute.entryPoint)).toEqual(['traceImportedIndirect', 'composeImportedIndirect', 'prepareImportedIndirectPrimary']);
+    const first = encode(effect, g);
+    expect(first.encoder.passes.map(pass => pass.descriptor?.label)).toEqual(['Strata imported indirect primary', 'Strata imported indirect trace', 'Strata imported indirect composition']);
+    expect(first.result.dispatchCalls).toBe(3); expect(effect.progress.primary?.queuedPrimaryPixels).toBe(0);
+    submit(effect, g, first, 8);
+    expect(effect.progress).toMatchObject({ batchCursor: 0, primary: { state: 'queued-complete', queuedPrimaryPixels: 21, queuedPrimaryDispatches: 1, actualPrimaryQueries: null } });
+    const second = encode(effect, g);
+    expect(second.result).toMatchObject({ dispatchCalls: 2, skippedGpuPasses: ['gi-primary'] });
+    expect(second.encoder.passes.map(pass => pass.descriptor?.label)).toEqual(['Strata imported indirect trace', 'Strata imported indirect composition']);
+    submit(effect, g, second, 9); expect(effect.progress.primary?.queuedPrimaryDispatches).toBe(1);
+  });
+
+  it('writes primary timestamps only for dispatched preparation and explicitly skips later query slots', async () => {
+    const g = gpu(), input = capabilityOptions(), effect = await make(g, { ...input, options: { ...input.options, pixelBatch: 64 } });
+    const primaryWrites = { querySet: {} as GPUQuerySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 };
+    const frame = () => {
+      const e = g.encoder(), cam = camera(); effect.prepare(e as unknown as GPUCommandEncoder,cam,7,3,0,{});
+      const result = effect.compose(e as unknown as GPUCommandEncoder,outputs,cam,7,3,0,{temporal:false},{'gi-primary':primaryWrites});
+      return { encoder:e,result };
+    };
+    const initial = frame(); expect(initial.encoder.passes[0]!.descriptor?.timestampWrites).toBe(primaryWrites);
+    expect(initial.result.skippedGpuPasses).toBeUndefined(); submit(effect,g,initial,1);
+    const repeat = frame(); expect(repeat.encoder.passes.some(p=>p.descriptor?.timestampWrites===primaryWrites)).toBe(false);
+    expect(repeat.result.skippedGpuPasses).toEqual(['gi-primary']); effect.cancelFrame();
+  });
+
+  it('prepares the actual 256-pixel final tail once and preserves frontier across display toggles', async () => {
+    const g = gpu(), input = capabilityOptions(), effect = await make(g, { ...input, options: { ...input.options, maxPixels: 57600, pixelBatch: 4096 } });
+    const actualRanges: number[][] = [];
+    for (let frame = 1; frame <= 15; frame++) {
+      const before = effect.progress.primary!;
+      effect.setDenoise(frame % 2 ? 'spatial' : 'off'); expect(effect.progress.primary).toEqual(before);
+      const encoded = encode(effect, g, camera(), 320, 180);
+      const uniform = g.buffers.find(b => b.label === 'Strata imported indirect frame')!;
+      actualRanges.push([...new Uint32Array(uniform.data.buffer).subarray(38, 40)]);
+      expect(encoded.result.dispatchCalls).toBe(3);
+      expect(effect.progress.primary!.queuedPrimaryPixels).toBe((frame - 1) * 4096);
+      submit(effect, g, encoded, frame);
+    }
+    expect(actualRanges).toEqual([[0,4096],[4096,4096],[8192,4096],[12288,4096],[16384,4096],[20480,4096],[24576,4096],[28672,4096],[32768,4096],[36864,4096],[40960,4096],[45056,4096],[49152,4096],[53248,4096],[57344,256]]);
+    expect(effect.progress).toMatchObject({ batchCursor: 0, primary: { queuedPrimaryPixels: 57600, queuedPrimaryDispatches: 15, state: 'queued-complete' } });
+    const later = encode(effect, g, camera(), 320, 180); expect(later.result.skippedGpuPasses).toEqual(['gi-primary']);
+    submit(effect, g, later, 16); expect(effect.progress.primary?.queuedPrimaryPixels).toBe(57600);
+  });
+
+  it.each([0, 2])('does not commit cancelled first/tail preparation after %s submitted batches', async committed => {
+    const g = gpu(), effect = await make(g);
+    for (let i = 0; i < committed; i++) submit(effect, g, encode(effect, g), i + 1);
+    const state = effect.accumulationBuffer as unknown as (typeof g.buffers)[number] | undefined;
+    state?.data.fill(27); const previousRevision = effect.progress.revision;
+    const cancelled = encode(effect, g); const records = guide(g); records.data.fill(51);
+    expect(effect.progress.primary?.queuedPrimaryPixels).toBe(committed * 8);
+    g.raw.queue.submit.mockImplementationOnce(() => { throw Error('synchronous submission failure'); });
+    expect(() => g.raw.queue.submit([cancelled.encoder.finish()])).toThrow('synchronous submission failure'); effect.cancelFrame();
+    expect(effect.progress).toMatchObject({ revision: previousRevision, pendingReset: true, primary: { state: 'empty', queuedPrimaryPixels: 0 } });
+    expect(records.data.every(value => value === 51)).toBe(true);
+    const retry = encode(effect, g); expect(retry.result.dispatchCalls).toBe(3);
+    const uniform = g.buffers.find(b => b.label === 'Strata imported indirect frame')!;
+    expect([...new Uint32Array(uniform.data.buffer).subarray(38, 40)]).toEqual([0,8]);
+    submit(effect, g, retry, committed + 1);
+    expect(records.data.every(value => value === 0)).toBe(true); expect(effect.progress.primary?.queuedPrimaryPixels).toBe(8);
+  });
+
+  it.each(['reset', 'camera', 'resize', 'lighting', 'seed', 'pause'] as const)('retires partial primary progress on %s and rebuilds from zero', async change => {
+    const g = gpu(), effect = await make(g); submit(effect, g); const generation = effect.progress.primary!.generation;
+    let cam = camera(), width = 7;
+    if (change === 'reset') effect.reset();
+    if (change === 'camera') { cam = camera(); cam.viewProjection[12] = .25; }
+    if (change === 'resize') width = 8;
+    if (change === 'lighting') effect.updateLighting({ directionToLight: [0,1,0], color: [1,1,1], intensity: 0 });
+    if (change === 'seed') effect.updateSettings({ seed: 99 });
+    if (change === 'pause') { effect.setEnabled(false); effect.setEnabled(true); }
+    const frame = encode(effect, g, cam, width, 3);
+    expect(effect.progress.primary!.generation).toBeGreaterThan(generation); expect(effect.progress.primary?.queuedPrimaryPixels).toBe(0);
+    expect(frame.result.dispatchCalls).toBe(3); submit(effect, g, frame, 2);
+    expect(effect.progress).toMatchObject({ revision: 2, primary: { queuedPrimaryPixels: 8, queuedPrimaryDispatches: 1 } });
+  });
+
+  it.each([1, 3])('invalidates delayed readback and all queued progress when faulted after %s batches', async batches => {
+    const g = gpu(), effect = await make(g);
+    for (let i = 0; i < batches; i++) submit(effect, g, encode(effect, g), i + 1);
+    const before = effect.progress, wait = deferred<void>(), create = g.raw.createBuffer.getMockImplementation()!;
+    g.raw.createBuffer.mockImplementation(d => { const b = create(d); if ((d.usage & 1) !== 0) b.mapAsync.mockReturnValueOnce(wait.promise); return b; });
+    const pending = effect.readProgress(), rejection = expect(pending).rejects.toMatchObject({ code: 'GPU_VALIDATION_FAILED' });
+    const buffer = g.buffers.at(-1)!; effect.faultGpuEpoch(Error('delayed device validation')); wait.resolve(); await rejection;
+    expect(effect.progress).toMatchObject({ revision: before.revision, pendingReset: true, primary: { state: 'faulted', queuedPrimaryPixels: 0 } });
+    expect(effect.progress.primary!.generation).toBeGreaterThan(before.primary!.generation);
+    expect(buffer.getMappedRange).not.toHaveBeenCalled(); expect(buffer.destroy).toHaveBeenCalledOnce();
+    const writes = g.raw.queue.writeBuffer.mock.calls.length;
+    for (const action of [() => encode(effect, g), () => effect.reset(), () => effect.setDenoise('off'), () => effect.validateSize(7,3), () => effect.submitted(99)]) expect(action).toThrowError(expect.objectContaining({ code: 'GPU_VALIDATION_FAILED' }));
+    expect(g.raw.queue.writeBuffer).toHaveBeenCalledTimes(writes);
+    effect.dispose(); const disposed = effect.progress; effect.faultGpuEpoch(Error('late old-device error')); expect(effect.progress).toEqual(disposed);
+  });
+
+  it('invalidates a queued reset when asynchronous rejection means old GPU records were never cleared', async () => {
+    const g = gpu(), effect = await make(g); submit(effect,g);
+    const records = guide(g), state = effect.accumulationBuffer as unknown as (typeof g.buffers)[number];
+    records.data.fill(71); state.data.fill(29); effect.reset();
+    const resetFrame = encode(effect,g);
+    // Model a submit call returning while GPU validation later rejects all its commands.
+    g.raw.queue.submit.mockImplementationOnce(() => {}); submit(effect,g,resetFrame,2);
+    expect(records.data.every(v=>v===71)).toBe(true); expect(state.data.every(v=>v===29)).toBe(true);
+    expect(effect.progress.primary).toMatchObject({ state:'queued-partial',queuedPrimaryPixels:8 });
+    effect.faultGpuEpoch(Error('Reset command rejected asynchronously'));
+    expect(effect.progress.primary).toMatchObject({ state:'faulted',queuedPrimaryPixels:0 });
+    expect(() => encode(effect,g)).toThrowError(expect.objectContaining({code:'GPU_VALIDATION_FAILED'}));
+    effect.dispose(); expect(effect.gpuBufferBytes).toBe(0); expect(effect.gpuTextureBytes).toBe(0);
+  });
+
+  it('rejects a tagged old-generation readback after reset without faulting the valid retry', async () => {
+    const g = gpu(), effect = await make(g); submit(effect, g);
+    const wait = deferred<void>(), create = g.raw.createBuffer.getMockImplementation()!;
+    g.raw.createBuffer.mockImplementation(d => { const b = create(d); if ((d.usage & 1) !== 0) b.mapAsync.mockReturnValueOnce(wait.promise); return b; });
+    const pending = effect.readProgress(), rejected = expect(pending).rejects.toMatchObject({ code: 'RENDER_FAILED' });
+    effect.reset(); submit(effect, g, encode(effect, g), 2); wait.resolve(); await rejected;
+    expect(effect.progress.primary?.state).toBe('queued-partial'); await expect(effect.readProgress()).resolves.toMatchObject({ submittedFrameId: 2 });
+  });
+});

@@ -1,7 +1,7 @@
 import { StrataError } from '../errors.js';
 import type { RasterGiProvider } from '../rendering/gi-provider.js';
 import type { CameraFrame } from '../rendering/raster-math.js';
-import type { RasterControls, RasterOutputs, RasterTimestamps } from '../rendering/raster-types.js';
+import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from '../rendering/raster-types.js';
 import { importedIndirectShader } from './imported-indirect-shader.js';
 import { normalizeImportedIndirectOptions, normalizeImportedSpatialDenoise, validateImportedIndirectSize, validateImportedIndirectCapability } from './imported-indirect-options.js';
 import type { ImportedIndirectCreateOptions, ImportedIndirectEnvironment, ImportedIndirectLighting, ImportedIndirectMaterial,
@@ -63,12 +63,12 @@ function cameraData(camera: CameraFrame): { key: string; inverse: Float32Array<A
   return { key: JSON.stringify([[...camera.viewProjection], [...camera.view], camera.eye]), inverse: inverse(camera.viewProjection) };
 }
 interface Targets { width: number; height: number; accumulation: GPUBuffer; texture: GPUTexture; view: GPUTextureView; scene: GPUBindGroup; guides?: GPUBuffer; }
-interface Pending { encoder: GPUCommandEncoder; width: number; height: number; cameraKey: string; key: string; inverse: Float32Array<ArrayBuffer>; reset: boolean; start: number; count: number; encoded: boolean; }
+interface Pending { encoder: GPUCommandEncoder; width: number; height: number; cameraKey: string; key: string; inverse: Float32Array<ArrayBuffer>; reset: boolean; start: number; count: number; primary: boolean; nextPrimaryPixels: number; encoded: boolean; }
 
 /** Full-resolution, bounded progressive diffuse accumulation. Borrowed material resources are never destroyed. */
 export class ImportedIndirectEffect implements RasterGiProvider {
   readonly preparePassNames = [] as const;
-  readonly composePassNames = ['gi-trace', 'gi-shade'] as const;
+  get composePassNames(): readonly RasterPassName[] { return this.spatialDenoise ? ['gi-primary', 'gi-trace', 'gi-shade'] : ['gi-trace', 'gi-shade']; }
   private enabled = true;
   private disposed = false;
   private dirty = true;
@@ -80,6 +80,10 @@ export class ImportedIndirectEffect implements RasterGiProvider {
   private submittedDenoise: ImportedIndirectDenoise = 'off';
   private submittedPresentationRevision = 0;
   private cursor = 0;
+  private primaryGeneration = 0;
+  private queuedPrimaryPixels = 0;
+  private queuedPrimaryDispatches = 0;
+  private gpuFault: StrataError | undefined;
   private committedKey: string | undefined;
   private committedSize = [0, 0];
   private pending: Pending | undefined;
@@ -89,7 +93,9 @@ export class ImportedIndirectEffect implements RasterGiProvider {
     private readonly uniform: GPUBuffer, private readonly diagnostics: GPUBuffer, private readonly tracePipeline: GPUComputePipeline,
     private readonly composePipeline: GPUComputePipeline, private readonly screenLayout: GPUBindGroupLayout, private readonly sceneLayout: GPUBindGroupLayout,
     private readonly materialGroup: GPUBindGroup, private readonly material: ImportedIndirectMaterial,
-    private light: ImportedIndirectLighting, private env: ImportedIndirectEnvironment, private limits: Required<ImportedIndirectTraceOptions>, private readonly spatialDenoise: boolean) {}
+    private light: ImportedIndirectLighting, private env: ImportedIndirectEnvironment, private limits: Required<ImportedIndirectTraceOptions>, private readonly spatialDenoise: boolean,
+    private readonly primaryPipeline?: GPUComputePipeline,
+    private readonly validatePrimaryCamera?: (viewProjection: Float32Array, inverse: Float32Array) => void) {}
   static async create(device: GPUDevice, input: ImportedIndirectCreateOptions): Promise<ImportedIndirectEffect> {
     if (!input) fail('creation options are required.'); aborted(input.signal);
     const limits = normalizeImportedIndirectOptions(input.options), spatialDenoise = normalizeImportedSpatialDenoise(input.options), light = lighting(input.lighting), env = environment(input.environment), m = input.material;
@@ -99,6 +105,8 @@ export class ImportedIndirectEffect implements RasterGiProvider {
     if (material.emissiveFactor.some(value => value * material.emissiveStrength > 65504)) fail('emissive factor times strength exceeds the finite rgba16float range (65504).');
     validateImportedIndirectCapability(device.limits, 1, 1, spatialDenoise);
     const sourceBytes = validateSource(device, input.source);
+    const primaryDomain = spatialDenoise ? await import('./imported-indirect-primary-domain.js') : undefined;
+    if (primaryDomain) { await primaryDomain.validateImportedPrimarySource(input.source, input.signal); aborted(input.signal); }
     const l = device.limits;
     if (l.maxStorageBuffersPerShaderStage < 6 || l.maxBindGroups < 3 || l.maxSampledTexturesPerShaderStage < 5 || l.maxSamplersPerShaderStage < 3
       || l.maxStorageTexturesPerShaderStage < 1 || l.maxUniformBufferBindingSize < uniformBytes || l.maxComputeInvocationsPerWorkgroup < 64 || l.maxComputeWorkgroupSizeX < 64 || l.maxComputeWorkgroupSizeY < 8) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported indirect requires six storage buffers, three groups, five textures, three samplers and 64-thread compute groups.');
@@ -110,7 +118,7 @@ export class ImportedIndirectEffect implements RasterGiProvider {
     const shader = spatialDenoise ? (await import('./imported-indirect-spatial-shader.js')).importedIndirectSpatialShader : importedIndirectShader;
     aborted(input.signal);
     const module = device.createShaderModule({ label: 'Strata imported progressive indirect', code: shader });
-    const [trace, compose] = await Promise.all(['traceImportedIndirect', 'composeImportedIndirect'].map(entryPoint => device.createComputePipelineAsync({ label: entryPoint, layout, compute: { module, entryPoint } })));
+    const [trace, compose, primary] = await Promise.all(['traceImportedIndirect', 'composeImportedIndirect', ...(spatialDenoise ? ['prepareImportedIndirectPrimary'] : [])].map(entryPoint => device.createComputePipelineAsync({ label: entryPoint, layout, compute: { module, entryPoint } })));
     aborted(input.signal); const owned: GPUBuffer[] = [];
     try {
       const sourceBuffers = [input.source.nodes, input.source.triangles, input.source.vertices, input.source.indices].map((data, index) => {
@@ -120,10 +128,24 @@ export class ImportedIndirectEffect implements RasterGiProvider {
       const diagnostics = device.createBuffer({ label: 'Strata imported indirect counters', size: diagnosticBytes, usage: 0x80 | 0x8 | 0x4 }); owned.push(diagnostics);
       const materialGroup = device.createBindGroup({ layout: materialLayout, entries: [{ binding: 0, resource: m.baseColorTexture }, { binding: 1, resource: m.baseSampler }, { binding: 2, resource: m.metallicRoughnessTexture }, { binding: 3, resource: m.metallicRoughnessSampler }, { binding: 4, resource: m.emissiveTexture }, { binding: 5, resource: m.emissiveSampler }] });
       aborted(input.signal);
-      return new ImportedIndirectEffect(device, sourceBuffers, sourceBytes, uniform, diagnostics, trace!, compose!, screenLayout, sceneLayout, materialGroup, material, light, env, limits, spatialDenoise);
+      return new ImportedIndirectEffect(device, sourceBuffers, sourceBytes, uniform, diagnostics, trace!, compose!, screenLayout, sceneLayout, materialGroup, material, light, env, limits, spatialDenoise, primary, primaryDomain?.validateImportedPrimaryCamera);
     } catch (cause) { for (const resource of owned) resource.destroy(); throw cause; }
   }
-  private live(): void { if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported indirect effect is disposed.'); }
+  private live(): void { if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported indirect effect is disposed.'); if (this.gpuFault) throw this.gpuFault; }
+  private dirtyEpoch(): void {
+    if (this.spatialDenoise) {
+      if (!this.dirty) this.primaryGeneration++;
+      this.queuedPrimaryPixels = 0; this.queuedPrimaryDispatches = 0;
+    }
+    this.dirty = true;
+  }
+  /** A current-device error invalidates all queued descendants; this is not a rollback. */
+  faultGpuEpoch(cause: unknown): void {
+    if (!this.spatialDenoise || this.disposed || this.gpuFault) return;
+    this.gpuFault = cause instanceof StrataError ? cause : new StrataError('GPU_VALIDATION_FAILED', 'Shared primary epoch is faulted; dispose and recreate the engine.', { cause });
+    this.primaryGeneration++; this.pending = undefined; this.dirty = true;
+    this.queuedPrimaryPixels = 0; this.queuedPrimaryDispatches = 0;
+  }
   private idle(): void { this.live(); if (this.pending) throw new StrataError('RENDER_FAILED', 'Imported indirect frame requires submitted() or cancelFrame() before another operation.'); }
   get active(): boolean { return this.enabled && !this.disposed; }
   get initialUploadBytes(): number { return this.sourceBytes; }
@@ -135,19 +157,27 @@ export class ImportedIndirectEffect implements RasterGiProvider {
   /** Internal guide/diagnostic readback; expires on resize/disposal. */
   get spatialGuideBuffer(): GPUBuffer | undefined { return this.targets?.guides; }
   get maxPixels(): number { return this.limits.maxPixels; }
-  get progress(): ImportedIndirectProgress { return { revision: this.revision, submittedFrames: this.submittedFrames, submittedFrameId: this.submittedFrameId, spatialDenoise: this.spatialDenoise, denoise: this.denoise, presentationRevision: this.presentationRevision, batchCursor: this.cursor, width: this.committedSize[0]!, height: this.committedSize[1]!, pendingReset: this.dirty || Boolean(this.pending?.reset), pendingFrame: Boolean(this.pending), enabled: this.active, normalMode: 'geometric', textureLod: 0, limits: { ...this.limits } }; }
+  get hasSharedPrimary(): boolean { return this.spatialDenoise; }
+  get progress(): ImportedIndirectProgress {
+    return { numericBaseline: this.spatialDenoise ? 'shared-primary-v1' : 'legacy-inline-primary-v1',
+      ...(this.spatialDenoise ? { primary: { generation: this.primaryGeneration,
+        state: this.disposed ? 'disposed' as const : this.gpuFault ? 'faulted' as const : this.dirty || !this.queuedPrimaryPixels ? 'empty' as const
+          : this.queuedPrimaryPixels === this.committedSize[0]! * this.committedSize[1]! ? 'queued-complete' as const : 'queued-partial' as const,
+        queuedPrimaryPixels: this.queuedPrimaryPixels, queuedPrimaryDispatches: this.queuedPrimaryDispatches, actualPrimaryQueries: null } } : {}),
+      revision: this.revision, submittedFrames: this.submittedFrames, submittedFrameId: this.submittedFrameId, spatialDenoise: this.spatialDenoise, denoise: this.denoise, presentationRevision: this.presentationRevision, batchCursor: this.cursor, width: this.committedSize[0]!, height: this.committedSize[1]!, pendingReset: this.dirty || Boolean(this.pending?.reset), pendingFrame: Boolean(this.pending), enabled: this.active, normalMode: 'geometric', textureLod: 0, limits: { ...this.limits } };
+  }
   updateLighting(value: ImportedIndirectLighting, env?: ImportedIndirectEnvironment): void {
     this.idle(); const nextLight = lighting(value), nextEnvironment = env === undefined ? this.env : environment(env);
-    if (JSON.stringify([nextLight, nextEnvironment]) !== JSON.stringify([this.light, this.env])) { this.light = nextLight; this.env = nextEnvironment; this.dirty = true; }
+    if (JSON.stringify([nextLight, nextEnvironment]) !== JSON.stringify([this.light, this.env])) { this.light = nextLight; this.env = nextEnvironment; this.dirtyEpoch(); }
   }
   updateSettings(value: ImportedIndirectOptions): void {
     this.idle();
     if (!value || typeof value !== 'object' || Array.isArray(value)) fail('options must be an object.');
     if (value.spatialDenoise !== undefined && (typeof value.spatialDenoise !== 'boolean' || value.spatialDenoise !== this.spatialDenoise)) fail('spatialDenoise is a creation capability and cannot change.');
     const next = normalizeImportedIndirectOptions({ ...this.limits, ...value });
-    if (JSON.stringify(next) !== JSON.stringify(this.limits)) { this.limits = next; this.dirty = true; }
+    if (JSON.stringify(next) !== JSON.stringify(this.limits)) { this.limits = next; this.dirtyEpoch(); }
   }
-  setEnabled(value: boolean): void { this.idle(); if (typeof value !== 'boolean') fail('enabled must be boolean.'); if (value !== this.enabled) { this.enabled = value; this.dirty = true; } }
+  setEnabled(value: boolean): void { this.idle(); if (typeof value !== 'boolean') fail('enabled must be boolean.'); if (value !== this.enabled) { this.enabled = value; this.dirtyEpoch(); } }
   /** Pure complete control validation must precede geometry or effect mutation. */
   validateDenoise(value: unknown): void {
     this.live();
@@ -158,7 +188,7 @@ export class ImportedIndirectEffect implements RasterGiProvider {
     this.idle(); this.validateDenoise(value);
     if (value !== this.denoise) { this.denoise = value; this.presentationRevision++; }
   }
-  reset(): void { this.idle(); this.dirty = true; }
+  reset(): void { this.idle(); this.dirtyEpoch(); }
   /** Pure size preflight: safe before host resize/activation, with no allocation or state change. */
   validateSize(width: number, height: number): void {
     this.live();
@@ -169,8 +199,15 @@ export class ImportedIndirectEffect implements RasterGiProvider {
     this.idle(); if (!this.active) fail('cannot prepare a disabled effect.'); this.validateSize(width, height);
     const pixels = width * height;
     const data = cameraData(camera), key = JSON.stringify([data.key, width, height, this.light, this.env, this.limits]);
+    // Raster may already have resized its common MRT targets. This pure check
+    // still precedes effect pending state, indirect allocation/uploads and passes.
+    this.validatePrimaryCamera?.(camera.viewProjection, data.inverse);
+    if (key !== this.committedKey) this.dirtyEpoch();
     const reset = this.dirty || key !== this.committedKey, start = reset ? 0 : this.cursor;
-    this.pending = { encoder, width, height, cameraKey: data.key, key, inverse: data.inverse, reset, start, count: Math.min(this.limits.pixelBatch, pixels - start), encoded: false };
+    const count = Math.min(this.limits.pixelBatch, pixels - start), primary = this.spatialDenoise && this.queuedPrimaryPixels < pixels;
+    if (primary && start !== this.queuedPrimaryPixels) throw new StrataError('RENDER_FAILED', 'Primary preparation frontier differs from the queued transport range.');
+    this.pending = { encoder, width, height, cameraKey: data.key, key, inverse: data.inverse, reset, start, count, primary,
+      nextPrimaryPixels: primary ? start + count : this.queuedPrimaryPixels, encoded: false };
     return { dispatchCalls: 0, uploadBytes: 0 };
   }
   private resize(width: number, height: number): Targets {
@@ -203,20 +240,27 @@ export class ImportedIndirectEffect implements RasterGiProvider {
       const screen = this.device.createBindGroup({ layout: this.screenLayout, entries: [{ binding: 0, resource: { buffer: this.uniform } }, { binding: 1, resource: outputs.depth }, { binding: 2, resource: outputs.hdr }, { binding: 3, resource: target.view }] });
       if (p.reset) { encoder.clearBuffer(target.accumulation); encoder.clearBuffer(this.diagnostics); if (target.guides) encoder.clearBuffer(target.guides); }
       else if (target.guides) encoder.clearBuffer(target.guides, 0, 16);
+      if (p.primary) {
+        const primary = encoder.beginComputePass({ label: 'Strata imported indirect primary', ...(timestamps['gi-primary'] ? { timestampWrites: timestamps['gi-primary'] } : {}) });
+        primary.setPipeline(this.primaryPipeline!); primary.setBindGroup(0, screen); primary.setBindGroup(1, target.scene); primary.setBindGroup(2, this.materialGroup);
+        primary.dispatchWorkgroups(Math.ceil(p.count / 64)); primary.end();
+      }
       const trace = encoder.beginComputePass({ label: 'Strata imported indirect trace', ...(timestamps['gi-trace'] ? { timestampWrites: timestamps['gi-trace'] } : {}) });
       trace.setPipeline(this.tracePipeline); trace.setBindGroup(0, screen); trace.setBindGroup(1, target.scene); trace.setBindGroup(2, this.materialGroup); trace.dispatchWorkgroups(Math.ceil(p.count / 64)); trace.end();
       const compose = encoder.beginComputePass({ label: 'Strata imported indirect composition', ...(timestamps['gi-shade'] ? { timestampWrites: timestamps['gi-shade'] } : {}) });
       compose.setPipeline(this.composePipeline); compose.setBindGroup(0, screen); compose.setBindGroup(1, target.scene); compose.setBindGroup(2, this.materialGroup); compose.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8)); compose.end();
-      p.encoded = true; return { view: target.view, dispatchCalls: 2, uploadBytes: uniformBytes };
+      p.encoded = true; return { view: target.view, dispatchCalls: p.primary ? 3 : 2, uploadBytes: uniformBytes,
+        ...(this.spatialDenoise && !p.primary ? { skippedGpuPasses: ['gi-primary'] as readonly RasterPassName[] } : {}) };
     } catch (cause) { this.cancelFrame(); throw cause; }
   }
   submitted(frameId?: number): void {
     this.live(); if (!this.active && !this.pending) return;
     const p = this.pending; if (!p?.encoded) throw new StrataError('RENDER_FAILED', 'Imported indirect submitted() requires an encoded frame.');
     if (p.reset) { this.revision++; this.submittedFrames = 0; }
+    if (p.primary) { this.queuedPrimaryPixels = p.nextPrimaryPixels; this.queuedPrimaryDispatches++; }
     this.cursor = (p.start + p.count) % (p.width * p.height); this.committedKey = p.key; this.committedSize = [p.width, p.height]; this.submittedFrames++; this.submittedFrameId = frameId ?? (this.submittedFrameId ?? 0) + 1; this.submittedDenoise = this.denoise; this.submittedPresentationRevision = this.presentationRevision; this.dirty = false; this.pending = undefined;
   }
-  cancelFrame(): void { if (this.disposed) return; this.pending = undefined; this.dirty = true; }
+  cancelFrame(): void { if (this.disposed) return; this.pending = undefined; this.dirtyEpoch(); }
   async readProgress(): Promise<ImportedIndirectReadback> {
     this.idle(); if (this.dirty || !this.submittedFrames) fail('readProgress requires a submitted accumulation revision.');
     if (this.readback) throw new StrataError('RENDER_FAILED', 'Imported indirect diagnostic readback is already pending.');
@@ -228,8 +272,9 @@ export class ImportedIndirectEffect implements RasterGiProvider {
       this.device.queue.submit([encoder.finish()]);
       await Promise.race([buffer.mapAsync(1), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new StrataError('GPU_WORK_TIMEOUT', 'Imported indirect diagnostic readback timed out.')), 5000); })]);
       this.live(); const counters = new Uint32Array(buffer.getMappedRange()).slice(); buffer.unmap();
+      if (this.spatialDenoise && progress.primary!.generation !== this.primaryGeneration) throw new StrataError('RENDER_FAILED', 'Shared primary readback belongs to a retired generation.');
       return { ...progress, attempted: counters[0]!, completed: counters[1]!, exhausted: counters[2]!, invalid: counters[3]!, ...(this.spatialDenoise ? { spatialDiagnostics: { filteredPixels: counters[4]!, fallbackChannels: counters[5]!, hdrFaultChannels: counters[6]!, guideBypassPixels: counters[7]! } } : {}) };
     } finally { if (timer) clearTimeout(timer); if (this.readback === buffer) { this.readback = undefined; buffer.destroy(); } }
   }
-  dispose(): void { if (this.disposed) return; this.disposed = true; this.pending = undefined; this.readback?.destroy(); this.readback = undefined; for (const buffer of this.sourceBuffers) buffer.destroy(); this.uniform.destroy(); this.diagnostics.destroy(); this.targets?.accumulation.destroy(); this.targets?.guides?.destroy(); this.targets?.texture.destroy(); this.targets = undefined; }
+  dispose(): void { if (this.disposed) return; this.disposed = true; this.primaryGeneration++; this.queuedPrimaryPixels = 0; this.pending = undefined; this.readback?.destroy(); this.readback = undefined; for (const buffer of this.sourceBuffers) buffer.destroy(); this.uniform.destroy(); this.diagnostics.destroy(); this.targets?.accumulation.destroy(); this.targets?.guides?.destroy(); this.targets?.texture.destroy(); this.targets = undefined; }
 }

@@ -35,6 +35,7 @@ export class ImportedRenderer {
   private disposed = false;
   private counters: ImportedIndirectReadback | null = null;
   private counterReadback: Promise<void> | undefined;
+  private indirectGpuFault: StrataError | undefined;
   private constructor(private readonly raster: RasterRenderer, private readonly geometry: ImportedGeometry,
     readonly retainedCpuBytes: number, private readonly indirect?: ImportedIndirectEffect, private readonly traceSummary?: TraceSummary) {}
   static async create(device: GPUDevice, format: GPUTextureFormat, options: ImportedSceneOptions, context?: CreationContext): Promise<ImportedRenderer> {
@@ -72,6 +73,9 @@ export class ImportedRenderer {
       checkAbort(options.signal);
       if (prepared && result && effectModule && indirectOptions) {
         const lighting = geometry.lighting;
+        // Shared-primary attribute admission runs inside effect creation before
+        // any indirect allocation/upload. A rejection retires this already-owned
+        // common geometry below, including its borrowed texture resources.
         indirect = await effectModule.ImportedIndirectEffect.create(device, {
           source: { nodes: new Uint8Array(result.nodes), triangles: new Uint8Array(result.triangles), vertices: prepared.vertices, indices: prepared.indices },
           material: geometry.borrowIndirectMaterial(prepared.sourceMaterialIndex), lighting, environment: incident(lighting), options: { ...indirectOptions, spatialDenoise },
@@ -100,12 +104,21 @@ export class ImportedRenderer {
   get directTexture(): GPUTexture | undefined { return this.raster.directTexture; }
   get currentCamera(): CameraFrame | undefined { return this.geometry.currentCamera; }
   get hasIndirect(): boolean { return this.indirect !== undefined; }
+  get hasSharedPrimary(): boolean { return this.indirect?.hasSharedPrimary === true; }
+  /** Fault all queued descendants; in-flight work cannot be rolled back. */
+  faultIndirectEpoch(cause: unknown): void {
+    if (this.disposed || !this.hasSharedPrimary || this.indirectGpuFault) return;
+    this.indirectGpuFault = cause instanceof StrataError ? cause : new StrataError('GPU_VALIDATION_FAILED', 'Shared primary epoch is faulted; recreate the engine.', { cause });
+    this.counters = null; this.indirect!.faultGpuEpoch(this.indirectGpuFault);
+  }
   validateSize(width: number, height: number): void { this.indirect?.validateSize(width, height); }
   async readIndirectProgress(): Promise<void> {
+    if (this.indirectGpuFault) throw this.indirectGpuFault;
     // An earlier idle request may have copied frame A before this caller fenced
     // frame B. Join A, then obtain B's header rather than accepting stale data.
     if (this.counterReadback) await this.counterReadback;
     if (this.disposed || !this.indirect) return;
+    if (this.indirectGpuFault) throw this.indirectGpuFault;
     const effect = this.indirect, progress = effect.progress;
     if (progress.pendingReset || progress.pendingFrame || !progress.submittedFrames) return;
     if (!this.counters || !this.matchesReadback(this.counters, progress)) {
@@ -114,13 +127,14 @@ export class ImportedRenderer {
           if (!this.disposed && this.matchesReadback(counters, effect.progress)) this.counters = counters;
         }, cause => {
           // Retirement must not report the replacement engine as disposed.
-          if (!this.disposed) throw cause;
+          if (!this.disposed && (!this.hasSharedPrimary || this.indirectGpuFault || this.matchesReadback(progress, effect.progress))) throw cause;
         });
         const pending = operation.finally(() => { if (this.counterReadback === pending) this.counterReadback = undefined; });
         this.counterReadback = pending;
       }
       await this.counterReadback;
     }
+    if (!this.disposed && this.indirectGpuFault) throw this.indirectGpuFault;
     // Only a currently matching result may reject. A completed older promise
     // never carries a presentation fault into a later frame or display mode.
     if (!this.disposed && this.counters && this.matchesReadback(this.counters, effect.progress)
@@ -128,10 +142,11 @@ export class ImportedRenderer {
       throw new StrataError('PRESENTATION_HDR_FAULT', 'Imported indirect composition exceeds the explicit spatial capability HDR domain [0, 65472]; inspect spatialDiagnostics.hdrFaultChannels. Raw transport is unchanged.');
     }
   }
-  private matchesReadback(readback: ImportedIndirectReadback, progress: ImportedIndirectProgress): boolean {
+  private matchesReadback(readback: ImportedIndirectProgress, progress: ImportedIndirectProgress): boolean {
     return !progress.pendingReset && !progress.pendingFrame && readback.revision === progress.revision
       && readback.submittedFrameId === progress.submittedFrameId && readback.presentationRevision === progress.presentationRevision
-      && readback.denoise === progress.denoise;
+      && readback.denoise === progress.denoise && !this.indirectGpuFault
+      && readback.primary?.generation === progress.primary?.generation && progress.primary?.state !== 'faulted' && progress.primary?.state !== 'disposed';
   }
   private configure(controls: Controls): Controls {
     normalizeRasterControls(controls);

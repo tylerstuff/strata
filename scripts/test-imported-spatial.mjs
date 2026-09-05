@@ -31,14 +31,15 @@ const output = join(homedir(), 'Downloads/Strata-Benchmark-Results', `${new Date
 await mkdir(output, { recursive: true });
 await writeFile(join(output, 'bundle.js'), bundle.outputFiles[0].contents);
 await writeFile(join(output, 'harness.ts'), harness); await writeFile(join(output, 'runner.mjs'), runner);
-const report = { kind: 'strata-imported-spatial-reconstruction-generated', status: 'running', performanceEvidence: false,
+const report = { kind: 'strata-imported-spatial-reconstruction-generated', numericBaseline: 'shared-primary-v1', status: 'running', performanceEvidence: false,
   sourceBefore: initialSource, modules, bundleSha256: hash(bundle.outputFiles[0].contents), harnessSha256: hash(harness), runnerSha256: hash(runner),
   fixtures: [...fixtures].map(([name, bytes]) => ({ name, bytes: bytes.length, sha256: hash(bytes) })),
   softwareGpu: process.env.STRATA_TEST_SOFTWARE_GPU === '1', browserErrors: [], requestFailures: [], cleanupErrors: [],
   limitations: ['Only generated geometry and immutable generated environment references are loaded. No external model collection is served or copied.',
     'Functional linear-HDR, same-ray radiometry and lifecycle checks; no timing or performance claim.',
     'CPU-reference fixtures measure linear-HDR reconstruction and geometry rejection, not unseen visibility or arbitrary light discontinuities.',
-    'The raw transport sampler is unchanged. Passing these fixtures does not establish useful actual-house visual quality.'] };
+    'The hash sampler is unchanged; shared-primary staging is a new optional numerical baseline. Historical ordinary comparisons are descriptive, while within-baseline filter-toggle raw/counter/record equality is mandatory.',
+    'Passing these fixtures does not establish useful actual-house visual quality.'] };
 let browser, server, timer;
 try {
   server = await createBenchmarkServer({ assetRoot: '' });

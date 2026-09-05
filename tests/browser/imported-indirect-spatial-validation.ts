@@ -4,6 +4,9 @@ import {
   makeSpatialTruthFixture, referenceSpatialPixel, roundSpatialPixelToF32, spatialTruthGates, spatialTruthSeeds,
   type ReferenceSpatialPixel, type SpatialVector,
 } from '../helpers/imported-indirect-spatial-reference.js';
+import { decodePrimaryRecord, packPrimaryRecord, primaryFirstConsumption, primaryReferenceGates, primaryWire,
+  referencePrimaryCamera, referencePrimaryHit, referenceRho, referenceSrgb,
+  type PrimaryVec3, type ReferencePrimaryCamera } from '../helpers/imported-primary-reference.js';
 
 const require = (value: unknown, message: string): void => { if (!value) throw new Error(message); };
 async function bounded<T>(promise: Promise<T>, name: string): Promise<T> {
@@ -120,6 +123,7 @@ export async function validateImportedSpatial() {
     const module = device.createShaderModule({ label: 'Actual optional imported diffuse reconstruction', code: importedIndirectSpatialShader });
     const compose = await bounded(device.createComputePipelineAsync({ layout, compute: { module, entryPoint: 'composeImportedIndirect' } }), 'Spatial compose pipeline');
     const trace = await bounded(device.createComputePipelineAsync({ layout, compute: { module, entryPoint: 'traceImportedIndirect' } }), 'Spatial trace pipeline');
+    const preparePrimary = await bounded(device.createComputePipelineAsync({ layout, compute: { module, entryPoint: 'prepareImportedIndirectPrimary' } }), 'Shared primary pipeline');
     const probeModule = device.createShaderModule({ label: 'Production helpers plus numerical queries', code: importedIndirectSpatialShader + probes });
     const probePipeline = await bounded(device.createComputePipelineAsync({ layout: 'auto', compute: { module: probeModule, entryPoint: 'querySpatialHelpers' } }), 'Spatial helper pipeline');
     const white = texture('Generated white material', 1, 1, 'rgba8unorm', 0x04 | 0x02);
@@ -138,10 +142,11 @@ export async function validateImportedSpatial() {
       pixels.forEach((p, index) => {
         p.sum.forEach((v, c) => s.setUint32(index * 32 + c * 4, bits(v), true));
         s.setUint32(index * 32 + 12, p.samples, true); s.setUint32(index * 32 + 16, p.samples, true); s.setUint32(index * 32 + 20, p.status, true);
-        p.guide.rho.forEach((v, c) => g.setUint32(16 + index * 32 + c * 4, bits(v), true));
-        g.setUint32(16 + index * 32 + 12, metadata?.[index] ?? (index | (p.guide.valid ? 0x00100000 : 0)), true);
-        p.guide.point.forEach((v, c) => g.setFloat32(16 + index * 32 + 16 + c * 4, v, true));
-        g.setFloat32(16 + index * 32 + 28, p.guide.footprint, true);
+        const record = p.status === 4 ? packPrimaryRecord({ state: 2 }) : packPrimaryRecord({ state: 1, issued: true,
+          triangle: index, rho: p.guide.rho, point: p.guide.point, guide: p.guide.valid, footprint: p.guide.footprint });
+        if (metadata?.[index] !== undefined) record[3] = metadata[index]!;
+        record.forEach((v, c) => g.setUint32(16 + index * 32 + c * 4, v, true));
+        pixels[index] = { ...p, primaryRecord: record, primaryTriangleCount: pixels.length };
         // Extent is independently known from the fixed X edge. Source IDs are
         // deliberately reordered; a packed-index/source-ID mix-up is observable.
         const [x, y, z] = p.guide.point, e = p.guide.triangleExtent;
@@ -241,6 +246,9 @@ export async function validateImportedSpatial() {
       await runCase(`status${status}-donors-excluded-centers-direct-only`, unknown, 9, 9);
     }
     await runCase('unknown-raw-poison-is-not-relabelled-HDR-fault', planar().map(p => ({ ...p, status: 2, sum: [NaN, -1, Infinity] as SpatialVector })), 9, 9);
+    for (const [label, mask] of [['missing-query', 0x00500000], ['reserved-state5', 0x03500000], ['reserved-bit26', 0x06500000]] as const) {
+      await runCase(`malformed-primary-${label}-cannot-use-completed-raw`, planar(), 9, 9, true, planar().map((_, i) => mask | i));
+    }
     await runCase('partial-sweep-stale-guide-cannot-fill-unsampled', planar().map((p, i) => i % 3 ? p : { ...p, samples: 0 }), 9, 9);
     await runCase('invalid-center-and-donor-guides-bypass', planar().map((p, i) => ({ ...p, guide: { ...p.guide, valid: i % 3 !== 0 } })), 9, 9);
     for (const rho of [2 ** -17, 2 ** -149]) {
@@ -316,7 +324,7 @@ export async function validateImportedSpatial() {
       { name: 'hdr-excluded-half-maximum', sum: bits(65504), samples: 1, direct: 0, valid: false, mean: 0 },
       { name: 'direct-addition-outside-domain', sum: bits(1), samples: 1, direct: bits(65472), valid: false, mean: 0 },
     ];
-    const identityQueries = [0x00100000, 0x001fffff, 0x003fffff, 0, 0x00400000 | 0x00100000, 0x80100000];
+    const identityQueries = [0x02500000, 0x025fffff, 0x027fffff, 0, 0x02d00000, 0x82500000];
     const pairQueries = [
       { name: 'plane-inside', donor: 1, weight: 24, valid: true }, { name: 'plane-outside', donor: 2, weight: 0, valid: true },
       { name: 'normal-outside', donor: 3, weight: 0, valid: true },
@@ -357,8 +365,8 @@ export async function validateImportedSpatial() {
     pairGuide(4, [0, 0, 0], [0, Math.sqrt(1 - .9501 ** 2), .9501]);
     pairGuide(5, [2.499, 0, 0]); pairGuide(6, [2.501, 0, 0]);
     pairGuide(7, [1, 0, 0], [0, 0, -1]); pairGuide(8, [1, 0, 0], [0, 0, -1]);
-    const pairMetadata = pairPixels.map((_, i) => i | 0x00100000); pairMetadata[7]! |= 0x00200000;
-    pairMetadata[9]! |= 0x00400000; pairMetadata[10] = 0x001fffff;
+    const pairMetadata = pairPixels.map((_, i) => i | 0x02500000); pairMetadata[7]! |= 0x00200000;
+    pairMetadata[9]! |= 0x04000000; pairMetadata[10] = 0x025fffff;
     const packedProbe = pack(pairPixels, pairMetadata), probeTriangles = buffer('Probe triangle identities', packedProbe.triangles), probeGuides = buffer('Probe guides', packedProbe.guides);
     const pg0 = device.createBindGroup({ layout: probePipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: probeUniform } }] });
     const pg1 = device.createBindGroup({ layout: probePipeline.getBindGroupLayout(1), entries: [{ binding: 1, resource: { buffer: probeTriangles } }, { binding: 6, resource: { buffer: probeGuides } }] });
@@ -416,9 +424,9 @@ export async function validateImportedSpatial() {
       incident: incidentQueries.map((q, i) => ({ ...q, actual: [...orthographic.slice((incidentStart + i) * 8, (incidentStart + i + 1) * 8)] })),
       parallelBypasses: true, nearGrazingBypasses: true });
 
-    // Execute both actual trace entry points on identical generated source,
-    // uniforms and depth. This establishes unchanged raw words while the optional
-    // variant writes exact first-primary guides, including reordered packed IDs.
+    // The new shared-primary baseline is compared exactly across presentation
+    // modes. Historical six-binding results are retained descriptively; they are
+    // not an equality gate for this explicitly changed numerical design.
     const ordinaryModule = device.createShaderModule({ label: 'Unchanged six-binding estimator', code: importedIndirectShader });
     const ordinaryTrace = await bounded(device.createComputePipelineAsync({ layout, compute: { module: ordinaryModule, entryPoint: 'traceImportedIndirect' } }), 'Ordinary trace comparison');
     const positions = [[-8, -8, 0], [8, -8, 0], [8, 8, 0], [-8, 8, 0]], indices = new Uint32Array([0, 1, 2, 0, 2, 3]);
@@ -436,26 +444,33 @@ export async function validateImportedSpatial() {
     const frameBytes = new ArrayBuffer(288), ff = new Float32Array(frameBytes), fw = new Uint32Array(frameBytes);
     ff.set(orthoInverse); ff.set(orthoProjection, 16); fw.set([8, 8, 0, 64], 36); fw.set([2, 4096, 1337, 1], 40);
     ff.set([3, 1, 1, 0], 52); ff.set([.5, 1, 2], 56); ff.set([1, 1, 1, 1], 60);
-    const traceFrame = buffer('Trace comparison constant environment', frameBytes, 0x40 | 0x08);
     const traceDepth = texture('Exact orthographic plane depth', 8, 8, 'depth32float', 0x04 | 0x10);
     const traceDirect = texture('Trace unused direct input', 8, 8, 'rgba16float', 0x04 | 0x02), traceOutput = texture('Trace unused composition target', 8, 8, 'rgba16float', 0x08);
-    const tg0 = device.createBindGroup({ layout: group0Layout, entries: [{ binding: 0, resource: { buffer: traceFrame } },
-      { binding: 1, resource: traceDepth.createView() }, { binding: 2, resource: traceDirect.createView() }, { binding: 3, resource: traceOutput.createView() }] });
-    const variants = [ordinaryTrace, trace].map((pipeline, i) => {
+    const variants = [ordinaryTrace, trace, trace].map((pipeline, i) => {
       const states = buffer(`Trace variant${i} raw state`, 64 * 32), counters = buffer(`Trace variant${i} raw counters`, 16), guides = buffer(`Trace variant${i} guide cache`, 16 + 64 * 32);
       const group = device.createBindGroup({ layout: group1Layout, entries: [nb, tb, vb, ib, states, counters, guides].map((b, binding) => ({ binding, resource: { buffer: b } })) });
-      return { pipeline, states, counters, guides, group };
+      const bytes = frameBytes.slice(0); new Float32Array(bytes)[67] = i === 2 ? 1 : 0;
+      const uniform = buffer(`Trace variant${i} presentation`, bytes, 0x40 | 0x08);
+      const group0 = device.createBindGroup({ layout: group0Layout, entries: [{ binding: 0, resource: { buffer: uniform } },
+        { binding: 1, resource: traceDepth.createView() }, { binding: 2, resource: traceDirect.createView() }, { binding: 3, resource: traceOutput.createView() }] });
+      return { pipeline, states, counters, guides, group, uniform, group0 };
     });
     let traceSweepNumber = 0;
     async function traceSweep(clearDepth: boolean) {
-      const each = 64 * 32 + 16 + 16 + 64 * 32, readback = buffer('Trace comparison exact word readback', each * 2, 0x01 | 0x08);
+      const each = 64 * 32 + 16 + 16 + 64 * 32, readback = buffer('Trace comparison exact word readback', each * 3, 0x01 | 0x08);
       try {
         const encoder = device.createCommandEncoder();
         if (clearDepth) {
           const pass = encoder.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: traceDepth.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: .5 } }); pass.end();
         }
         variants.forEach((variant, i) => {
-          const pass = encoder.beginComputePass(); pass.setPipeline(variant.pipeline); pass.setBindGroup(0, tg0); pass.setBindGroup(1, variant.group); pass.setBindGroup(2, group2); pass.dispatchWorkgroups(1); pass.end();
+          if (i > 0 && clearDepth) {
+            const primaryPass = encoder.beginComputePass(); primaryPass.setPipeline(preparePrimary); primaryPass.setBindGroup(0, variant.group0); primaryPass.setBindGroup(1, variant.group); primaryPass.setBindGroup(2, group2); primaryPass.dispatchWorkgroups(1); primaryPass.end();
+          }
+          const pass = encoder.beginComputePass(); pass.setPipeline(variant.pipeline); pass.setBindGroup(0, variant.group0); pass.setBindGroup(1, variant.group); pass.setBindGroup(2, group2); pass.dispatchWorkgroups(1); pass.end();
+          if (i > 0) {
+            const presentation = encoder.beginComputePass(); presentation.setPipeline(compose); presentation.setBindGroup(0, variant.group0); presentation.setBindGroup(1, variant.group); presentation.setBindGroup(2, group2); presentation.dispatchWorkgroups(1); presentation.end();
+          }
           encoder.copyBufferToBuffer(variant.states, 0, readback, i * each, 64 * 32);
           encoder.copyBufferToBuffer(variant.counters, 0, readback, i * each + 64 * 32, 16);
           encoder.copyBufferToBuffer(variant.guides, 0, readback, i * each + 64 * 32 + 16, 16 + 64 * 32);
@@ -463,13 +478,17 @@ export async function validateImportedSpatial() {
         device.queue.submit([encoder.finish()]); await bounded(readback.mapAsync(1), 'Actual ordinary/optional trace comparison');
         const data = readback.getMappedRange().slice(0); readback.unmap();
         const ordinary = new Uint32Array(data, 0, (64 * 32 + 16) / 4), optional = new Uint32Array(data, each, (64 * 32 + 16) / 4);
-        const guideBytes = data.slice(each + 64 * 32 + 16), guideView = new DataView(guideBytes);
+        const toggled = new Uint32Array(data, each * 2, (64 * 32 + 16) / 4);
+        const guideBytes = data.slice(each + 64 * 32 + 16, each * 2), guideView = new DataView(guideBytes);
         // Retain the actual words before parity or radiometric assertions. An
         // immutable failed report must contain the evidence needed to distinguish
         // material/fixture defects from harmless interpolation rounding.
         cases.push({ name: 'actual-trace-sweep-readback', sweep: ++traceSweepNumber,
           ordinaryStateAndCounterWords: [...ordinary], optionalStateAndCounterWords: [...optional],
-          optionalGuideWords: [...new Uint32Array(guideBytes)],
+          optionalGuideWords: [...new Uint32Array(guideBytes)], toggledStateAndCounterWords: [...toggled],
+          toggledPrimaryWords: [...new Uint32Array(data, each * 2 + 64 * 32 + 32, 64 * 8)],
+          legacyChangedRawCounterWords: ordinary.reduce((n, w, i) => n + Number(w !== optional[i]), 0),
+          legacyComparisonIsAcceptanceGate: false,
           decoded: Array.from({ length: 64 }, (_, i) => ({ pixel: [i % 8, Math.floor(i / 8)],
             sum: [0, 1, 2].map(c => float(optional[i * 8 + c]!)), samples: optional[i * 8 + 3],
             attempts: optional[i * 8 + 4], status: optional[i * 8 + 5],
@@ -479,7 +498,10 @@ export async function validateImportedSpatial() {
             footprint: guideView.getFloat32(16 + i * 32 + 28, true) })),
           expectedAnalyticRho: [.25, .5, .75], expectedAnalyticFirstSum: [.125, .5, 1.5],
           sourceSha256: await sha(sourceTriangles), frameWords: [...fw] });
-        require(ordinary.every((word, i) => word === optional[i]), 'Optional guide/integer storage changed raw estimator words/counters.');
+        require(optional.every((word, i) => word === toggled[i]), 'Denoise presentation changed shared-primary raw state/counters.');
+        const primaryWords = new Uint32Array(guideBytes, 16);
+        const toggledPrimary = new Uint32Array(data, each * 2 + 64 * 32 + 32, 64 * 8);
+        require(primaryWords.every((word, i) => word === toggledPrimary[i]), 'Denoise presentation changed cached primary records.');
         return { words: [...optional], guideBytes, sourceHash: await sha(sourceTriangles) };
       } finally { removeBuffer(readback); }
     }
@@ -490,7 +512,7 @@ export async function validateImportedSpatial() {
     // subtract/multiply/add operations (FMA contraction does not increase this
     // budget), with positive fixture weights and IEEE-f32 unit roundoff2^-24.
     // This bounds interpolation of the ideal constant; it does NOT relax actual
-    // cached-rho transport or ordinary/optional raw-word parity below.
+    // cached-rho transport or within-shared-primary raw-word parity below.
     const interpolationUnitRoundoff = 2 ** -24, interpolationRoundings = 8;
     const analyticRhoRelativeBound = interpolationRoundings * interpolationUnitRoundoff / (1 - interpolationRoundings * interpolationUnitRoundoff);
     let maxAnalyticRhoRelativeError = 0, nonDiagonalPackedIdentityChecks = 0;
@@ -507,7 +529,7 @@ export async function validateImportedSpatial() {
         maxAnalyticRhoRelativeError = Math.max(maxAnalyticRhoRelativeError, relativeError);
       });
       const identity = firstGuide.getUint32(16 + i * 32 + 12, true);
-      require((identity & 0xfff00000) === 0x00100000 && (identity & 0xfffff) < 2, 'Guide did not store valid packed identity/original orientation.');
+      require((identity & 0xfff00000) === 0x02500000 && (identity & 0xfffff) < 2, 'Guide did not store valid packed identity/original orientation.');
       const x = i % 8 - 3.5, y = 3.5 - Math.floor(i / 8);
       if (x !== y) {
         const expectedPacked = y < x ? 1 : 0;
@@ -519,15 +541,261 @@ export async function validateImportedSpatial() {
     }
     require(nonDiagonalPackedIdentityChecks === 56, 'Independent packed-ID witness did not cover every off-diagonal pixel.');
     // A cache sentinel proves later attempts do not silently recompute the guide.
-    device.queue.writeBuffer(variants[1]!.guides, 44, new Float32Array([2]));
+    for (const variant of variants.slice(1)) device.queue.writeBuffer(variant.guides, 44, new Float32Array([2]));
+    device.queue.writeBuffer(variants[2]!.uniform, 268, new Float32Array([0]));
     const secondTrace = await traceSweep(false), cappedTrace = await traceSweep(false);
     require(new DataView(secondTrace.guideBytes).getFloat32(44, true) === 2, 'Later trace attempt overwrote the first-primary guide.');
     require(secondTrace.words.every((word, i) => word === cappedTrace.words[i]), 'Capped trace changed raw estimator state/counters.');
-    cases.push({ name: 'actual-trace-guide-and-legacy-word-identity', pixels: 64, sweeps: 3, cap: 2, sourceSha256: firstTrace.sourceHash,
+    cases.push({ name: 'shared-primary-off-on-and-toggle-word-identity', pixels: 64, sweeps: 3, cap: 2, sourceSha256: firstTrace.sourceHash,
       firstCounters: firstTrace.words.slice(64 * 8), cappedCounters: cappedTrace.words.slice(64 * 8),
       cachedRhoTransportBitsExact: true, idealColorInterpolation: { unitRoundoff: interpolationUnitRoundoff,
         roundingOperations: interpolationRoundings, relativeBound: analyticRhoRelativeBound, maxRelativeError: maxAnalyticRhoRelativeError },
-      nonDiagonalPackedIdentityChecks, firstGuideOnly: true, rawStateAndCountersIdentical: true, tangentFootprint: 1 });
+      nonDiagonalPackedIdentityChecks, firstGuideOnly: true, rawStateAndCountersIdentical: true, primaryRecordsIdentical: true,
+      legacyComparisonIsAcceptanceGate: false, tangentFootprint: 1 });
+
+    // Rasterize generated triangles into depth, then independently solve the
+    // near/far pixel segment against the analytic plane. The reference uses a
+    // binary64 Gram solve and source data, never the production BVH hit helper.
+    const depthModule = device.createShaderModule({ code: `
+      @group(0) @binding(0) var<uniform> vp: mat4x4f;
+      @vertex fn depthVertex(@location(0) position: vec3f) -> @builtin(position) vec4f { return vp * vec4f(position, 1.0); }
+    ` });
+    const depthPipelines = await Promise.all([false, true].map(doubleSided => device.createRenderPipelineAsync({
+      layout: 'auto', vertex: { module: depthModule, entryPoint: 'depthVertex', buffers: [{ arrayStride: 64,
+        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
+      primitive: { topology: 'triangle-list', frontFace: 'ccw', cullMode: doubleSided ? 'none' : 'back' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    })));
+    const primaryTriangle: readonly [PrimaryVec3, PrimaryVec3, PrimaryVec3] = [[-8, 0, -8], [0, 0, 8], [8, 0, -8]];
+    const sourceColors: readonly PrimaryVec3[] = [[.2, .4, .9], [.8, .3, .1], [.4, .9, .2]];
+    const sourceUvs = [[.1, .1], [.85, .15], [.25, .9]] as const;
+    const texelBytes = new Uint8Array([128, 64, 192, 255, 224, 144, 96, 255, 80, 208, 160, 255, 176, 112, 240, 255]);
+    const texturedBase = texture('Primary independent sRGB2x2', 2, 2, 'rgba8unorm-srgb', 0x04 | 0x02);
+    const texturedMr = texture('Primary independent linear metal', 1, 1, 'rgba8unorm', 0x04 | 0x02);
+    device.queue.writeTexture({ texture: texturedBase }, texelBytes, { bytesPerRow: 8 }, [2, 2]);
+    device.queue.writeTexture({ texture: texturedMr }, new Uint8Array([0, 0, 128, 255]), {}, [1, 1]);
+    const materialGroup = device.createBindGroup({ layout: group2Layout, entries: [texturedBase.createView(), sampler,
+      texturedMr.createView(), sampler, black.createView(), sampler].map((resource, binding) => ({ binding, resource })) });
+    const orientationCode = importedIndirectSpatialShader + /* wgsl */ `
+      @group(3) @binding(0) var<storage, read_write> orientationOutput: array<vec4f>;
+      @compute @workgroup_size(64) fn queryPrimaryOrientation(@builtin(global_invocation_id) id: vec3u) {
+        if (id.x >= arrayLength(&indirectSpatial.records)) { return; }
+        let record = indirectSpatial.records[id.x];
+        if (!primaryRecordValid(record) || primaryRecordState(record.identity) != PRIMARY_READY) { return; }
+        let normal = spatialNormal(record); let point = spatialPoint(record);
+        let seed = indirectHash(id.x ^ indirectFrame.options.z); // Actual first-sample seed (attempt0).
+        orientationOutput[id.x * 2u] = vec4f(indirectCosineDirection(normal, seed, 1u), 1.0);
+        orientationOutput[id.x * 2u + 1u] = vec4f(staticTraceOffset(point, normal, staticTraceTriangles[record.identity & SPATIAL_ID_MASK]) - point, 1.0);
+      }
+    `;
+    const orientationLayout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: 4, buffer: { type: 'storage' } }] });
+    const orientationPipeline = await device.createComputePipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts: [group0Layout, group1Layout, group2Layout, orientationLayout] }),
+      compute: { module: device.createShaderModule({ code: orientationCode }), entryPoint: 'queryPrimaryOrientation' } });
+
+    const cameraAbove = (perspective = false) => referencePrimaryCamera({ eye: [0, 4, 0], target: [0, 0, 0], up: [0, 0, -1], near: 1, far: 8,
+      ...(perspective ? { verticalFov: Math.PI / 3 } : { halfHeight: 2 }) });
+    const cameraBelow = referencePrimaryCamera({ eye: [0, -4, 0], target: [0, 0, 0], up: [0, 0, 1], near: 1, far: 8, halfHeight: 2 });
+    type PrimaryFixtureOptions = { camera: ReferencePrimaryCamera; doubleSided: boolean; textured?: boolean; forcedDepth?: number;
+      expectedState?: 0 | 1 | 2 | 3 | 4; expectedIssued?: boolean; guideInvalid?: boolean; split?: boolean; maxVisits?: number;
+      records?: readonly (readonly number[])[]; secondaryExhaustion?: boolean; badInverse?: boolean; badColor?: boolean; batchProof?: boolean };
+    async function primaryFixture(name: string, options: PrimaryFixtureOptions) {
+      const width = 9, height = 9, count = width * height, owned: GPUBuffer[] = [], images: GPUTexture[] = [];
+      const own = (label: string, data: ArrayBuffer | number, usage?: number) => { const b = buffer(name + ' ' + label, data, usage); owned.push(b); return b; };
+      const close = (a: number, b: number, abs: number, rel: number, label: string) => require(Number.isFinite(a)
+        && Math.abs(a - b) <= abs + rel * Math.abs(b), `${name}: ${label} ${a} differs from analytic ${b}.`);
+      try {
+        // The optional far-away second leaf makes maxVisits1 a real traversal
+        // exhaustion. It also bounds a secondary origin inside the root AABB.
+        const positions: PrimaryVec3[] = [...primaryTriangle];
+        if (options.split) positions.push([100, 1, -8], [108, 1, 8], [116, 1, -8]);
+        const vertices = new Float32Array(positions.length * 16), triangleCount = positions.length / 3;
+        positions.forEach((position, i) => vertices.set([...position, 0, 1, 0, ...sourceUvs[i % 3]!, 1, 0, 0, 1,
+          ...(options.textured ? sourceColors[i % 3]! : [.25, .5, .75]), 1], i * 16));
+        if (options.badColor) vertices[12] = -(2 ** 30); // Finite source, negative interpolated rho must reject after query.
+        const sourceIndex = new Uint32Array(positions.map((_, i) => i));
+        const triangles = new ArrayBuffer(triangleCount * 64), tv = new DataView(triangles);
+        for (let i = 0; i < triangleCount; i++) {
+          for (let c = 0; c < 3; c++) positions[i * 3 + c]!.forEach((v, a) => tv.setFloat32(i * 64 + c * 16 + a * 4, v, true));
+          tv.setUint32(i * 64 + 28, i * 3, true); tv.setUint32(i * 64 + 44, i, true); tv.setFloat32(i * 64 + 52, 1, true);
+        }
+        const nodes = new ArrayBuffer((options.split ? 3 : 1) * 32), nv = new DataView(nodes);
+        function node(at: number, min: PrimaryVec3, max: PrimaryVec3, first: number, n: number) {
+          min.forEach((v, a) => nv.setFloat32(at * 32 + a * 4, v, true)); max.forEach((v, a) => nv.setFloat32(at * 32 + 16 + a * 4, v, true));
+          nv.setUint32(at * 32 + 12, first, true); nv.setUint32(at * 32 + 28, n, true);
+        }
+        if (options.split) { node(0, [-8, 0, -8], [116, 1, 8], 1, 0); node(1, [-8, 0, -8], [8, 0, 8], 0, 1); node(2, [100, 1, -8], [116, 1, 8], 1, 1); }
+        else node(0, [-8, 0, -8], [8, 0, 8], 0, 1);
+        const n = own('BVH', nodes), t = own('triangles', triangles), v = own('source vertices', vertices.buffer, 0x80 | 0x20 | 0x08 | 0x04), i = own('source indices', sourceIndex.buffer);
+        const bytes = new ArrayBuffer(288), f = new Float32Array(bytes), w = new Uint32Array(bytes);
+        f.set(options.camera.inverse); f.set(options.camera.projection, 16); w.set([width, height, 0, count], 36);
+        w.set([1, options.maxVisits ?? 4096, 1337, Number(options.doubleSided)], 40);
+        f.set([3, 1, 1, 0], 52); f.set([.5, 1, 2], 56); f.set(options.textured ? [.75, .5, 1, 1] : [1, 1, 1, 1], 60);
+        f[64] = options.textured ? .5 : 0; f[67] = 1;
+        if (options.badInverse) f[15] = 0; // Orthographic w is identically0; rejection must occur before issuing a query.
+        const u = own('uniform', bytes, 0x40 | 0x08), vp = own('raster matrix', new Float32Array(options.camera.projection).buffer, 0x40 | 0x08);
+        const raw = own('raw', count * 32), counters = own('counters', 16), primaryBytes = new Uint32Array(4 + count * 8);
+        if (options.records) options.records.forEach((record, pixel) => primaryBytes.set(record, 4 + pixel * 8));
+        const primary = own('primary', primaryBytes.buffer);
+        const depth = texture(name + ' actual raster depth', width, height, 'depth32float', 0x04 | 0x10 | 0x01); images.push(depth);
+        const direct = texture(name + ' direct', width, height, 'rgba16float', 0x04 | 0x02); images.push(direct);
+        const output = texture(name + ' output', width, height, 'rgba16float', 0x08 | 0x01); images.push(output);
+        device.queue.writeTexture({ texture: direct }, new Uint16Array(Array.from({ length: count }, () => [.125, .25, .5, 1].map(half)).flat()), { bytesPerRow: width * 8 }, [width, height]);
+        const groups = [device.createBindGroup({ layout: group0Layout, entries: [{ binding: 0, resource: { buffer: u } },
+          { binding: 1, resource: depth.createView() }, { binding: 2, resource: direct.createView() }, { binding: 3, resource: output.createView() }] }),
+        device.createBindGroup({ layout: group1Layout, entries: [n, t, v, i, raw, counters, primary].map((b, binding) => ({ binding, resource: { buffer: b } })) }),
+        options.textured ? materialGroup : group2];
+        const depthPipeline = depthPipelines[Number(options.doubleSided)]!;
+        const depthGroup = device.createBindGroup({ layout: depthPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: vp } }] });
+        function dispatch(encoder: GPUCommandEncoder, pipeline: GPUComputePipeline, size = count, composition = false) {
+          const pass = encoder.beginComputePass(); pass.setPipeline(pipeline); groups.forEach((g, index) => pass.setBindGroup(index, g));
+          pass.dispatchWorkgroups(composition ? Math.ceil(width / 8) : Math.ceil(size / 64), composition ? Math.ceil(height / 8) : 1); pass.end();
+        }
+        async function snapshot(encoder: GPUCommandEncoder, label: string, includeOutput = false) {
+          const stateBytes = count * 32, primarySize = 16 + stateBytes, depthSize = height * 256;
+          const rb = own(label, stateBytes + 16 + primarySize + depthSize * (includeOutput ? 2 : 1), 0x01 | 0x08);
+          encoder.copyBufferToBuffer(raw, 0, rb, 0, stateBytes); encoder.copyBufferToBuffer(counters, 0, rb, stateBytes, 16);
+          encoder.copyBufferToBuffer(primary, 0, rb, stateBytes + 16, primarySize);
+          encoder.copyTextureToBuffer({ texture: depth, aspect: 'depth-only' }, { buffer: rb, offset: stateBytes + 16 + primarySize, bytesPerRow: 256 }, [width, height]);
+          if (includeOutput) encoder.copyTextureToBuffer({ texture: output }, { buffer: rb, offset: stateBytes + 16 + primarySize + depthSize, bytesPerRow: 256 }, [width, height]);
+          device.queue.submit([encoder.finish()]); await bounded(rb.mapAsync(1), name + ' ' + label);
+          const result = rb.getMappedRange().slice(0); rb.unmap();
+          return { raw: [...new Uint32Array(result, 0, stateBytes / 4)], counters: [...new Uint32Array(result, stateBytes, 4)],
+            records: [...new Uint32Array(result, stateBytes + 32, stateBytes / 4)],
+            depth: Array.from({ length: count }, (_, pixel) => new DataView(result).getFloat32(stateBytes + 16 + primarySize + Math.floor(pixel / width) * 256 + pixel % width * 4, true)),
+            output: includeOutput ? Array.from({ length: count }, (_, pixel) => [0, 1, 2].map(c => unhalf(new DataView(result).getUint16(
+              stateBytes + 16 + primarySize + depthSize + Math.floor(pixel / width) * 256 + (pixel % width * 4 + c) * 2, true)))) : undefined };
+        }
+        let encoder = device.createCommandEncoder();
+        const raster = encoder.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: depth.createView(), depthClearValue: options.forcedDepth ?? 1,
+          depthLoadOp: 'clear', depthStoreOp: 'store' } });
+        if (options.forcedDepth === undefined) { raster.setPipeline(depthPipeline); raster.setBindGroup(0, depthGroup); raster.setVertexBuffer(0, v); raster.draw(3); }
+        raster.end();
+        if (options.batchProof) { w[39] = 64; device.queue.writeBuffer(u, 0, bytes); }
+        if (!options.records) dispatch(encoder, preparePrimary, options.batchProof ? 64 : count);
+        let prepared = await snapshot(encoder, 'prepared');
+        require(prepared.raw.every(word => word === 0) && prepared.counters.every(word => word === 0), `${name}: primary pass changed raw state/counters.`);
+        if (options.batchProof) {
+          require(prepared.records.slice(64 * 8).every(word => word === 0), `${name}: primary batch overwrote unadmitted tail.`);
+          const firstBatch = prepared.records.slice(0, 64 * 8); w[38] = 64; w[39] = count - 64; device.queue.writeBuffer(u, 0, bytes);
+          encoder = device.createCommandEncoder(); dispatch(encoder, preparePrimary, count - 64); prepared = await snapshot(encoder, 'incomplete-tail');
+          require(firstBatch.every((word, at) => word === prepared.records[at]), `${name}: preparing tail changed prior cache.`);
+          w[38] = 0; w[39] = count; device.queue.writeBuffer(u, 0, bytes);
+        }
+        // Preserve actual records before every numerical gate for failure diagnosis.
+        const recordCase = { name, primaryWords: prepared.records, rasterDepth: prepared.depth, beforeTraceRawWords: prepared.raw,
+          beforeTraceCounters: prepared.counters, frameWords: [...w], sourceSha256: await sha(vertices.buffer), sourceTriangleSha256: await sha(triangles),
+          reference: 'binary64 pixel-segment plane/Gram solve; actual uploaded f32 source; hardware sRGB decode bounded separately', checks: [] as unknown[] };
+        cases.push(recordCase);
+        let checked = 0, sourceTexels = new Set<number>(), ready = 0, backgrounds = 0;
+        for (let pixel = 0; pixel < count; pixel++) {
+          const words = prepared.records.slice(pixel * 8, (pixel + 1) * 8), record = decodePrimaryRecord(words, triangleCount);
+          if (options.records) continue;
+          require(record, `${name}: generated malformed primary at${pixel}.`);
+          if (record!.state === 1) ready++; if (record!.state === 2) backgrounds++;
+          if (options.expectedState !== undefined) {
+            require(record!.state === options.expectedState && record!.issued === options.expectedIssued,
+              `${name}: state/query${record!.state}/${record!.issued}, expected${options.expectedState}/${options.expectedIssued}.`);
+            continue;
+          }
+          const x = pixel % width, y = Math.floor(pixel / width), ray = options.camera.ray(x, y, width, height);
+          const hit = referencePrimaryHit(ray, primaryTriangle, options.doubleSided);
+          if (!hit || Math.min(...hit.weights) < .03) continue; // Interior only: no inherited edge-predicate accuracy claim.
+          require(record!.state === 1 && record!.issued && record!.triangle === 0 && record!.flipped === hit.flipped, `${name}: interior hit/orientation mismatch${pixel}.`);
+          if (options.guideInvalid) require(!record!.guide && words[7] === 0, `${name}: real grazing hit must remain READY with+0 invalid guide.`);
+          hit.point.forEach((value, c) => close(record!.point[c]!, value, primaryReferenceGates.pointAbsolute, primaryReferenceGates.pointRelative, 'point'));
+          const colors = [0, 1, 2].map(c => vec([...vertices.slice(c * 16 + 12, c * 16 + 15)]));
+          let base: PrimaryVec3 = [1, 1, 1];
+          if (options.textured) {
+            const uv = [0, 1].map(c => hit.weights.reduce((sum, weight, vertex) => sum + weight * vertices[vertex * 16 + 6 + c]!, 0));
+            if (uv.some(value => Math.abs(value - .5) < .025)) continue; // Exclude sampler decision boundary, not rho-error samples.
+            const texel = Math.min(1, Math.max(0, Math.floor(uv[0]! * 2))) + Math.min(1, Math.max(0, Math.floor(uv[1]! * 2))) * 2;
+            sourceTexels.add(texel); base = vec([0, 1, 2].map(c => referenceSrgb(texelBytes[texel * 4 + c]!)));
+          }
+          const expectedRho = referenceRho(base, options.textured ? [.75, .5, 1] : [1, 1, 1], colors, hit.weights, options.textured ? 128 / 255 : 0, options.textured ? .5 : 0)!;
+          record!.rho.forEach((value, c) => close(value, expectedRho[c]!, primaryReferenceGates.rhoAbsolute, primaryReferenceGates.rhoRelative, 'rho'));
+          recordCase.checks.push({ pixel, expectedPoint: hit.point, expectedWeights: hit.weights, expectedRho, actualRho: record!.rho, flipped: record!.flipped, guide: record!.guide }); checked++;
+        }
+        if (!options.records && options.expectedState === undefined) require(checked >= (options.guideInvalid ? 1 : 32), `${name}: independent primary witness became vacuous (${checked}).`);
+        if (options.textured) require(sourceTexels.size >= 2, `${name}: asymmetric UV witness reached fewer than two material texels.`);
+        if (!options.records && options.expectedState === undefined) {
+          const orientation = own('actual direction and origin offsets', count * 32), orientationRead = own('orientation readback', count * 32, 0x01 | 0x08);
+          const orientationGroup = device.createBindGroup({ layout: orientationLayout, entries: [{ binding: 0, resource: { buffer: orientation } }] });
+          const oe = device.createCommandEncoder(), op = oe.beginComputePass(); op.setPipeline(orientationPipeline);
+          groups.forEach((g, index) => op.setBindGroup(index, g)); op.setBindGroup(3, orientationGroup); op.dispatchWorkgroups(Math.ceil(count / 64)); op.end();
+          oe.copyBufferToBuffer(orientation, 0, orientationRead, 0, count * 32); device.queue.submit([oe.finish()]); await bounded(orientationRead.mapAsync(1), name + ' actual orientation');
+          const directions = new Float32Array(orientationRead.getMappedRange().slice(0)); orientationRead.unmap();
+          let hemisphereChecks = 0, blockerChecks = 0, minimumHemisphere = Infinity, minimumOffset = Infinity;
+          for (let pixel = 0; pixel < count; pixel++) {
+            const record = decodePrimaryRecord(prepared.records.slice(pixel * 8, pixel * 8 + 8), triangleCount);
+            if (!record || record.state !== 1) continue;
+            const direction = vec([...directions.slice(pixel * 8, pixel * 8 + 3)]), offset = vec([...directions.slice(pixel * 8 + 4, pixel * 8 + 7)]);
+            const sign = record.flipped ? -1 : 1, cosine = direction[1] * sign, displacement = offset[1] * sign;
+            require(directions[pixel * 8 + 3] === 1 && directions[pixel * 8 + 7] === 1 && Math.abs(Math.hypot(...direction) - 1) <= primaryReferenceGates.directionLength
+              && cosine >= -primaryReferenceGates.hemisphere && displacement > 0, `${name}: actual sampler hemisphere or geometric offset sign wrong.`);
+            minimumHemisphere = Math.min(minimumHemisphere, cosine); minimumOffset = Math.min(minimumOffset, displacement); hemisphereChecks++;
+            const origin = vec(record.point.map((value, c) => value + offset[c]!));
+            const far = vec(origin.map((value, c) => value + direction[c]! * 2 / cosine));
+            const wrong = vec(origin.map((value, c) => value - direction[c]! * 2 / cosine));
+            const blocker: readonly [PrimaryVec3, PrimaryVec3, PrimaryVec3] = [[-8192, sign, -8192], [0, sign, 8192], [8192, sign, -8192]];
+            require(referencePrimaryHit({ near: origin, far }, blocker, true) !== null
+              && referencePrimaryHit({ near: origin, far: wrong }, blocker, true) === null, `${name}: independent known-blocker direction negative control failed.`); blockerChecks++;
+          }
+          require(hemisphereChecks >= 1 && blockerChecks === hemisphereChecks, `${name}: orientation witness empty.`);
+          recordCase.checks.push({ actualFirstSampleDirectionWords: [...new Uint32Array(directions.buffer)], hemisphereChecks, blockerChecks,
+            minimumHemisphere, minimumOffset, negativeControl: 'Actual sampled direction reaches independently intersected parallel blocker; reversed direction misses.' });
+        }
+
+        encoder = device.createCommandEncoder(); dispatch(encoder, trace); dispatch(encoder, compose, count, true);
+        const consumed = await snapshot(encoder, 'consumed', true);
+        require(prepared.records.every((word, at) => word === consumed.records[at]), `${name}: trace/compose changed cached primary.`);
+        let attempted = 0, completed = 0, exhausted = 0, invalid = 0;
+        for (let pixel = 0; pixel < count; pixel++) {
+          const expect = primaryFirstConsumption(prepared.records.slice(pixel * 8, pixel * 8 + 8), triangleCount);
+          if (options.secondaryExhaustion && expect.transport) { expect.rawStatus = 2; expect.exhausted = 1; expect.transport = false; }
+          attempted += expect.attempted; exhausted += expect.exhausted; invalid += expect.invalid; completed += Number(expect.transport);
+          require(consumed.raw[pixel * 8 + 3] === Number(expect.transport) && consumed.raw[pixel * 8 + 4] === expect.attempted
+            && consumed.raw[pixel * 8 + 5] === expect.rawStatus, `${name}: primary/raw consumption disagreement at${pixel}: ${consumed.raw.slice(pixel * 8, pixel * 8 + 8)}.`);
+          if (!expect.transport) require(consumed.output![pixel]!.every((v, c) => v === [.125, .25, .5][c]), `${name}: unknown/background/corrupt primary contributed indirect color.`);
+        }
+        require(consumed.counters.every((value, c) => value === [attempted, completed, exhausted, invalid][c]), `${name}: first-consumption counters wrong.`);
+        encoder = device.createCommandEncoder(); if (!options.records) dispatch(encoder, preparePrimary); dispatch(encoder, trace); dispatch(encoder, compose, count, true);
+        const repeated = await snapshot(encoder, 'terminal-or-capped-repeat');
+        require(consumed.raw.every((word, at) => word === repeated.raw[at]) && consumed.counters.every((word, at) => word === repeated.counters[at])
+          && consumed.records.every((word, at) => word === repeated.records[at]), `${name}: repeated terminal/capped stages changed persistent state.`);
+        recordCase.checks.push({ ready, backgrounds, analyticInteriorChecks: checked, sampledMaterialTexels: [...sourceTexels], counters: consumed.counters,
+          rawWords: consumed.raw, primaryOnlyWriteProved: true, traceAndComposeReadOnlyRecords: true, repeatedConsumptionStable: true,
+          independentFirstBatch: options.batchProof ? { batch: 64, tail: count - 64 } : null });
+      } finally { owned.forEach(removeBuffer); images.forEach(removeTexture); }
+    }
+    await primaryFixture('primary-ortho-front-single-sided-asymmetric-material', { camera: cameraAbove(), doubleSided: false, textured: true, batchProof: true });
+    await primaryFixture('primary-perspective-front-double-sided-asymmetric-material', { camera: cameraAbove(true), doubleSided: true, textured: true });
+    await primaryFixture('primary-ortho-back-double-sided-flips-orientation', { camera: cameraBelow, doubleSided: true });
+    await primaryFixture('primary-single-sided-back-raster-culls-before-query', { camera: cameraBelow, doubleSided: false, expectedState: 2, expectedIssued: false });
+    await primaryFixture('primary-single-sided-back-covered-depth-rejected', { camera: cameraBelow, doubleSided: false, forcedDepth: 3 / 7, expectedState: 4, expectedIssued: true });
+    await primaryFixture('primary-before-near-plane-raster-background', { camera: referencePrimaryCamera({ eye: [0, 4, 0], target: [0, 0, 0], up: [0, 0, -1], near: 4.5, far: 8, halfHeight: 2 }),
+      doubleSided: true, expectedState: 2, expectedIssued: false });
+    await primaryFixture('primary-covered-depth-mismatch', { camera: cameraAbove(), doubleSided: true, forcedDepth: .2, expectedState: 4, expectedIssued: true });
+    await primaryFixture('primary-predivision-invalid-no-query', { camera: cameraAbove(), doubleSided: true, badInverse: true, expectedState: 4, expectedIssued: false });
+    await primaryFixture('primary-material-invalid-after-query', { camera: cameraAbove(), doubleSided: true, badColor: true, expectedState: 4, expectedIssued: true });
+    await primaryFixture('primary-real-traversal-exhaustion', { camera: cameraAbove(), doubleSided: true, split: true, maxVisits: 1, expectedState: 3, expectedIssued: true });
+    const grazingCamera = referencePrimaryCamera({ eye: [0, .2, 4], target: [0, 0, 0], up: [0, 1, 0], near: .1, far: 8, halfHeight: .01 });
+    await primaryFixture('primary-real-grazing-ready-invalid-guide', { camera: grazingCamera, doubleSided: true, guideInvalid: true });
+    const readyNoGuide = packPrimaryRecord({ state: 1, issued: true, rho: [.25, .5, .75], point: [0, 0, 0], triangle: 0, guide: false });
+    const backgroundRecord = packPrimaryRecord({ state: 2 });
+    await primaryFixture('primary-ready-secondary-real-exhaustion', { camera: cameraAbove(), doubleSided: true, split: true, maxVisits: 1, secondaryExhaustion: true,
+      records: Array.from({ length: 81 }, (_, pixel) => pixel === 40 ? readyNoGuide : backgroundRecord) });
+    const corruptionRecords: number[][] = [];
+    for (let state = 0; state < 8; state++) for (const queried of [false, true]) {
+      const record = state === 1 ? [...readyNoGuide] : new Array<number>(8).fill(0);
+      record[3] = (state << 22) | (queried ? primaryWire.query : 0); corruptionRecords.push(record);
+    }
+    for (let reserved = 26; reserved < 32; reserved++) { const record = [...readyNoGuide]; record[3] = (record[3]! | 2 ** reserved) >>> 0; corruptionRecords.push(record); }
+    const outsideId = [...readyNoGuide]; outsideId[3]! |= 1; corruptionRecords.push(outsideId);
+    const terminalPayload = [...backgroundRecord]; terminalPayload[4] = bits(1); corruptionRecords.push(terminalPayload);
+    const badFootprint = [...readyNoGuide]; badFootprint[7] = 0x80000000; corruptionRecords.push(badFootprint);
+    while (corruptionRecords.length < 81) corruptionRecords.push([...backgroundRecord]);
+    await primaryFixture('primary-state-query-reserved-corruption-consumption', { camera: cameraAbove(), doubleSided: true, records: corruptionRecords });
+
     await bounded(device.queue.onSubmittedWorkDone(), 'Spatial final fence');
     while (scopes > 0) { const error = await bounded(device.popErrorScope(), 'Spatial error scope'); scopes--; if (error) errors.push(error.message); }
     require(errors.length === 0, errors.join('; '));
@@ -535,9 +803,10 @@ export async function validateImportedSpatial() {
       device: adapter!.info.device, description: adapter!.info.description, isFallbackAdapter: adapter!.info.isFallbackAdapter },
       shaderSha256: await sha(importedIndirectSpatialShader), legacyShaderSha256: await sha(importedIndirectShader),
       guideBytes: '16+32*N', rawBytesPerPixel: 32, header: ['filteredPixels', 'fallbackChannels', 'hdrFaultChannels', 'guideBypassPixels'],
-      gates: spatialTruthGates, seeds: spatialTruthSeeds, noiseReports, cases, errors,
+      gates: spatialTruthGates, primaryGates: primaryReferenceGates, seeds: spatialTruthSeeds, noiseReports, cases, errors,
       limitations: ['Spatially biased; same-plane illumination discontinuities can blur.', 'No actual-house visual acceptance or performance evidence.',
-        'Generated numerical fixtures do not replace public scene lifecycle validation.'] };
+        'Generated numerical fixtures do not replace public scene lifecycle validation.',
+        'Shared-primary is a new optional numerical baseline; historical ordinary comparisons are descriptive, not equality gates.'] };
   } catch (error) {
     return { status: 'failed', performanceEvidence: false, failure: error instanceof Error ? error.stack : String(error), cases, errors,
       adapter: { vendor: adapter!.info.vendor, description: adapter!.info.description, isFallbackAdapter: adapter!.info.isFallbackAdapter } };

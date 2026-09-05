@@ -145,13 +145,15 @@ describe('independent geometric and wire references', () => {
     expect(tangentPlaneFootprint([0, 0, -.5], [0, 0, 0], rays)).toBeNull();
   });
   it('decodes packed BVH endpoints and orientation while rejecting every reserved bit', () => {
-    expect(decodeSpatialGuideMetadata(0x00100000)).toEqual({ triangle: 0, flipped: false });
-    expect(decodeSpatialGuideMetadata(0x003fffff)).toEqual({ triangle: 0xfffff, flipped: true });
+    expect(decodeSpatialGuideMetadata(0x02500000)).toEqual({ triangle: 0, flipped: false });
+    expect(decodeSpatialGuideMetadata(0x027fffff)).toEqual({ triangle: 0xfffff, flipped: true });
     expect(decodeSpatialGuideMetadata(0)).toBeNull(); expect(decodeSpatialGuideMetadata(0x00200000)).toBeNull();
-    for (let bit = 22; bit < 32; bit++) expect(decodeSpatialGuideMetadata((0x00100000 | (2 ** bit)) >>> 0)).toBeNull();
+    for (let bit = 26; bit < 32; bit++) expect(decodeSpatialGuideMetadata((0x02500000 | (2 ** bit)) >>> 0)).toBeNull();
+    for (const state of [0, 2, 3, 4, 5, 6, 7]) expect(decodeSpatialGuideMetadata((state << 22) | 0x02100000)).toBeNull();
+    expect(decodeSpatialGuideMetadata(0x00500000)).toBeNull(); // READY without issued query.
     expect(decodeSpatialGuideMetadata(0xffffffff)).toBeNull();
     // Reordering requires a new packed BVH index; source identity is not the key.
-    expect(decodeSpatialGuideMetadata(0x00100007)?.triangle).not.toBe(decodeSpatialGuideMetadata(0x00100009)?.triangle);
+    expect(decodeSpatialGuideMetadata(0x02500007)?.triangle).not.toBe(decodeSpatialGuideMetadata(0x02500009)?.triangle);
   });
 });
 

@@ -64,12 +64,13 @@ function harness() {
     borrowIndirectMaterial: vi.fn((_index: number) => { events.push('borrow'); return material; }),
     useIndirectBaseline: vi.fn(() => { events.push('baseline'); }), update: vi.fn((_controls?: ImportedControls) => false),
     submitted: vi.fn(), cancelFrame: vi.fn(), dispose: vi.fn() };
-  let progress: ImportedIndirectProgress = { revision: 1, submittedFrames: 1, batchCursor: 8, width: 8, height: 8,
+  let progress: ImportedIndirectProgress = { numericBaseline: 'legacy-inline-primary-v1', revision: 1, submittedFrames: 1, batchCursor: 8, width: 8, height: 8,
     pendingReset: false, pendingFrame: false, enabled: true, spatialDenoise: false, denoise: 'off', presentationRevision: 0, submittedFrameId: 1, normalMode: 'geometric', textureLod: 0,
     limits: { maxPixels: 64, pixelBatch: 8, maxSamples: 16, maxVisits: 100, seed: 7 } };
   const counters = (overrides: Partial<ImportedIndirectReadback> = {}): ImportedIndirectReadback => ({ ...progress,
     attempted: 8, completed: 5, exhausted: 2, invalid: 1, ...overrides });
-  const effect = { get progress() { return progress; }, validateSize: vi.fn((_width: number, _height: number) => undefined),
+  const effect = { get progress() { return progress; }, get hasSharedPrimary() { return progress.spatialDenoise; },
+    faultGpuEpoch: vi.fn(() => { progress = { ...progress, pendingReset: true, primary: { generation: (progress.primary?.generation ?? 0) + 1, state: 'faulted', queuedPrimaryPixels: 0, queuedPrimaryDispatches: 0, actualPrimaryQueries: null } }; }), validateSize: vi.fn((_width: number, _height: number) => undefined),
     readProgress: vi.fn(async () => counters()), updateLighting: vi.fn(),
     validateDenoise: vi.fn((mode: unknown) => {
       if (mode !== 'off' && mode !== 'spatial') throw new StrataError('INVALID_OPTIONS', 'Invalid denoise mode');
@@ -175,6 +176,22 @@ describe('imported progressive GI CPU orchestration', () => {
     await expect(h.create({ signal: abort.signal })).rejects.toMatchObject({ code: 'SCENE_LOAD_ABORTED' });
     expect(h.geometry.dispose).toHaveBeenCalledOnce(); expect(h.effect.dispose).toHaveBeenCalledTimes(stage === 'raster' ? 1 : 0);
     expect(h.raster.dispose).toHaveBeenCalledTimes(stage === 'raster' ? 1 : 0); expect(h.cpu.dispose).not.toHaveBeenCalled();
+  });
+
+  it('retires already-owned common geometry when additional optional source admission fails before indirect allocation', async () => {
+    const h = harness(); h.prepared.vertices[6] = 2 ** 31;
+    // Ownership simulation at the common-geometry boundary; no GPU allocation claim.
+    const owned = new Set(['vertex buffer','base texture','material buffer']);
+    h.geometry.dispose.mockImplementation(() => { owned.clear(); });
+    boundary.effect.mockImplementation(async (_device,input) => {
+      const { validateImportedPrimarySource } = await import('../../packages/core/src/imported/imported-indirect-primary-domain.js');
+      await validateImportedPrimarySource(input.source,input.signal);
+      throw Error('Out-of-domain source unexpectedly admitted');
+    });
+    await expect(h.create({ indirect: { spatialDenoise: true } })).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
+    expect(h.geometry.dispose).toHaveBeenCalledOnce(); expect(owned.size).toBe(0);
+    expect(h.effect.dispose).not.toHaveBeenCalled(); expect(boundary.raster).not.toHaveBeenCalled();
+    expect(h.rawDevice.createBuffer).not.toHaveBeenCalled(); expect(h.rawDevice.createComputePipelineAsync).not.toHaveBeenCalled();
   });
 
   it('keeps one direct baseline and disables temporal rendering in both GI comparison states', async () => {
@@ -341,4 +358,33 @@ describe('imported progressive GI CPU orchestration', () => {
     expect(renderer.importedTelemetry.indirect!.sampleCounters).toMatchObject({ submittedFrameId: 2, denoise: 'off', spatialDiagnostics: { hdrFaultChannels: 0 } });
     expect(h.effect.readProgress).toHaveBeenCalledTimes(2); renderer.dispose();
   });
+
+  it('faults the shared epoch before late counters resolve and never republishes them', async () => {
+    const h = harness(); h.setProgress({ numericBaseline: 'shared-primary-v1', spatialDenoise: true,
+      primary: { generation: 1, state: 'queued-complete', queuedPrimaryPixels: 64, queuedPrimaryDispatches: 1, actualPrimaryQueries: null } });
+    const renderer = await h.create(), wait = deferred<ImportedIndirectReadback>(), old = h.counters();
+    h.effect.readProgress.mockReturnValueOnce(wait.promise);
+    const first = renderer.readIndirectProgress(), second = renderer.readIndirectProgress();
+    const fault = new StrataError('GPU_VALIDATION_FAILED', 'Delayed command rejection'); renderer.faultIndirectEpoch(fault);
+    expect(h.effect.faultGpuEpoch).toHaveBeenCalledWith(fault);
+    expect(renderer.importedTelemetry.indirect!.progress.primary?.state).toBe('faulted');
+    expect(renderer.importedTelemetry.indirect!.sampleCounters).toBeNull();
+    // Already-returned GPU counters are discarded. Waiting callers fail closed.
+    const rejected = expect(Promise.all([first,second])).rejects.toBe(fault); wait.resolve(old); await rejected;
+    await expect(renderer.readIndirectProgress()).rejects.toBe(fault);
+    expect(renderer.importedTelemetry.indirect!.sampleCounters).toBeNull(); renderer.dispose();
+  });
+
+  it('suppresses a rejected old-generation map while a current caller refreshes the reset generation', async () => {
+    const h = harness(); h.setProgress({ numericBaseline: 'shared-primary-v1', spatialDenoise: true,
+      primary: { generation: 1, state: 'queued-partial', queuedPrimaryPixels: 8, queuedPrimaryDispatches: 1, actualPrimaryQueries: null } });
+    const renderer = await h.create(), wait = deferred<ImportedIndirectReadback>(); h.effect.readProgress.mockReturnValueOnce(wait.promise);
+    const oldRead = renderer.readIndirectProgress();
+    h.setProgress({ revision: 2, submittedFrameId: 2, primary: { generation: 2, state: 'queued-partial', queuedPrimaryPixels: 8, queuedPrimaryDispatches: 1, actualPrimaryQueries: null } });
+    const currentRead = renderer.readIndirectProgress(); wait.reject(new StrataError('RENDER_FAILED', 'Retired primary generation'));
+    await expect(Promise.all([oldRead,currentRead])).resolves.toEqual([undefined,undefined]);
+    expect(h.effect.readProgress).toHaveBeenCalledTimes(2);
+    expect(renderer.importedTelemetry.indirect!.sampleCounters).toMatchObject({ revision: 2, primary: { generation: 2 } }); renderer.dispose();
+  });
+
 });

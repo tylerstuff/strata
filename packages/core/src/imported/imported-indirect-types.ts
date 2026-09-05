@@ -2,8 +2,9 @@ import type { ImportedVec3, ImportedVec4 } from './imported-types.js';
 
 /**
  * Internal static geometry. The caller MUST run validateImportedStaticBvh before
- * creating the effect; topology, attributes and triangle mappings are not rescanned
- * here. Arrays remain caller-owned; do not mutate during create().
+ * creating the effect; topology and triangle mappings are not rescanned here.
+ * The optional shared-primary baseline additionally scans consumed UV/COLOR
+ * attributes for its numerical domain. Arrays remain caller-owned; do not mutate during create().
  */
 export interface ImportedIndirectSource {
   readonly nodes: Uint8Array<ArrayBuffer>;
@@ -65,6 +66,18 @@ export interface ImportedIndirectCreateOptions {
   readonly signal?: AbortSignal;
 }
 export interface ImportedIndirectProgress {
+  /** Optional shared-primary transport is a new numerical baseline, not legacy bit equivalence. */
+  readonly numericBaseline: 'legacy-inline-primary-v1' | 'shared-primary-v1';
+  readonly primary?: {
+    /** Invalidated by resets/cancellation/faults independently of submitted accumulation revision. */
+    readonly generation: number;
+    readonly state: 'empty' | 'queued-partial' | 'queued-complete' | 'faulted' | 'disposed';
+    /** Queue-ordered preparation, never a GPU validation receipt. Independent of batchCursor. */
+    readonly queuedPrimaryPixels: number;
+    readonly queuedPrimaryDispatches: number;
+    /** Scheduled pixels include background and pre-query rejection; actual queries need record readback. */
+    readonly actualPrimaryQueries: null;
+  };
   /** Changes only when a reset frame is submitted. */
   readonly revision: number;
   readonly submittedFrames: number;

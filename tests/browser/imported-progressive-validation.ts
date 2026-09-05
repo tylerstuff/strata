@@ -296,7 +296,16 @@ export async function validateImportedProgressive() {
     const spatialLimits = { ...limits, maxPixels: 1048576, maxSamples: 8, spatialDenoise: true };
     const spatialReceipt = await engine.setScene({ renderer: 'imported', asset, indirect: spatialLimits });
     await stage('spatial');
-    for (let i = 0; i < spatialLimits.maxSamples; i++) await frame(engine, canvas, onOptions);
+    for (let i = 0; i < spatialLimits.maxSamples; i++) {
+      const submitted = await frame(engine, canvas, onOptions);
+      const progress = submitted.telemetry.imported!.indirect!.progress;
+      require(progress.numericBaseline === 'shared-primary-v1' && progress.primary?.state === 'queued-complete'
+        && progress.primary.queuedPrimaryPixels === 256 && progress.primary.queuedPrimaryDispatches === 1
+        && progress.primary.actualPrimaryQueries === null && progress.batchCursor === 0,
+        'One-batch shared-primary progress must distinguish queued completion from an initial zero cursor, without inventing measured queries.');
+      require(submitted.metrics.dispatchCalls === (i === 0 ? 3 : 2),
+        'Only the first shared-primary sweep may add a primary preparation dispatch.');
+    }
     const spatialOff = await frame(engine, canvas, onOptions, 'spatial-capability-off'); captures.push(spatialOff.capture!);
     const spatialBefore = counters(engine, 16 * 16 * spatialLimits.maxSamples);
     const spatialAllocations = [engine.getTelemetry().allocatedGpuBufferBytes, engine.getTelemetry().allocatedGpuTextureBytes];
@@ -322,7 +331,8 @@ export async function validateImportedProgressive() {
     captures.push(offAgain.capture!); const spatialAfter = counters(engine, 2048);
     require(same(offAgain.capture!.pixels, spatialOff.capture!.pixels), 'Disabling reconstruction must restore the exact capped raw presentation.');
     require(spatialAfter.revision === spatialBefore.revision && spatialAfter.attempted === spatialBefore.attempted
-      && spatialAfter.completed === spatialBefore.completed && spatialAfter.presentationRevision === spatialBefore.presentationRevision + 2,
+      && spatialAfter.completed === spatialBefore.completed && spatialAfter.presentationRevision === spatialBefore.presentationRevision + 2
+      && same(spatialAfter.primary, spatialBefore.primary) && spatialAfter.numericBaseline === 'shared-primary-v1',
       'Mode switches must preserve raw sample counts and accumulation revision.');
     require(same([engine.getTelemetry().allocatedGpuBufferBytes, engine.getTelemetry().allocatedGpuTextureBytes], spatialAllocations)
       && workerEvents.filter(value => value.type === 'build-static-bvh').length === buildsBeforeToggle,

@@ -1,3 +1,5 @@
+import { primaryCompositionConsistent } from './imported-primary-reference.js';
+
 /** Binary64, test-only specification of the frozen spatial reconstruction contract.
  * No runtime/shader imports. Analytic plane intersections and known linear fields
  * provide independent truth; this is not a model of f32 instruction rounding.
@@ -19,6 +21,10 @@ export interface ReferenceSpatialPixel {
   readonly status: number;
   readonly direct: SpatialVector;
   readonly guide: ReferenceSpatialGuide;
+  /** Optional exact shared-primary record for malformed/state fixtures. Ordinary
+   * radiometric fixtures describe an implicitly valid READY record instead. */
+  readonly primaryRecord?: readonly number[];
+  readonly primaryTriangleCount?: number;
 }
 export interface ReferenceSpatialResult {
   readonly indirect: SpatialVector;
@@ -94,6 +100,9 @@ export function referenceSpatialPixel(pixels: readonly ReferenceSpatialPixel[], 
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || pixels.length !== width * height
     || !Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x >= width || y >= height) throw new Error('Invalid reference grid.');
   const center = pixels[y * width + x]!, direct = center.direct;
+  if (center.primaryRecord && !primaryCompositionConsistent(center.primaryRecord, center.primaryTriangleCount ?? pixels.length, center.status, center.samples)) {
+    return { indirect: [0, 0, 0], composed: [...direct], fallbackChannels: 0, hdrFaultChannels: 0, filtered: false, guideBypass: false };
+  }
   if (!eligible(center)) return { indirect: [0, 0, 0], composed: [...direct], fallbackChannels: 0, hdrFaultChannels: 0, filtered: false, guideBypass: false };
   const rawValues = [0, 1, 2].map(c => rawChannel(center, c));
   const hdrFaultChannels = rawValues.filter((raw, c) => raw === null || !Number.isFinite(direct[c]!) || direct[c]! < 0
@@ -119,6 +128,7 @@ export function referenceSpatialPixel(pixels: readonly ReferenceSpatialPixel[], 
       if (qx < 0 || qy < 0 || qx >= width || qy >= height) continue;
       const donor = pixels[qy * width + qx]!;
       if (!eligible(donor)) continue;
+      if (donor.primaryRecord && !primaryCompositionConsistent(donor.primaryRecord, donor.primaryTriangleCount ?? pixels.length, donor.status, donor.samples)) continue;
       const geometryWeight = spatialGuideWeight(center.guide, donor.guide, Math.hypot(dx, dy));
       if (geometryWeight === 0) continue;
       const donorRho = donor.guide.rho[c]!;
@@ -194,7 +204,8 @@ export function spatialTruthMetrics(fixture: SpatialTruthFixture): {
 
 /** Frozen wire flags, checked independently of the production shader. */
 export function decodeSpatialGuideMetadata(word: number): { triangle: number; flipped: boolean } | null {
-  if (!Number.isInteger(word) || word < 0 || word > 0xffffffff || (word & 0xffc00000) !== 0 || (word & 0x00100000) === 0) return null;
+  if (!Number.isInteger(word) || word < 0 || word > 0xffffffff || (word & 0xfc000000) !== 0
+    || ((word >>> 22) & 7) !== 1 || (word & 0x02000000) === 0 || (word & 0x00100000) === 0) return null;
   return { triangle: word & 0x000fffff, flipped: (word & 0x00200000) !== 0 };
 }
 /** CPU oracles should evaluate the exact values sent to GPU, not an unrounded

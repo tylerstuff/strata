@@ -1,10 +1,11 @@
 import { importedIndirectShader } from './imported-indirect-shader.js';
+import { importedIndirectPrimaryShader } from './imported-indirect-primary-shader.js';
 
-/** Optional spatial reconstruction. Does not change the raw estimator or its ABI. */
+/** Shared-primary optional numerical baseline; the ordinary shader is unchanged. */
 export const importedIndirectSpatialHelpers = /* wgsl */ `
 struct IndirectSpatialGuide {
   rho: vec3u, identity: u32, // Exact f32 bits; classify zero/tiny before reinterpretation.
-  point: vec3f, footprint: f32,
+  point: vec3u, footprint: u32, // Stored f32 bits, shared by both consumers.
 };
 struct IndirectSpatialGuides {
   filteredPixels: atomic<u32>, fallbackChannels: atomic<u32>,
@@ -15,7 +16,7 @@ struct IndirectSpatialGuides {
 const SPATIAL_ID_MASK = 0x000fffffu;
 const SPATIAL_VALID = 0x00100000u;
 const SPATIAL_FLIPPED = 0x00200000u;
-const SPATIAL_RESERVED = 0xffc00000u;
+const SPATIAL_RESERVED = 0xfc000000u;
 const SPATIAL_HDR_MAX = 65472.0;
 const SPATIAL_MIN_RHO = 0.0000152587890625; // 2^-16; no denominator clamp.
 const SPATIAL_MIN_NORMAL = 1.1754943508222875e-38; // 2^-126.
@@ -53,17 +54,15 @@ fn spatialTriangleSafe(triangle: StaticTraceTriangle) -> bool {
   return normSquared >= 0.99 && normSquared <= 1.01;
 }
 fn spatialIdentityValid(identity: u32) -> bool {
-  return (identity & SPATIAL_RESERVED) == 0u && (identity & SPATIAL_VALID) != 0u;
+  return (identity & SPATIAL_RESERVED) == 0u && (identity & SPATIAL_VALID) != 0u
+    && primaryRecordState(identity) == PRIMARY_READY && (identity & PRIMARY_QUERY_ISSUED) != 0u;
 }
+fn spatialPoint(guide: IndirectSpatialGuide) -> vec3f { return bitcast<vec3f>(guide.point); }
+fn spatialFootprint(guide: IndirectSpatialGuide) -> f32 { return bitcast<f32>(guide.footprint); }
 fn spatialGuideValid(guide: IndirectSpatialGuide) -> bool {
-  if (!spatialIdentityValid(guide.identity)
-    || (guide.identity & SPATIAL_ID_MASK) >= arrayLength(&staticTraceTriangles)) { return false; }
-  if (!spatialBounded3(guide.point, 1048576.0) || !spatialNormalOrZero(bitcast<u32>(guide.footprint))
-    || guide.footprint < 9.094947017729282e-13 || guide.footprint > 1048576.0) { return false; }
-  for (var channel = 0u; channel < 3u; channel++) {
-    let word = guide.rho[channel]; let magnitude = word & 0x7fffffffu;
-    if (magnitude != 0u && ((word & 0x80000000u) != 0u || magnitude > bitcast<u32>(65504.0))) { return false; }
-  }
+  if (!spatialIdentityValid(guide.identity) || !primaryReadyDataValid(guide)) { return false; }
+  if (!spatialBounded3(spatialPoint(guide), 1048576.0) || !spatialNormalOrZero(guide.footprint)
+    || spatialFootprint(guide) < 9.094947017729282e-13 || spatialFootprint(guide) > 1048576.0) { return false; }
   return spatialTriangleSafe(staticTraceTriangles[guide.identity & SPATIAL_ID_MASK]);
 }
 fn spatialNormal(guide: IndirectSpatialGuide) -> vec3f {
@@ -75,6 +74,8 @@ fn spatialNormal(guide: IndirectSpatialGuide) -> vec3f {
 // <=2^24, |w|>=2^-20 and dehomogenized coordinates <=2^20 bound all new
 // products before evaluation. Outside this numerical domain, use raw GI.
 fn spatialTangentPoint(pixel: vec2f, point: vec3f, normal: vec3f) -> vec4f {
+  if (!spatialMatrixBounded(indirectFrame.inverseViewProjection) || !spatialBounded3(point, 1048576.0)
+    || !spatialBounded3(normal, 1.01)) { return vec4f(0.0); }
   let size = vec2f(indirectFrame.sizeBudget.xy);
   if (any(size < vec2f(1.0)) || any(size > vec2f(65536.0))
     || any(pixel < vec2f(0.0)) || any(pixel >= size)) { return vec4f(0.0); }
@@ -107,34 +108,32 @@ fn spatialTangentPoint(pixel: vec2f, point: vec3f, normal: vec3f) -> vec4f {
   if (!spatialBounded3(result, 1048576.0)) { return vec4f(0.0); }
   return vec4f(result, 1.0);
 }
-fn spatialWriteGuide(pixelIndex: u32, pixel: vec2i, primary: StaticTraceHit,
-    point: vec3f, rho: vec3f, normal: vec3f, direction: vec3f) {
-  // The record is zeroed on reset. Failure here never changes tracing status.
-  indirectSpatial.records[pixelIndex].identity = 0u;
-  if (primary.triangle > SPATIAL_ID_MASK || primary.triangle >= arrayLength(&staticTraceTriangles)
-    || !spatialBounded3(point, 1048576.0) || !spatialBounded3(normal, 1.01)
-    || !spatialTriangleSafe(staticTraceTriangles[primary.triangle])
+fn spatialQualifyGuide(record: IndirectSpatialGuide, pixel: vec2i) -> IndirectSpatialGuide {
+  // READY survives all guide-only failures, with exact rho/point and zero footprint.
+  if (!primaryReadyDataValid(record)) { return record; }
+  let point = spatialPoint(record); let normal = spatialNormal(record);
+  if (!spatialBounded3(point, 1048576.0) || !spatialBounded3(normal, 1.01)
+    || !spatialTriangleSafe(staticTraceTriangles[record.identity & SPATIAL_ID_MASK])
     || !spatialMatrixBounded(indirectFrame.inverseViewProjection)
-    || !spatialMatrixBounded(indirectFrame.viewProjection)) { return; }
+    || !spatialMatrixBounded(indirectFrame.viewProjection)) { return record; }
   let size = indirectFrame.sizeBudget.xy;
-  if (size.x < 2u || size.y < 2u || size.x > 65536u || size.y > 65536u) { return; }
+  if (size.x < 2u || size.y < 2u || size.x > 65536u || size.y > 65536u) { return record; }
   let projected = indirectFrame.viewProjection * vec4f(point, 1.0);
   if (!spatialBounded4(projected, 4398046511104.0) || projected.w < 0.00000095367431640625
     || abs(projected.x) > projected.w || abs(projected.y) > projected.w
-    || projected.z < 0.0 || projected.z > projected.w) { return; }
+    || projected.z < 0.0 || projected.z > projected.w) { return record; }
   let center = spatialTangentPoint(vec2f(pixel), point, normal);
   let xPixel = pixel + vec2i(select(1, -1, pixel.x + 1 >= i32(size.x)), 0);
   let yPixel = pixel + vec2i(0, select(1, -1, pixel.y + 1 >= i32(size.y)));
   let xPoint = spatialTangentPoint(vec2f(xPixel), point, normal);
   let yPoint = spatialTangentPoint(vec2f(yPixel), point, normal);
-  if (center.w == 0.0 || xPoint.w == 0.0 || yPoint.w == 0.0) { return; }
+  if (center.w == 0.0 || xPoint.w == 0.0 || yPoint.w == 0.0) { return record; }
   let dx = xPoint.xyz - center.xyz; let dy = yPoint.xyz - center.xyz;
   let footprintSquared = max(dot(dx, dx), dot(dy, dy));
-  if (footprintSquared < 8.271806125530277e-25 || footprintSquared > 1099511627776.0) { return; }
-  var identity = primary.triangle | SPATIAL_VALID;
-  if (dot(staticTraceTriangles[primary.triangle].normal, direction) > 0.0) { identity |= SPATIAL_FLIPPED; }
-  let guide = IndirectSpatialGuide(bitcast<vec3u>(rho), identity, point, sqrt(footprintSquared));
-  if (spatialGuideValid(guide)) { indirectSpatial.records[pixelIndex] = guide; }
+  if (footprintSquared < 8.271806125530277e-25 || footprintSquared > 1099511627776.0) { return record; }
+  let guide = IndirectSpatialGuide(record.rho, record.identity | SPATIAL_VALID, record.point, bitcast<u32>(sqrt(footprintSquared)));
+  if (spatialGuideValid(guide)) { return guide; }
+  return record;
 }
 
 struct SpatialMean { value: f32, valid: bool, positive: bool, }
@@ -198,12 +197,13 @@ fn spatialPairWeight(center: IndirectSpatialGuide, donor: IndirectSpatialGuide, 
   let na = spatialNormal(center); let nb = spatialNormal(donor);
   let alignment = clamp(dot(na, nb), 0.0, 1.0);
   if (alignment < 0.95) { return 0.0; }
-  let delta = donor.point - center.point;
-  let allowance = 0.00000095367431640625 * (spatialMaxAbs(center.point) + spatialMaxAbs(donor.point)
+  let centerPoint = spatialPoint(center); let donorPoint = spatialPoint(donor);
+  let delta = donorPoint - centerPoint;
+  let allowance = 0.00000095367431640625 * (spatialMaxAbs(centerPoint) + spatialMaxAbs(donorPoint)
     + spatialExtent(a) + spatialExtent(b));
-  let tolerance = 0.05 * min(center.footprint, donor.footprint) + allowance;
+  let tolerance = 0.05 * min(spatialFootprint(center), spatialFootprint(donor)) + allowance;
   if (abs(dot(na, delta)) > tolerance || abs(dot(nb, delta)) > tolerance) { return 0.0; }
-  let separation = (length(vec2f(offset)) + 1.5) * max(center.footprint, donor.footprint);
+  let separation = (length(vec2f(offset)) + 1.5) * max(spatialFootprint(center), spatialFootprint(donor));
   if (dot(delta, delta) > separation * separation) { return 0.0; }
   var normalWeight = alignment * alignment;
   normalWeight *= normalWeight; normalWeight *= normalWeight;
@@ -220,8 +220,13 @@ const spatialCompose = /* wgsl */ `
   let pixel = vec2i(id.xy); let pixelIndex = id.y * size.x + id.x;
   let direct = textureLoad(indirectDirect, pixel, 0);
   let state = indirectStates[pixelIndex];
+  let primary = indirectSpatial.records[pixelIndex];
+  let recordValid = primaryRecordValid(primary);
+  let ready = recordValid && primaryRecordState(primary.identity) == PRIMARY_READY;
+  let inconsistent = !recordValid || (state.samples > 0u && !ready)
+    || (state.status == 4u && primaryRecordState(primary.identity) != PRIMARY_BACKGROUND);
   var color = direct.rgb; var indirect = vec3f(0.0); var fault = false;
-  if (state.status == 0u && state.samples > 0u) {
+  if (!inconsistent && ready && state.status == 0u && state.samples > 0u) {
     // Raw composition is proved before inspecting guides or the display toggle.
     for (var channel = 0u; channel < 3u; channel++) {
       let raw = spatialRawColor(state.sum[channel], state.samples, bitcast<u32>(direct[channel]));
@@ -229,7 +234,7 @@ const spatialCompose = /* wgsl */ `
       else { color[channel] = raw.color; indirect[channel] = raw.mean; }
     }
     if (!fault && indirectFrame.materialSettings.w == 1.0) {
-      let center = indirectSpatial.records[pixelIndex];
+      let center = primary;
       if (!spatialGuideValid(center)) { atomicAdd(&indirectSpatial.guideBypassPixels, 1u); }
       else {
         var activeChannels = vec3<bool>(false); var fallback = vec3<bool>(false);
@@ -282,26 +287,59 @@ const spatialCompose = /* wgsl */ `
     if (state.status == 0u) { color = vec3f(0.0, min(f32(state.samples) / f32(indirectFrame.options.x), 1.0), 0.0); }
     if (state.status == 2u) { color = vec3f(1.0, 0.0, 1.0); }
     if (state.status == 3u) { color = vec3f(1.0, 0.25, 0.0); }
+    if (inconsistent) { color = vec3f(1.0, 0.25, 0.0); }
   }
   if (fault) { color = vec3f(1.0, 0.0, 1.0); }
   textureStore(indirectOutput, pixel, vec4f(color, direct.a));
 }
 `;
 
-/** Derive the opt-in variant without changing even one byte of the legacy WGSL. */
+const sharedTraceHead = /* wgsl */ `
+@compute @workgroup_size(64) fn traceImportedIndirect(@builtin(global_invocation_id) id: vec3u) {
+  let pixels = primaryPixelCount();
+  if (pixels == 0u || id.x >= indirectFrame.sizeBudget.w || arrayLength(&indirectStates) < pixels) { return; }
+  let pixelIndex = indirectFrame.sizeBudget.z + id.x;
+  let state = indirectStates[pixelIndex];
+  if (state.status != 0u || state.samples >= indirectFrame.options.x) { return; }
+  let record = indirectSpatial.records[pixelIndex];
+  let recordValid = primaryRecordValid(record);
+  let primaryState = primaryRecordState(record.identity);
+  // Only this stage writes raw state/counters. Background never starts an attempt.
+  if (recordValid && primaryState == PRIMARY_BACKGROUND && state.samples == 0u && state.attempts == 0u) {
+    indirectStates[pixelIndex].status = 4u; return;
+  }
+  indirectStates[pixelIndex].attempts += 1u;
+  atomicAdd(&indirectDiagnostics.attempted, 1u);
+  if (!recordValid || primaryState == PRIMARY_UNINITIALIZED
+    || (primaryState != PRIMARY_READY && (state.samples != 0u || state.attempts != 0u))) {
+    indirectUnknown(pixelIndex, 3u); return;
+  }
+  if (primaryState == PRIMARY_EXHAUSTED) { indirectUnknown(pixelIndex, 2u); return; }
+  if (primaryState != PRIMARY_READY) { indirectUnknown(pixelIndex, 3u); return; }
+  // These exact stored words are also reconstruction's authoritative inputs.
+  let rho = bitcast<vec3f>(record.rho);
+  let point = spatialPoint(record);
+  let normal = spatialNormal(record);
+  let primaryTriangle = record.identity & SPATIAL_ID_MASK;
+`;
+
+/** Assemble a separately named optional baseline; leave the ordinary module intact. */
 export function withImportedIndirectSpatial(base: string): string {
-  const insertion = '  let normal = indirectNormal(primary, primaryDirection);';
+  const traceEntry = '@compute @workgroup_size(64) fn traceImportedIndirect';
+  const transport = '  let seed = indirectHash(pixelIndex ^ indirectFrame.options.z ^ (state.attempts * 0x9e3779b9u));';
   const compose = '@compute @workgroup_size(8, 8) fn composeImportedIndirect';
   const stateSum = '  sum: vec3f,';
   const add = '  indirectStates[pixelIndex].sum += sample;';
-  if ([insertion, compose, stateSum, add].some(marker => base.split(marker).length !== 2)) {
+  const origin = '  let origin = staticTraceOffset(point, normal, staticTraceTriangles[primary.triangle]);';
+  if ([traceEntry, transport, compose, stateSum, add, origin].some(marker => base.split(marker).length !== 2)
+    || !(base.indexOf(traceEntry) < base.indexOf(transport) && base.indexOf(transport) < base.indexOf(compose))) {
     throw new Error('Imported indirect spatial shader integration markers changed.');
   }
-  const trace = base.slice(0, base.indexOf(compose)).replace(stateSum, '  sum: vec3u,')
-    .replace(add, '  indirectStates[pixelIndex].sum = bitcast<vec3u>(bitcast<vec3f>(indirectStates[pixelIndex].sum) + sample);')
-    .replace(insertion, `${insertion}
-  if (state.attempts == 0u) { spatialWriteGuide(pixelIndex, pixel, primary, point, rho, normal, primaryDirection); }`);
-  return `${trace}\n${importedIndirectSpatialHelpers}\n${spatialCompose}`;
+  const definitions = base.slice(0, base.indexOf(traceEntry)).replace(stateSum, '  sum: vec3u,');
+  const secondary = base.slice(base.indexOf(transport), base.indexOf(compose))
+    .replace(origin, '  let origin = staticTraceOffset(point, normal, staticTraceTriangles[primaryTriangle]);')
+    .replace(add, '  indirectStates[pixelIndex].sum = bitcast<vec3u>(bitcast<vec3f>(indirectStates[pixelIndex].sum) + sample);');
+  return `${definitions}\n${importedIndirectSpatialHelpers}\n${importedIndirectPrimaryShader}\n${sharedTraceHead}${secondary}\n${spatialCompose}`;
 }
 
 /** Loaded only for the explicit seven-storage-buffer capability. */
