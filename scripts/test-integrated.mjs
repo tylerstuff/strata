@@ -71,7 +71,7 @@ try {
   if (!smoke) {
     await run('lifecycle');
     await start({ cameraMode: 'overview' }); await run('shared-materials');
-    await start({ cameraMode: 'tour' }); await run('streaming');
+    await start({ cameraMode: 'tour' }); await run('streaming'); await run('empty-reflection-pass');
     await start({ cameraMode: 'terrain-witness', terrainColor: 'green', wallColor: 'neutral' }); await run('terrain-lighting', 'green-terrain-indirect');
     await start({ cameraMode: 'terrain-witness', terrainColor: 'neutral', wallColor: 'neutral' }); await run('terrain-lighting', 'neutral-terrain-indirect');
     await run('lighting-latency');

@@ -286,7 +286,9 @@ export function validateBenchmarkReport(report) {
           const expected = run.workload.renderer === 'raster' || virtual || gi ? [
             ...(virtual && run.workload.geometryMode !== 'mesh-lod' ? ['selection'] : []),
             ...(gi && run.workload.giEnabled ? ['gi-trace', 'gi-update'] : []),
-            ...(reflections && run.workload.reflectionMode === 'world' ? ['reflection-trace', 'reflection-resolve'] : []),
+            ...(reflections && run.workload.reflectionMode === 'world' ? [
+              ...(frame.reflections.scheduledCandidates > 0 ? ['reflection-trace'] : []), 'reflection-resolve',
+            ] : []),
             ...(gi && (run.workload.giEnabled || (reflections && run.workload.reflectionMode !== 'off')) ? ['gi-shade'] : []),
             'shadow', 'raster', 'presentation', ...(run.workload.temporal ? ['temporal'] : []),
           ] : ['procedural'];

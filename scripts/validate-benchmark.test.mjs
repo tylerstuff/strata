@@ -95,7 +95,7 @@ function giFixture({ enabled = true, temporal = true, probes = 32, rays = 64, dy
 }
 
 function reflectionFixture({ enabled = true, temporal = true, timed = false, dynamic = false,
-  mode = 'world', scale = 0.25, budget = 32768, updateEvery = 1, height = 720 } = {}) {
+  mode = 'world', scale = 0.25, budget = 32768, updateEvery = 1, height = 720, regionPixels = 4096 } = {}) {
   const report = giFixture({ enabled, temporal, timed, dynamic }); const run = report.runs[0];
   const width = height === 1080 ? 1920 : 1280;
   Object.assign(run.resolution, { width, height, cssWidth: width, cssHeight: height });
@@ -108,8 +108,8 @@ function reflectionFixture({ enabled = true, temporal = true, timed = false, dyn
   const names = [...(enabled ? ['gi-trace', 'gi-update'] : []), 'shadow', 'raster',
     ...(world ? ['reflection-trace', 'reflection-resolve'] : []), ...(active ? ['gi-shade'] : []),
     ...(temporal ? ['temporal'] : []), 'presentation'];
-  const region = world ? 4096 : 0; const perUpdate = Math.min(region, budget);
-  let traceFrames = world ? 1 : 0; let totalCandidates = world ? perUpdate : 0; // One warm-up submission.
+  const region = world ? regionPixels : 0; const perUpdate = Math.min(region, budget);
+  let traceFrames = Number(perUpdate > 0); let totalCandidates = perUpdate; // One warm-up submission.
   for (const [index, frame] of run.frames.entries()) {
     const age = active ? (dynamic && index > 0 ? 1 : frame.frameId) : 0;
     const candidates = world && (age - 1) % updateEvery === 0 ? perUpdate : 0;
@@ -130,15 +130,17 @@ function reflectionFixture({ enabled = true, temporal = true, timed = false, dyn
       dispatchCalls: Number(enabled) * 2 + Number(active) + Number(world) + Number(candidates > 0),
       allocatedGpuBufferBytes: frame.gi.traceGeometryBytes + frame.gi.cacheBufferBytes + 96 + 512 + 65536,
       allocatedGpuTextureBytes: frame.gi.cacheTextureBytes + frame.gi.composeTextureBytes + frame.reflections.gpuTextureBytes + 16777216,
-      gpuPasses: timed ? Object.fromEntries(names.map(name => [name, 0])) : {} });
+      gpuPasses: timed ? Object.fromEntries(names.filter(name => name !== 'reflection-trace' || candidates > 0).map(name => [name, 0])) : {} });
   }
-  const count = run.frames.length;
   Object.assign(run.allocations, { gi: { ...run.frames.at(-1).gi }, reflections: { ...run.frames.at(-1).reflections },
     allocatedGpuBufferBytes: run.frames[0].allocatedGpuBufferBytes, allocatedGpuTextureBytes: run.frames[0].allocatedGpuTextureBytes });
   Object.assign(run.summary, { dispatchCalls: run.frames.reduce((sum, frame) => sum + frame.dispatchCalls, 0),
     maxTrackedGpuBufferBytes: run.frames[0].allocatedGpuBufferBytes, maxTrackedGpuTextureBytes: run.frames[0].allocatedGpuTextureBytes });
-  run.profiling.capturedPassSampleCount = timed ? count * names.length : 0;
-  run.gpuPasses = timed ? Object.fromEntries(names.map(name => [name, { ...sampleDistribution(run.frames.map(() => 0)), sampleCount: count, totalMs: 0 }])) : {};
+  run.profiling.capturedPassSampleCount = run.frames.reduce((sum, frame) => sum + Object.keys(frame.gpuPasses).length, 0);
+  run.gpuPasses = timed ? Object.fromEntries(names.flatMap(name => {
+    const values = run.frames.flatMap(frame => Object.hasOwn(frame.gpuPasses, name) ? [frame.gpuPasses[name]] : []);
+    return values.length ? [[name, { ...sampleDistribution(values), sampleCount: values.length, totalMs: 0 }]] : [];
+  })) : {};
   return report;
 }
 
@@ -358,7 +360,7 @@ test('accepts reflection modes with independent GI/TAA, exact layout and unknown
     const report = reflectionFixture({ scale, budget, height, updateEvery: 4, timed: true });
     assert.equal(validateBenchmarkReport(report), report);
     assert.equal(report.runs[0].frames[0].reflections.scheduledCandidates, 0);
-    assert.ok(Object.hasOwn(report.runs[0].frames[0].gpuPasses, 'reflection-trace'));
+    assert.ok(!Object.hasOwn(report.runs[0].frames[0].gpuPasses, 'reflection-trace'));
   }
 });
 
@@ -434,13 +436,19 @@ test('rejects reflection allocation, candidate scheduling, cumulative work and s
   assert.throws(() => validateBenchmarkReport(probeOnly), /disabled\/probe-only reflection mode claims traced work/);
 });
 
-test('requires both world reflection timing passes even on frames with no scheduled trace candidates', () => {
-  const report = reflectionFixture({ timed: true, updateEvery: 4 });
+test('requires reflection trace timing only for frames with actual scheduled candidates', () => {
+  const report = reflectionFixture({ timed: true, updateEvery: 2 });
   const run = report.runs[0];
   assert.equal(run.frames[0].reflections.scheduledCandidates, 0);
+  assert.ok(run.frames[1].reflections.scheduledCandidates > 0);
+  assert.ok(!Object.hasOwn(run.frames[0].gpuPasses, 'reflection-trace'));
+  assert.equal(run.gpuPasses['reflection-trace'].sampleCount, 1);
   assert.equal(validateBenchmarkReport(report), report);
-  delete run.frames[0].gpuPasses['reflection-trace'];
+  delete run.frames[1].gpuPasses['reflection-trace'];
   assert.throws(() => validateBenchmarkReport(report), /incomplete frame pass timings/);
+  const invented = reflectionFixture({ timed: true, updateEvery: 2 });
+  invented.runs[0].frames[0].gpuPasses['reflection-trace'] = 0;
+  assert.throws(() => validateBenchmarkReport(invented), /incomplete frame pass timings/);
   const extra = reflectionFixture({ timed: true, mode: 'probe-only' });
   extra.runs[0].frames[0].gpuPasses['reflection-resolve'] = 0;
   assert.throws(() => validateBenchmarkReport(extra), /incomplete frame pass timings/);
@@ -449,8 +457,33 @@ test('requires both world reflection timing passes even on frames with no schedu
   assert.throws(() => validateBenchmarkReport(orphan), /pass summaries contain measurements absent/);
 });
 
-function integratedFixture({ enabled = true, temporal = true, mode = 'world', geometryMode = 'streamed', timed = false, motion = false } = {}) {
-  const report = reflectionFixture({ enabled, temporal, mode, timed }); const run = report.runs[0];
+test('world reflection resolve remains timed when an empty candidate region omits all trace work', () => {
+  for (const create of [reflectionFixture, integratedFixture]) {
+    const report = create({ timed: true, regionPixels: 0 }); const run = report.runs[0];
+    for (const frame of run.frames) {
+      assert.equal(frame.reflections.scheduledCandidates, 0);
+      assert.equal(frame.reflections.sourceFrameId, frame.frameId);
+      assert.ok(!Object.hasOwn(frame.gpuPasses, 'reflection-trace'));
+      assert.ok(Object.hasOwn(frame.gpuPasses, 'reflection-resolve'));
+      frame.gpuPassIntervals = Object.fromEntries(Object.keys(frame.gpuPasses).map(name => [name, { startMs: 0, endMs: 0 }]));
+      frame.gpuSpanMs = 0;
+    }
+    run.summary.gpuSpanMs = sampleDistribution(run.frames.map(() => 0));
+    assert.ok(!Object.hasOwn(run.gpuPasses, 'reflection-trace'));
+    assert.equal(validateBenchmarkReport(report), report);
+    const staleSource = structuredClone(report); staleSource.runs[0].frames[0].reflections.sourceFrameId--;
+    assert.throws(() => validateBenchmarkReport(staleSource), /source frame/);
+    const missingResolve = structuredClone(report); delete missingResolve.runs[0].frames[0].gpuPasses['reflection-resolve'];
+    delete missingResolve.runs[0].frames[0].gpuPassIntervals['reflection-resolve'];
+    assert.throws(() => validateBenchmarkReport(missingResolve), /incomplete frame pass timings/);
+    const invented = structuredClone(report); invented.runs[0].frames[0].gpuPasses['reflection-trace'] = 0;
+    invented.runs[0].frames[0].gpuPassIntervals['reflection-trace'] = { startMs: 0, endMs: 0 };
+    assert.throws(() => validateBenchmarkReport(invented), /incomplete frame pass timings/);
+  }
+});
+
+function integratedFixture({ enabled = true, temporal = true, mode = 'world', geometryMode = 'streamed', timed = false, motion = false, regionPixels = 4096 } = {}) {
+  const report = reflectionFixture({ enabled, temporal, mode, timed, regionPixels }); const run = report.runs[0];
   const info = { fixture: 'streamed-courtyard-v1', cameraPath: 'integrated-tour-v1',
     renderRepresentation: 'streamed-terrain-and-exact-room-v1', tracingRepresentation: 'persistent-terrain-proxy-and-exact-room-v1',
     collisionRepresentation: 'none', terrainColor: 'green', staticRasterTriangles: 312, persistentProxyTriangles: 2048,
@@ -484,7 +517,8 @@ function integratedFixture({ enabled = true, temporal = true, mode = 'world', ge
     delete frame.gi.objectOffset;
     Object.assign(frame.reflections, { objectOffset: state.objectOffset, worldRevision: revision, sourceFrameId: active ? frameId : null,
       submittedFrames: active ? frameId : 0, cacheEpoch: active ? frameId : 0, framesSinceReset: active ? 1 : 0,
-      traceFrames: mode === 'world' ? frameId : 0, totalScheduledCandidates: mode === 'world' ? frameId * 4096 : 0, traceGeometryBytes: 184640 });
+      traceFrames: mode === 'world' && regionPixels > 0 ? frameId : 0,
+      totalScheduledCandidates: mode === 'world' ? frameId * Math.min(regionPixels, frame.reflections.maxRaysPerFrame) : 0, traceGeometryBytes: 184640 });
     const geometry = { sourceFrameId: mesh ? frameId : frameId - 1, cameraPath: info.cameraPath, geometryMode,
       sourceSeed: 1337, sourceTilesPerSide: 4, sourceCellsPerTile: 64, sourceTriangleCount: 131072,
       sourcePageCount: 80, sourceRootPageCount: 3, uniqueCompiledBytes: 5242880,

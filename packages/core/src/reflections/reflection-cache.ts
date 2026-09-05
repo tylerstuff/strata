@@ -1,6 +1,6 @@
 import { StrataError } from '../errors.js';
 import type { CameraFrame } from '../rendering/raster-math.js';
-import type { RasterOutputs } from '../rendering/raster-types.js';
+import type { RasterOutputs, RasterPassName } from '../rendering/raster-types.js';
 import type { ProbeBindings } from '../gi/probe-cache.js';
 import { invertGiMatrix } from '../gi/room-geometry.js';
 import { reflectionSurface } from './reflection-scene.js';
@@ -169,7 +169,7 @@ export class ReflectionCache {
     this.traceGroups = traceGroups; this.resolveGroups = resolveGroups; this.source = outputs;
   }
 
-  encode(encoder: GPUCommandEncoder, input: ReflectionFrame): { bindings: ReflectionBindings; dispatchCalls: number; uploadBytes: number } {
+  encode(encoder: GPUCommandEncoder, input: ReflectionFrame): { bindings: ReflectionBindings; dispatchCalls: number; uploadBytes: number; skippedGpuPasses?: readonly RasterPassName[] } {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Reflection cache is disposed.');
     if (![input.width, input.height].every(value => Number.isInteger(value) && value > 0 && value <= this.device.limits.maxTextureDimension2D)
       || ![input.frameIndex, input.worldRevision].every(value => Number.isInteger(value) && value >= 0 && value <= 0xffffffff)
@@ -210,15 +210,20 @@ export class ReflectionCache {
         ] }); this.probeGroups.set(input.probes.uniform, probes);
       }
       this.device.queue.writeBuffer(this.statistics, 0, new Uint32Array(8)); uploadBytes += 32;
-      const trace = encoder.beginComputePass({ label: 'Strata selective reflection trace', ...(input.timestamps?.trace ? { timestampWrites: input.timestamps.trace } : {}) });
-      trace.setPipeline(this.tracePipeline); trace.setBindGroup(0, this.traceGroups![index]!); trace.setBindGroup(1, this.sceneGroup); trace.setBindGroup(2, probes);
-      if (candidates > 0) { trace.dispatchWorkgroups(Math.ceil(candidates / 64)); dispatchCalls++; } trace.end();
+      // An empty pass can leave timestamp queries unwritten on some backends.
+      // Omit both the pass and its timing sample instead of decoding stale data.
+      if (candidates > 0) {
+        const trace = encoder.beginComputePass({ label: 'Strata selective reflection trace', ...(input.timestamps?.trace ? { timestampWrites: input.timestamps.trace } : {}) });
+        trace.setPipeline(this.tracePipeline); trace.setBindGroup(0, this.traceGroups![index]!); trace.setBindGroup(1, this.sceneGroup); trace.setBindGroup(2, probes);
+        trace.dispatchWorkgroups(Math.ceil(candidates / 64)); dispatchCalls++; trace.end();
+      }
       const resolve = encoder.beginComputePass({ label: 'Strata reflection temporal reconstruction', ...(input.timestamps?.resolve ? { timestampWrites: input.timestamps.resolve } : {}) });
       resolve.setPipeline(this.resolvePipeline); resolve.setBindGroup(0, this.resolveGroups![index]!);
       resolve.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8)); resolve.end(); dispatchCalls++;
     }
     this.pending = { index, key, scheduleKey, epoch, frameIndex: input.frameIndex, worldRevision: input.worldRevision, frames, frontier, candidates, region, controls, maxAge };
-    return { bindings: targets.banks[index]!.bindings, dispatchCalls, uploadBytes };
+    return { bindings: targets.banks[index]!.bindings, dispatchCalls, uploadBytes,
+      ...(controls.mode === 'world' && candidates === 0 ? { skippedGpuPasses: ['reflection-trace'] as const } : {}) };
   }
 
   submitted(frameId: number): void {

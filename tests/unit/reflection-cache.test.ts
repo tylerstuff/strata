@@ -5,6 +5,7 @@ import { acceptsReflectionHistory, normalizeReflectionControls, reflectionCandid
 import type { ReflectionVector } from '../../packages/core/src/reflections/reflection-reference.js';
 import { createGiCamera } from '../../packages/core/src/gi/room-geometry.js';
 import { reflectionSurface } from '../../packages/core/src/reflections/reflection-scene.js';
+import { lookAtMatrix, multiplyMatrices, orthographicMatrix } from '../../packages/core/src/rendering/raster-math.js';
 
 function fixture() {
   const buffers: { descriptor: GPUBufferDescriptor; bytes: Uint8Array<ArrayBuffer>; destroy: ReturnType<typeof vi.fn> }[] = [];
@@ -139,10 +140,41 @@ describe('bounded reflection cache ownership', () => {
   it('skips bounded update frames but continues resolve and expires history within sixteen frames', async () => {
     const gpu = fixture(); const cache = await gpu.create({ maxRaysPerFrame: 1 });
     for (let frameIndex = 0; frameIndex < 5; frameIndex++) {
+      gpu.rawEncoder.beginComputePass.mockClear();
       const result = cache.encode(gpu.encoder, { ...gpu.frame, frameIndex, controls: { updateEvery: 4 } });
-      expect(result.dispatchCalls).toBe(frameIndex % 4 === 0 ? 2 : 1); cache.submitted(frameIndex + 1);
+      const tracing = frameIndex % 4 === 0;
+      expect(result.dispatchCalls).toBe(tracing ? 2 : 1);
+      expect(result.skippedGpuPasses ?? []).toEqual(tracing ? [] : ['reflection-trace']);
+      expect(gpu.rawEncoder.beginComputePass.mock.calls.map(call => call[0]?.label)).toEqual(tracing
+        ? ['Strata selective reflection trace', 'Strata reflection temporal reconstruction'] : ['Strata reflection temporal reconstruction']);
+      cache.submitted(frameIndex + 1);
     }
     expect(cache.telemetry).toMatchObject({ traceFrames: 2, totalScheduledCandidates: 2, maxHistoryAge: 16 }); cache.dispose();
+  });
+
+  it('omits the queried trace pass outside the candidate region and resumes it after returning to the mirror', async () => {
+    const gpu = fixture(); const cache = await gpu.create();
+    const trace = {} as GPUComputePassTimestampWrites; const resolve = {} as GPUComputePassTimestampWrites;
+    const view = lookAtMatrix([20, 3, 5], [20, 0, 0]);
+    const camera = { eye: [20, 3, 5] as const, view, viewProjection: multiplyMatrices(orthographicMatrix(2, .1, 50), view), far: 50 };
+    expect(reflectionCandidateRegion(camera, 320, 180, reflectionSurface).width).toBe(0);
+    const outside = cache.encode(gpu.encoder, { ...gpu.frame, camera, timestamps: { trace, resolve } });
+    expect(outside.dispatchCalls).toBe(1); expect(outside.skippedGpuPasses).toEqual(['reflection-trace']);
+    expect(gpu.rawEncoder.beginComputePass.mock.calls.map(call => call[0])).toEqual([
+      { label: 'Strata reflection temporal reconstruction', timestampWrites: resolve },
+    ]);
+    expect(config(cache)[45]).toBe(0); cache.cancelFrame();
+    expect(cache.telemetry.sourceFrameId).toBeNull();
+    const retry = cache.encode(gpu.encoder, { ...gpu.frame, camera, timestamps: { trace, resolve } });
+    expect(retry.skippedGpuPasses).toEqual(['reflection-trace']); cache.submitted(1);
+    expect(cache.telemetry).toMatchObject({ scheduledCandidates: 0, traceFrames: 0, submittedFrames: 1 });
+    gpu.rawEncoder.beginComputePass.mockClear();
+    const returned = cache.encode(gpu.encoder, { ...gpu.frame, frameIndex: 1, timestamps: { trace, resolve } });
+    expect(returned.dispatchCalls).toBe(2); expect(returned.skippedGpuPasses ?? []).toEqual([]);
+    expect(gpu.rawEncoder.beginComputePass.mock.calls.map(call => call[0])).toEqual([
+      { label: 'Strata selective reflection trace', timestampWrites: trace }, { label: 'Strata reflection temporal reconstruction', timestampWrites: resolve },
+    ]);
+    cache.submitted(2); expect(cache.telemetry.traceFrames).toBe(1); cache.dispose();
   });
 
   it('commits frontier and history only after submission and retries cancelled work unchanged', async () => {

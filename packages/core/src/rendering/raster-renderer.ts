@@ -316,9 +316,11 @@ export class RasterRenderer {
     let dispatchCalls = prepared.reduce((sum, value) => sum + (value?.dispatchCalls ?? 0), 0) + (giPrepared?.dispatchCalls ?? 0);
     let uploadBytes = frameUniformBytes + presentationUniformBytes + prepared.reduce((sum, value) => sum + (value?.uploadBytes ?? 0), 0) + (giPrepared?.uploadBytes ?? 0);
     let triangles = prepared.reduce((sum, value) => sum + (value?.triangles ?? this.instanceCount * 24), 0) + 1;
+    let skippedGpuPasses: readonly RasterPassName[] | undefined;
     if (this.gi?.active) {
       const composed = this.gi.compose(encoder, targets.views, camera, width, height, timeSeconds, settings, timestamps);
       resolved = composed.view; dispatchCalls += composed.dispatchCalls; uploadBytes += composed.uploadBytes;
+      skippedGpuPasses = composed.skippedGpuPasses;
     }
     const unfiltered = resolved;
     if (settings.temporal) {
@@ -345,7 +347,8 @@ export class RasterRenderer {
     presentation.setPipeline(this.resources.presentationPipeline); presentation.setBindGroup(0, bindings); presentation.draw(3); presentation.end();
     this.previousCamera = camera; this.previousState = state;
     this.historyReady = settings.temporal; this.jitterIndex = (this.jitterIndex + 1) % 8;
-    return { drawCalls, dispatchCalls, triangles, uploadBytes, gpuBufferBytes: this.gpuBufferBytes, gpuTextureBytes: this.gpuTextureBytes };
+    return { drawCalls, dispatchCalls, triangles, uploadBytes, gpuBufferBytes: this.gpuBufferBytes, gpuTextureBytes: this.gpuTextureBytes,
+      ...(skippedGpuPasses ? { skippedGpuPasses } : {}) };
   }
 
   dispose(): void {

@@ -1,6 +1,7 @@
 import { StrataError } from '../errors.js';
 import { buildProceduralScene, createCameraMatrix, instanceStride, vertexStride } from './scene-data.js';
 import type { ProceduralSceneOptions } from './scene-data.js';
+import type { RasterPassName } from './raster-types.js';
 
 export type { ProceduralSceneOptions } from './scene-data.js';
 
@@ -9,6 +10,8 @@ const bufferUsage = { copyDestination: 0x8, index: 0x10, vertex: 0x20, uniform: 
 const renderAttachmentUsage = 0x10;
 
 export interface SceneFrameStats {
+  /** Planned passes omitted during encoding; their queries must not be decoded. */
+  readonly skippedGpuPasses?: readonly RasterPassName[];
   readonly drawCalls: number;
   readonly dispatchCalls: number;
   readonly triangles: number;

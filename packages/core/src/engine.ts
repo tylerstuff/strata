@@ -429,8 +429,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
           let dispatchCalls = 0;
           let triangles = 0;
           let uploadBytes = 0;
+          let skippedGpuPasses: readonly string[] | undefined;
           if (scene && scene.kind !== 'diffuse') {
-            ({ drawCalls, dispatchCalls, triangles, uploadBytes } = scene.value.encode(
+            ({ drawCalls, dispatchCalls, triangles, uploadBytes, skippedGpuPasses } = scene.value.encode(
               encoder, view, canvas.width, canvas.height, timeSeconds, controls, timing?.timestamps,
             ));
           } else if (scene) {
@@ -451,7 +452,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
             pass.end();
           }
           totalUploadBytes += uploadBytes;
-          if (timing) profiler!.resolve(encoder, timing);
+          if (timing) profiler!.resolve(encoder, timing, skippedGpuPasses);
           device!.queue.submit([encoder.finish()]);
           if (scene && scene.kind !== 'diffuse') forceRasterCameraCut = false;
           submittedFrames++;

@@ -148,7 +148,8 @@ export class ReflectionEffect implements RasterGiProvider {
         ...(timestamps['reflection-resolve'] ? { resolve: timestamps['reflection-resolve'] } : {}) },
     });
     const composed = this.composer.encode(encoder, outputs, camera, width, height, controls, this.pendingProbes, reflection.bindings, this.giEnabled, timestamps['gi-shade']);
-    return { view: composed.view, dispatchCalls: reflection.dispatchCalls + composed.dispatchCalls, uploadBytes: reflection.uploadBytes + composed.uploadBytes };
+    return { view: composed.view, dispatchCalls: reflection.dispatchCalls + composed.dispatchCalls, uploadBytes: reflection.uploadBytes + composed.uploadBytes,
+      ...(reflection.skippedGpuPasses ? { skippedGpuPasses: reflection.skippedGpuPasses } : {}) };
   }
   submitted(frameId: number): void {
     this.probeCache.submitted(frameId); this.reflectionCache.submitted(frameId); this.pendingProbes = undefined;

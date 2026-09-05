@@ -194,6 +194,9 @@ async function step(patch: Controls = {}, time = 0, capture = true) {
   const metadata = await readTexture(s.device, diagnostic.metadataTexture); const raw = await readTexture(s.device, diagnostic.rawTexture);
   const rawMetadata = await readTexture(s.device, diagnostic.rawMetadataTexture); const counters = await readStats(s.device, diagnostic.statisticsBuffer);
   const sourceCounts = [0, 0, 0, 0, 0]; let selectedPixels = 0;
+  const expectedSkipped = mode === 'world' && telemetry.scheduledCandidates === 0 ? ['reflection-trace'] : [];
+  require(JSON.stringify(stats.skippedGpuPasses ?? []) === JSON.stringify(expectedSkipped),
+    'Reflection skipped-query metadata disagrees with whether tracing dispatched.');
   if (mode === 'world') {
     require(counters[0] === telemetry.scheduledCandidates && counters[1]! <= counters[0]! && counters[2]! <= counters[1]!, `Reflection work exceeded declared quota: ${counters}`);
     require(counters[5] === 0 && counters[3]! + counters[4]! === counters[1], `Reflection traversal did not finish correctly: ${counters}`);

@@ -109,10 +109,14 @@ async function step(controls: Controls = {}, time = 0) {
   require(passes.filter(name => name === 'selection').length === 1 && passes.filter(name => name === 'raster').length === 1 && passes.filter(name => name === 'shadow').length === 1,
     'Integrated rendering duplicated the selection, shadow, or shared MRT pass.');
   const giEnabled = Boolean(s.renderer.giTelemetry.enabled); const reflectionMode = s.renderer.reflectionTelemetry.mode;
-  const expectedDispatches = 2 + (giEnabled ? 2 : 0) + (reflectionMode === 'world' ? 2 : 0) + (giEnabled || reflectionMode !== 'off' ? 1 : 0);
+  const hasTrace = Number(s.renderer.reflectionTelemetry.scheduledCandidates) > 0;
+  const expectedDispatches = 2 + (giEnabled ? 2 : 0) + (reflectionMode === 'world' ? 1 + Number(hasTrace) : 0) + (giEnabled || reflectionMode !== 'off' ? 1 : 0);
+  const skipped = stats.skippedGpuPasses ?? [];
+  require(JSON.stringify(skipped) === JSON.stringify(reflectionMode === 'world' && !hasTrace ? ['reflection-trace'] : []),
+    `Skipped reflection query metadata differs from actual dispatched work: ${skipped}`);
   require(stats.dispatchCalls === expectedDispatches && stats.drawCalls === 5 + Number(effective.temporal),
     `Integrated providers/pass counters disagree: ${JSON.stringify({ stats, passes, expectedDispatches })}`);
-  return { frame: s.frame, passes, stats, geometry, gi: s.renderer.giTelemetry, reflections: s.renderer.reflectionTelemetry,
+  return { frame: s.frame, passes: passes.filter(pass => !skipped.includes(pass)), stats, geometry, gi: s.renderer.giTelemetry, reflections: s.renderer.reflectionTelemetry,
     allocations: { buffers: s.renderer.gpuBufferBytes, textures: s.renderer.gpuTextureBytes } };
 }
 
@@ -351,12 +355,30 @@ async function streaming() {
   return { coarse: before.geometry, cameraCuts: frames, proxyBefore: firstProof, proxyAfter: afterProof,
     unchangedProductionTraceBuffers: true, delayedPageLoadsMs: 50, completeTerrainCoverageFromGpuCounters: true };
 }
+async function emptyReflectionPass() {
+  require(session!.options.cameraMode === 'tour', 'Empty reflection pass regression requires the integrated tour.');
+  const first = await step({ gi: { enabled: false }, reflections: { mode: 'world', updateEvery: 1 } }, 0);
+  require(Number(first.reflections.scheduledCandidates) > 0 && first.passes.includes('reflection-trace'), 'Visible mirror did not submit a trace.');
+  let outside: Awaited<ReturnType<typeof step>> | undefined; let outsideTime = 0;
+  for (let time = 1; time < 60; time++) {
+    const current = await step({}, time);
+    if (current.reflections.scheduledCandidates === 0) { outside = current; outsideTime = time; break; }
+  }
+  require(outside && !outside.passes.includes('reflection-trace') && outside.passes.includes('reflection-resolve'),
+    'Tour never omitted the empty trace while retaining reconstruction.');
+  const repeated = await step({}, outsideTime);
+  require(repeated.reflections.scheduledCandidates === 0 && !repeated.passes.includes('reflection-trace'), 'Held offscreen camera resurrected an empty queried pass.');
+  const returned = await step({ cameraCut: true }, 0);
+  require(Number(returned.reflections.scheduledCandidates) > 0 && returned.passes.includes('reflection-trace'), 'Returning to the mirror did not restore tracing.');
+  return { first, outside, outsideTime, repeated, returned, emptyPassOmitted: true, dummyDispatchUsed: false };
+}
 export async function runIntegratedCase(name: string) {
   require(session, 'Integrated validation session missing.');
   try {
     const result = name === 'cold-mirror' ? await coldMirror() : name === 'shared-materials' ? await materialProof()
       : name === 'terrain-trace' ? await traceProxyProof() : name === 'terrain-lighting' ? await terrainLighting()
-      : name === 'lighting-latency' ? await lightingLatency() : name === 'lifecycle' ? await lifecycle() : name === 'streaming' ? await streaming() : null;
+      : name === 'empty-reflection-pass' ? await emptyReflectionPass() : name === 'lighting-latency' ? await lightingLatency()
+      : name === 'lifecycle' ? await lifecycle() : name === 'streaming' ? await streaming() : null;
     require(result, `Unknown integrated case ${name}.`); require(session.gpuErrors.length === 0 && session.losses.length === 0, [...session.gpuErrors, ...session.losses].join('\n'));
     const gpuCounters: { probes?: number[]; reflections?: number[] } = {};
     if (session.renderer.giTelemetry.enabled) {
