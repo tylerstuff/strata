@@ -1,6 +1,7 @@
 import { loadGalleryCatalog, orderedGalleryAssets, type GalleryAsset, type GalleryCatalog } from './catalog.js';
 import { GalleryRuntime, debugViews, lightingPresets, scenePresets, type DebugView, type GalleryAnimation, type LightingPreset, type ScenePreset } from './runtime.js';
 import type { GalleryOrbit } from './orbit.js';
+import { fitViewportSize, watchDisplayDensity } from './viewport.js';
 
 function element<T extends HTMLElement>(id: string): T {
   const value = document.getElementById(id);
@@ -25,6 +26,7 @@ let actionError: string | null = null;
 let shownModel: string | null = null;
 let shownClipSignature = '';
 let fixedViewport = false;
+let fitMaximumDimension = 8192;
 let scrubbing = false;
 const runtime = new GalleryRuntime(canvas, update);
 
@@ -91,6 +93,7 @@ function showCatalog() {
 
 function update() {
   const state = runtime.getState();
+  fitMaximumDimension = state.engineInfo?.maxTextureDimension2D ?? fitMaximumDimension;
   const selected = assets.find(asset => asset.id === state.requestedModelId) ?? null;
   const ready = state.phase === 'ready' && state.busy === null;
   const known = state.asset !== null && state.modelId === selected?.id ? state.asset : null;
@@ -173,6 +176,43 @@ function update() {
   const adapter = state.engineInfo?.adapter;
   element('metric-device').textContent = adapter ? [adapter.description || adapter.device || adapter.architecture || adapter.vendor || 'WebGPU adapter', ...(adapter.isFallbackAdapter ? ['software adapter'] : [])].join(' · ') : 'Waiting for runtime';
   element('operation-status').textContent = actionError ?? (state.busy ? `Preparing ${state.busy}…` : state.phase === 'ready' ? `${state.viewport.width} × ${state.viewport.height} · ${state.frame?.triangles.toLocaleString() ?? '—'} submitted triangles · ${state.telemetry?.gpuErrorCount ?? 0} GPU errors` : state.error?.message ?? catalog?.diagnostics.join(' ') ?? 'Loading catalog…');
+  updateDisplayStatus();
+}
+
+function getDisplay() {
+  // The canvas has no border or padding. Use its CSS content dimensions in every
+  // sizing path, rather than mixing the wrapper's border and content boxes.
+  const rect = canvas.getBoundingClientRect();
+  const devicePixelRatio = window.devicePixelRatio;
+  return {
+    mode: fixedViewport ? 'fixed' as const : 'fit' as const,
+    css: { width: rect.width, height: rect.height },
+    render: { width: canvas.width, height: canvas.height },
+    devicePixelRatio,
+    nativeScale: {
+      x: rect.width > 0 ? canvas.width / (rect.width * devicePixelRatio) : null,
+      y: rect.height > 0 ? canvas.height / (rect.height * devicePixelRatio) : null,
+    },
+  };
+}
+function fittedViewport() {
+  const display = getDisplay();
+  return fitViewportSize(display.css.width, display.css.height, display.devicePixelRatio, fitMaximumDimension);
+}
+function updateDisplayStatus() {
+  const display = getDisplay();
+  const { x, y } = display.nativeScale;
+  const scale = x === null || y === null ? 'Hidden viewport' : `${Math.round(x * 100)}% × ${Math.round(y * 100)}% native density`;
+  const status = `${display.render.width} × ${display.render.height} render px · ${display.css.width.toFixed(1)} × ${display.css.height.toFixed(1)} CSS px · DPR ${display.devicePixelRatio} · ${scale}`;
+  const output = element('resolution-status');
+  if (output.textContent !== status) output.textContent = status;
+}
+function syncFitViewport() {
+  if (!fixedViewport) {
+    const size = fittedViewport();
+    if (size && (size.width !== canvas.width || size.height !== canvas.height)) runtime.resize(size.width, size.height);
+  }
+  updateDisplayStatus();
 }
 
 async function run(action: () => unknown | Promise<unknown>) {
@@ -195,8 +235,8 @@ resolutionSelect.addEventListener('change', () => run(async () => {
   if (resolutionSelect.value === 'fit') {
     fixedViewport = false;
     element('viewport-wrap').removeAttribute('style');
-    const rect = element('viewport-wrap').getBoundingClientRect();
-    await runtime.setViewport(Math.max(1, Math.round(rect.width)), Math.max(1, Math.round(rect.height)));
+    const size = fittedViewport();
+    if (size) await runtime.setViewport(size.width, size.height);
   } else {
     const [width, height] = resolutionSelect.value.split('x').map(Number);
     await setViewport(width!, height!);
@@ -252,11 +292,9 @@ canvas.addEventListener('keydown', event => {
   if (change) { event.preventDefault(); void run(() => runtime.setOrbit(change)); }
 }, { signal: events.signal });
 
-const resize = new ResizeObserver(entries => {
-  const rect = entries[0]?.contentRect;
-  if (rect && !fixedViewport) runtime.resize(Math.max(1, Math.round(rect.width)), Math.max(1, Math.round(rect.height)));
-});
-resize.observe(element('viewport-wrap'));
+const resize = new ResizeObserver(syncFitViewport);
+resize.observe(canvas);
+watchDisplayDensity(window, syncFitViewport, events.signal);
 document.addEventListener('visibilitychange', () => runtime.visibilityChanged(), { signal: events.signal });
 const healthRefresh = setInterval(update, 500);
 function dispose() { events.abort(); resize.disconnect(); clearInterval(healthRefresh); queuedOrbit = null; runtime.dispose(); }
@@ -275,12 +313,14 @@ async function setViewport(width: number, height: number) {
       const option = document.createElement('option'); option.value = value; option.textContent = `${width} × ${height}`; resolutionSelect.append(option);
     }
     resolutionSelect.value = value;
+    updateDisplayStatus();
     return state;
   } catch (error) { fixedViewport = previous; throw error; }
 }
 
 const api = {
   getState: () => runtime.getState(),
+  getDisplay,
   getCatalog: () => structuredClone(catalog),
   selectModel,
   setScenePreset: (id: ScenePreset) => runtime.setScenePreset(id),
@@ -304,6 +344,7 @@ void run(async () => {
   assets = orderedGalleryAssets(catalog);
   showCatalog();
   await runtime.initialize();
+  syncFitViewport();
   const initial = assets.find(asset => asset.entryUrl !== null && asset.unavailableReason === null);
   if (initial) await selectModel(initial.id);
 });
