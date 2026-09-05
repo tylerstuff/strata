@@ -19,6 +19,21 @@ function captureOutput(highWaterMark = 16384) {
 function handler(request: PreviewConnectionHandler['request'] = async value => success((value as { id: number }).id)) {
   return { closing: false as boolean, request: vi.fn(request), close: vi.fn(async () => {}) } satisfies PreviewConnectionHandler;
 }
+type ErrorKind = 'invalid JSON' | 'invalid UTF-8' | 'synchronous handler throw';
+const errorKinds: ErrorKind[] = ['invalid JSON', 'invalid UTF-8', 'synchronous handler throw'];
+function errorFrames(kind: ErrorKind, count: number): Buffer {
+  return Buffer.concat(Array.from({ length: count }, (_, i) => kind === 'invalid JSON' ? Buffer.from('no\n')
+    : kind === 'invalid UTF-8' ? Buffer.from([0xff, 10]) : Buffer.from(frame(i + 1))));
+}
+function errorHandler(kind: ErrorKind) {
+  const connection = handler(value => {
+    const request = value as { id: number; method: string };
+    if (kind === 'synchronous handler throw' && request.method === 'discover') throw new Error('Handler failed synchronously.');
+    if (request.method === 'dispose') connection.closing = true;
+    return Promise.resolve(success(request.id));
+  });
+  return connection;
+}
 
 describe('connection stdio framing', () => {
   it('decodes a multibyte character split across chunks and emits one compact line', async () => {
@@ -155,14 +170,49 @@ describe('connection stdio ownership and output', () => {
     expect(Buffer.byteLength(result.text())).toBeLessThan(1000);
   });
 
-  it('includes the active blocked write in the eight-buffer bound and stops malformed-input floods', async () => {
-    const input = new PassThrough(), writes = vi.fn(), output = new Writable({ write(chunk) { writes(chunk); } });
-    const connection = handler();
-    const running = runPreviewConnectionStdio({ connection, input, output, writeTimeoutMs: 100 });
-    const rejection = expect(running).rejects.toMatchObject({ code: 'CONNECTION_OUTPUT_OVERFLOW' });
-    input.write('no\n'.repeat(8)); await turn(); expect(output.destroyed).toBe(false); expect(writes).toHaveBeenCalledTimes(1);
-    input.write('no\n'.repeat(100)); await rejection;
-    expect(connection.close).toHaveBeenCalledTimes(1); expect(output.destroyed).toBe(true); expect(connection.request).not.toHaveBeenCalled();
+  it.each(errorKinds)('reserves two controls while six %s responses await a blocked writer', async kind => {
+    const input = new PassThrough(), chunks: Buffer[] = [], releases: (() => void)[] = [];
+    const output = new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); releases.push(callback); } });
+    const connection = errorHandler(kind), running = runPreviewConnectionStdio({ connection, input, output });
+    input.write(errorFrames(kind, 6)); await turn();
+    expect(chunks).toHaveLength(1); expect(connection.closing).toBe(false);
+    input.write(frame(7, 'cancel') + frame(8, 'dispose')); await turn();
+    expect(connection.request.mock.calls.map(([value]) => (value as { method: string }).method).slice(-2)).toEqual(['cancel', 'dispose']);
+    expect(connection.close).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 8; i++) { expect(releases).toHaveLength(1); releases.shift()!(); await turn(); }
+    await running;
+    const records = chunks.map(chunk => JSON.parse(chunk.toString()));
+    expect(records.slice(0, 6).map(record => [record.id, record.ok])).toEqual(Array.from({ length: 6 }, () => [null, false]));
+    expect(records.slice(6)).toEqual([success(7), success(8)]);
+    expect(output.destroyed).toBe(false);
+  });
+
+  it.each(errorKinds)('closes on the seventh ordinary %s response, with at most one overflow error', async kind => {
+    const input = new PassThrough(), chunks: Buffer[] = [], releases: (() => void)[] = [];
+    const output = new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); releases.push(callback); } });
+    const connection = errorHandler(kind), running = runPreviewConnectionStdio({ connection, input, output });
+    const rejection = expect(running).rejects.toMatchObject({ code: 'CONNECTION_ADMISSION_OVERFLOW' });
+    input.write(errorFrames(kind, 6)); await turn(); input.write(errorFrames(kind, 100)); await turn();
+    expect(connection.close).toHaveBeenCalledTimes(1); expect(input.isPaused()).toBe(true);
+    expect(connection.request).toHaveBeenCalledTimes(kind === 'synchronous handler throw' ? 6 : 0);
+    for (let i = 0; i < 7; i++) { expect(releases).toHaveLength(1); releases.shift()!(); await turn(); }
+    await rejection;
+    const records = chunks.map(chunk => JSON.parse(chunk.toString()));
+    expect(records).toHaveLength(7);
+    expect(records.filter(record => record.error.code === 'CONNECTION_ADMISSION_OVERFLOW')).toHaveLength(1);
+  });
+
+  it('releases a framing-error admission slot only after its write completes', async () => {
+    const input = new PassThrough(), chunks: Buffer[] = [], releases: (() => void)[] = [];
+    const output = new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); releases.push(callback); } });
+    const connection = handler(), running = runPreviewConnectionStdio({ connection, input, output });
+    input.write(errorFrames('invalid JSON', 6)); await turn();
+    releases.shift()!(); await turn();
+    input.write(errorFrames('invalid UTF-8', 1)); await turn();
+    expect(connection.close).not.toHaveBeenCalled();
+    for (let i = 0; i < 6; i++) { releases.shift()!(); await turn(); }
+    input.end(); await running;
+    expect(chunks).toHaveLength(7); expect(connection.request).not.toHaveBeenCalled();
   });
 
   it('counts the LF against the four MiB response cap', async () => {
@@ -197,7 +247,37 @@ describe('connection stdio ownership and output', () => {
     const running = runPreviewConnectionStdio({ connection, input, output: result.output, cleanupTimeoutMs: 10 });
     const rejection = expect(running).rejects.toMatchObject({ code: 'CONNECTION_DRAIN_TIMEOUT', details: { outcomeUnknown: true } });
     input.end(frame(1)); await rejection;
-    late.resolve(success(1, { publicationOccurred: true })); await turn(); expect(result.text()).toBe('');
+    const serialized = vi.fn(() => ({ publicationOccurred: true }));
+    late.resolve(success(1, { toJSON: serialized })); await turn(); expect(result.text()).toBe('');
+    expect(serialized).not.toHaveBeenCalled();
+    expect(input.listenerCount('data')).toBe(0); expect(result.output.listenerCount('error')).toBe(0);
+  });
+
+  it('observes late handler rejection without serializing diagnostics after shutdown', async () => {
+    const input = new PassThrough(), result = captureOutput(), late = deferred<ConnectionResponse>(), connection = handler(() => late.promise);
+    const running = runPreviewConnectionStdio({ connection, input, output: result.output, cleanupTimeoutMs: 10 });
+    const rejection = expect(running).rejects.toMatchObject({ code: 'CONNECTION_DRAIN_TIMEOUT' });
+    input.end(frame(1)); await rejection;
+    const error = connectionFailure('LATE_FAILURE', 'capture', 'Late failure.'), readDetails = vi.fn(() => ({}));
+    Object.defineProperty(error, 'details', { get: readDetails });
+    late.reject(error); await turn(); await turn();
+    expect(readDetails).not.toHaveBeenCalled(); expect(result.text()).toBe('');
+    expect(connection.close).toHaveBeenCalledTimes(1);
+    expect(input.listenerCount('error')).toBe(0); expect(result.output.listenerCount('close')).toBe(0);
+  });
+
+  it('handles a write callback failing after the stream was destroyed on timeout', async () => {
+    const input = new PassThrough(), connection = handler();
+    let callback!: (error?: Error | null) => void;
+    const write = vi.fn((_chunk: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void) => { callback = done; });
+    const output = new Writable({ write });
+    const running = runPreviewConnectionStdio({ connection, input, output, writeTimeoutMs: 10 });
+    const rejection = expect(running).rejects.toMatchObject({ code: 'CONNECTION_WRITE_TIMEOUT' });
+    input.write(frame(1)); await rejection; await turn();
+    expect(output.destroyed).toBe(true);
+    callback(new Error('Late write failure')); await turn(); await turn();
+    expect(write).toHaveBeenCalledTimes(1); expect(connection.close).toHaveBeenCalledTimes(1);
+    expect(output.listenerCount('drain')).toBe(0); expect(output.listenerCount('error')).toBe(0);
   });
 
   it('delivers a successful publication that wins cancellation before the shutdown deadline', async () => {
@@ -219,6 +299,17 @@ describe('connection stdio ownership and output', () => {
     const rejection = expect(running).rejects.toMatchObject({ code: 'CONNECTION_DRAIN_TIMEOUT', details: { deliveryUncertain: true } });
     input.end(); await rejection; expect(connection.close).toHaveBeenCalledTimes(1);
     lateClose.resolve(); await turn(); expect(result.text()).toBe('');
+  });
+
+  it('observes a late cleanup rejection without reopening output or admission', async () => {
+    const input = new PassThrough(), result = captureOutput(), lateClose = deferred<void>(), connection = handler();
+    connection.close.mockImplementation(() => lateClose.promise);
+    const running = runPreviewConnectionStdio({ connection, input, output: result.output, cleanupTimeoutMs: 10 });
+    const rejection = expect(running).rejects.toMatchObject({ code: 'CONNECTION_DRAIN_TIMEOUT' });
+    input.end(); await rejection;
+    lateClose.reject(new Error('Late cleanup failure')); await turn(); await turn();
+    expect(connection.close).toHaveBeenCalledTimes(1); expect(connection.request).not.toHaveBeenCalled();
+    expect(result.text()).toBe(''); expect(input.isPaused()).toBe(true);
   });
 
   it('preserves incomplete-cleanup errors after draining responses', async () => {

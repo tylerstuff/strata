@@ -120,6 +120,8 @@ class LocalPreviewConnection implements PreviewConnectionHandler {
   #closing = false;
   #fault: PreviewError | null = null;
   #closePromise: Promise<void> | null = null;
+  #lateSessionCleanup: Promise<void> | null = null;
+  readonly #cleanupErrors: PreviewError[] = [];
   #removeSignal: (() => void) | undefined;
 
   constructor(roots: ConnectionRoots, options: CreatePreviewSessionOptions, dependencies: PreviewConnectionDependencies) {
@@ -205,9 +207,10 @@ class LocalPreviewConnection implements PreviewConnectionHandler {
       return { requestId: target, cancellationRequested: true, settled: false };
     }
     if (method === 'dispose') return this.close().then(() => ({ disposed: true }));
-    if (method === 'inspect') return this.#run(id, method, async () => ({
-      ...this.#summary(), observation: this.#session ? await this.#observe() : null,
-    }));
+    if (method === 'inspect') return this.#run(id, method, async () => {
+      const observation = this.#session ? await this.#observe() : null;
+      return { ...this.#summary(), observation };
+    });
     if (this.#mutation !== null) throw connectionFailure('PREVIEW_BUSY', method, 'Another request or unsettled session operation retains mutation ownership.', { requestId: this.#mutation });
     if (method === 'load') {
       const scenePath = text(params.scenePath, 'scenePath');
@@ -221,7 +224,17 @@ class LocalPreviewConnection implements PreviewConnectionHandler {
         if (!this.#session) {
           const session = await this.#dependencies.createSession({ ...this.#options, signal });
           if (this.#closing || signal.aborted) {
-            await session.dispose();
+            // This candidate is never adopted, but its cleanup still belongs to
+            // this process, including rejection after shutdown has already begun.
+            this.#lateSessionCleanup = Promise.resolve().then(() => session.dispose()).catch(cause => {
+              const error = connectionFailure('CONNECTION_DISPOSE_FAILED', 'initialize', 'A late-created session could not be disposed.', {
+                unresolvedResources: ['late-created-session'], errors: [connectionErrorResponse(null, cause)],
+              });
+              this.#cleanupErrors.push(error);
+              this.#faultConnection(error);
+              throw error;
+            });
+            await this.#lateSessionCleanup;
             this.#checkAbort(signal);
             throw connectionFailure('CONNECTION_CLOSED', 'initialize', 'Connection closed before the session could be adopted.');
           }
@@ -352,8 +365,8 @@ class LocalPreviewConnection implements PreviewConnectionHandler {
     for (const work of this.#work.values()) this.#abort(work, 'CONNECTION_CLOSED');
     this.#closePromise = Promise.resolve().then(async () => {
       const cleanup = this.#session ? Promise.resolve().then(() => this.#session!.dispose()) : Promise.resolve();
-      const results = await bounded(Promise.allSettled([cleanup, ...this.#tasks]), this.#cleanupMs, 'dispose');
-      const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
+      const results = await bounded(Promise.allSettled([cleanup, ...this.#tasks, ...(this.#lateSessionCleanup ? [this.#lateSessionCleanup] : [])]), this.#cleanupMs, 'dispose');
+      const errors = [...this.#cleanupErrors, ...results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])];
       if (errors.length) throw connectionFailure('CONNECTION_DISPOSE_FAILED', 'dispose', 'Owned session cleanup failed.', { errors: errors.map(error => connectionErrorResponse(null, error)) });
     });
     void this.#closePromise.catch(error => {

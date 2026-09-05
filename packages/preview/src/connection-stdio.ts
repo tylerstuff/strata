@@ -1,3 +1,4 @@
+/// <reference types="node" preserve="true" />
 import type { Readable, Writable } from 'node:stream';
 import {
   PREVIEW_CONNECTION_LIMITS as limits, connectionErrorResponse, connectionFailure,
@@ -58,7 +59,7 @@ export async function runPreviewConnectionStdio(options: PreviewConnectionStdioO
   const pending = new Set<Promise<void>>();
   const drainWaiters = new Set<{ resolve(): void; reject(error: unknown): void }>();
   let pendingDrained: (() => void) | undefined;
-  const line = Buffer.allocUnsafe(limits.inputLineBytes);
+  let line = Buffer.allocUnsafe(limits.inputLineBytes);
   let lineLength = 0, discardLine = false;
   let resolveRun!: () => void, rejectRun!: (error: unknown) => void;
   const completed = new Promise<void>((resolve, reject) => { resolveRun = resolve; rejectRun = reject; });
@@ -141,11 +142,9 @@ export async function runPreviewConnectionStdio(options: PreviewConnectionStdioO
     return delivered;
   }
   function framingError(code: string, message: string): void {
-    void send(connectionErrorResponse(null, connectionFailure(code, 'input', message))).catch(fail);
+    admit(true, () => Promise.resolve(connectionErrorResponse(null, connectionFailure(code, 'input', message))));
   }
-  function dispatch(value: unknown): void {
-    const method = (value as { method?: unknown }).method;
-    const ordinary = method !== 'cancel' && method !== 'dispose';
+  function admit(ordinary: boolean, requestResponse: () => Promise<ConnectionResponse>): void {
     if (pending.size >= limits.outstandingRequests || (ordinary && ordinaryRequests >= limits.ordinaryRequests)) {
       const error = connectionFailure('CONNECTION_ADMISSION_OVERFLOW', 'input', 'Outstanding response capacity is exhausted; connection admission is closed.', { outcomeUnknown: true, deliveryUncertain: true });
       // An unaccepted overflow frame consumes no handler ID. Emit at most one
@@ -156,17 +155,22 @@ export async function runPreviewConnectionStdio(options: PreviewConnectionStdioO
       fail(error); return;
     }
     let request: Promise<ConnectionResponse>;
-    try { request = connection.request(value); }
-    catch (error) { void send(connectionErrorResponse(null, error)).catch(fail); return; }
     if (ordinary) ordinaryRequests++;
-    const job = request.then(send, error => send(connectionErrorResponse(null, error))).catch(fail).finally(() => {
-      pending.delete(job);
-      if (ordinary) ordinaryRequests--;
+    try { request = requestResponse(); }
+    catch (error) { request = Promise.resolve(connectionErrorResponse(null, error)); }
+    const job = request.then(send, error => {
+      if (!finished) return send(connectionErrorResponse(null, error));
+    }).catch(fail).finally(() => {
+      if (pending.delete(job) && ordinary) ordinaryRequests--;
       if (pending.size === 0) pendingDrained?.();
-      if (connection.closing) shutdown();
+      if (!finished && connection.closing) shutdown();
     });
     pending.add(job);
     if (connection.closing) shutdown();
+  }
+  function dispatch(value: unknown): void {
+    const method = (value as { method?: unknown }).method;
+    admit(method !== 'cancel' && method !== 'dispose', () => connection.request(value));
   }
   function parseLine(): void {
     let text: string;
@@ -228,7 +232,13 @@ export async function runPreviewConnectionStdio(options: PreviewConnectionStdioO
         await deadline(Promise.resolve().then(closeAndDrain), cleanupTimeoutMs, 'CONNECTION_DRAIN_TIMEOUT');
       } catch (error) { failure ??= error; failOutput(error); }
       finally {
-        finished = true; pendingDrained = undefined;
+        finished = true;
+        // Once delivery has completed or been declared uncertain, detach the
+        // drain waiter and local records. Handler promises remain observed so
+        // late rejection is handled, but cannot enqueue data or reopen input.
+        pending.clear(); ordinaryRequests = 0;
+        pendingDrained?.(); pendingDrained = undefined;
+        line = Buffer.alloc(0); lineLength = 0;
         input.off('error', inputError); signal?.removeEventListener('abort', aborted);
         if (!outputFailed || output.closed) { output.off('error', outputError); output.off('close', outputClosed); }
         if (failure === undefined) resolveRun(); else rejectRun(failure);

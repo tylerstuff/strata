@@ -2,8 +2,9 @@
 
 Tracked in [issue #8](https://github.com/tylerstuff/strata/issues/8). This bounded
 slice adds a persistent, process-owned stdio connection to the optional preview
-package. Its implementation and CPU acceptance are in progress; browser acceptance
-has not been run. It does not complete the wider authoring issue.
+package. The implementation checkpoint passed CPU checks, including its isolated
+packed consumer. Independent review of the frozen candidate and browser acceptance
+remain pending. It does not complete the wider authoring issue.
 
 ## Boundary and transport
 
@@ -14,6 +15,22 @@ existing authoring and authored-preview validation. One connection owns at most
 one `PreviewSession`. It uses the existing public session API and introduces no
 scene schema or renderer API. The TypeScript adapter is an optional
 `@strata-engine/preview/connection` export; ordinary runtime packages do not import it.
+
+From a fresh checkout, contributors build Core before preview:
+
+```sh
+npm ci
+npm run build
+npm run build:preview
+mkdir -p ./local-project ./local-captures
+node packages/preview/dist/connection-bin.js --project-root ./local-project --output-root ./local-captures --browser chrome
+```
+
+Contributors need Node.js 22.13+ and rustup for that build. Archive consumers receive
+precompiled WASM and need no Rust tooling. Use an installed Chrome browser, or
+separately install Playwright Chromium and choose `--browser chromium`. Help and
+discovery require neither browser initialization nor a scene file. The installed
+binary is `strata-preview-connection`; `--help` returns one JSON help result.
 
 The chosen transport is UTF-8 newline-delimited JSON over the child process's stdin
 and stdout. It needs no listening control socket, port discovery, hosted service,
@@ -30,7 +47,8 @@ Each request is one JSON object and ends with LF:
 
 IDs are strictly increasing positive safe integers for this process. Accepted IDs
 cannot be reused. Responses may finish out of order, so a pending load or capture
-does not prevent cancellation. Every accepted request has one terminal response:
+does not prevent cancellation. While the output channel remains healthy, every
+accepted request has one terminal response:
 
 ```json
 {"version":1,"id":1,"ok":true,"result":{}}
@@ -41,6 +59,11 @@ Framing/envelope failures use `id:null` when a request cannot be safely correlat
 Unknown fields, versions, methods and invalid parameters fail explicitly. Batches,
 notifications, binary payloads, unsolicited progress on stdout and reconnect/replay
 semantics are unsupported. Stderr is reserved for process/transport diagnostics.
+Keep stdin open while requests are pending; EOF requests shutdown and cancellation,
+so piping a load and immediately closing stdin is not a completed preview workflow.
+The process exits with 0 for help or normal shutdown, 2 for startup argument errors,
+and 1 for startup/transport/cleanup failure. A protocol error is an `ok:false`
+response and does not by itself force a nonzero process exit.
 
 ## Operations
 
@@ -58,6 +81,39 @@ semantics are unsupported. Stderr is reserved for process/transport diagnostics.
 versioned authoring document. The connection performs no scene writes, asset
 fetches, importing/cooking, arbitrary shell execution or network control requests.
 Use the established authoring API/CLI for edits, then load the reviewed new revision.
+Obtain `expectedRevision` from authoring's `readSceneFile` or CLI validation result.
+Supply the [existing explicit view](preview.md#start-a-preview), then use the returned
+`sourceRevision`, `loadId` and `viewRevision` as capture's three expected tokens.
+After a successful mutation, the next sequential mutation can be sent immediately.
+After a canceled or rejected operation, inspection may still report owned work;
+wait for it to settle before retrying a mutation.
+
+The Node export also supports direct structured requests. This example only
+discovers capabilities and creates no browser; both directories must exist:
+
+```js
+import { resolve } from 'node:path';
+import { createPreviewConnection } from '@strata-engine/preview/connection';
+
+const connection = await createPreviewConnection({
+  projectRoot: resolve('./local-project'),
+  outputRoot: resolve('./local-captures'),
+});
+try {
+  const response = await connection.request({ version: 1, id: 1, method: 'discover', params: {} });
+  console.log(JSON.stringify(response));
+} finally {
+  await connection.close();
+}
+```
+
+The same export provides `runPreviewConnectionStdio({ connection, input, output,
+signal?, writeTimeoutMs?, cleanupTimeoutMs? })`, protocol version/limits and public
+connection types. Streams must provide raw bytes; do not set a text encoding on
+the input before passing it. The transport borrows streams, pauses input and drains
+output on normal shutdown, and owns closing the connection. The optional session
+factory dependency is a host/test seam with the same ownership contract as the
+public preview session.
 
 ## Ownership, cancellation and limits
 
@@ -108,10 +164,21 @@ filesystem changes by another process.
 
 ## Validation boundary
 
-CPU tests use the existing session/driver seams and real temporary project/output
-directories. They cover framing, byte limits/backpressure, monotonic IDs, discovery,
+`npm run check:preview` passed for this implementation checkpoint: 319 CPU tests,
+strict type/declaration checks, the package build, and both isolated packed CPU
+consumers. These tests use the existing session/driver seams and real temporary
+project/output directories. They cover framing, byte limits/backpressure, monotonic IDs, discovery,
 unsupported input, root escapes, lazy initialization, cancellation, late settlement,
-publication truth, disposal/EOF/output failure and packed consumer operation. They
-must not launch a browser or require consumer Rust tools. A frozen candidate and
-evidence will be independently reviewed before any scheduled browser validation.
-No GPU, quality or performance claim follows from these CPU tests.
+publication truth, disposal/EOF/output failure and packed consumer operation.
+The connection consumer installs Core, authoring and preview archives with scripts
+disabled, checks installed declarations, drives the installed CLI without a valid
+browser load, and uses a real `PreviewSession` with a delayed fake driver for
+cancellation and native PNG/receipt publication. Rust/browser sentinels and an
+empty browser-install location keep this a CPU workflow. Fixtures are generated in
+temporary directories and removed afterward.
+
+No connection browser/GPU run or full `npm run check` was executed for this
+checkpoint. The prior API/one-shot capture browser proof covers a separate entry
+point. A frozen candidate and evidence will be independently reviewed before any
+scheduled connection browser validation. No GPU, quality or performance claim
+follows from these CPU tests.

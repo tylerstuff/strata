@@ -144,6 +144,49 @@ describe('local preview controller: existing session ownership and result identi
     expect(await value.request(request(5, 'resize', { width: 16, height: 16 }))).toMatchObject({ ok: true });
   });
 
+  it.each([false, true])('retains late-created disposal failure and faults admission (shutdown already started: %s)', async shutdown => {
+    const created = deferred<Session>(), session = new Session();
+    const factory = vi.fn(() => created.promise);
+    const { value } = await connection(session, {}, factory);
+    const loading = value.request(load(1));
+    await vi.waitFor(() => expect(factory).toHaveBeenCalledTimes(1));
+    await value.request(request(2, 'cancel', { requestId: 1 }));
+    const disposal = shutdown ? value.request(request(3, 'dispose')) : undefined;
+    session.onDispose = async () => { throw new PreviewError('PREVIEW_DISPOSE_FAILED', 'dispose', 'Browser cleanup failed.', { unresolvedResources: ['browser'] }); };
+    created.resolve(session);
+    expect(await loading).toMatchObject({ ok: false, error: { code: 'CONNECTION_DISPOSE_FAILED', details: { unresolvedResources: ['late-created-session'] } } });
+    expect(value.closing).toBe(true);
+    if (disposal) expect(await disposal).toMatchObject({ ok: false, error: { code: 'CONNECTION_DISPOSE_FAILED' } });
+    await expect(value.close()).rejects.toMatchObject({ code: 'CONNECTION_DISPOSE_FAILED' });
+    expect(await value.request(load(4))).toMatchObject({ ok: false });
+    expect(factory).toHaveBeenCalledTimes(1); expect(session.disposed).toBe(1);
+  });
+
+  it('samples request summaries after a delayed inspection observes capture cancellation and settlement', async () => {
+    const { value, session } = await connection(); await value.request(load(1));
+    const pending = deferred<CapturePublication>(), observed = deferred<void>();
+    session.onCapture = () => pending.promise;
+    const capture = value.request(request(2, 'capture', tokens));
+    await vi.waitFor(() => expect(session.captures).toHaveLength(1));
+    session.onObserve = vi.fn(() => observed.promise);
+    const inspection = value.request(request(3, 'inspect'));
+    await vi.waitFor(() => expect(session.onObserve).toHaveBeenCalled());
+    await value.request(request(4, 'cancel', { requestId: 2 }));
+    pending.resolve(publication(outputRoot));
+    expect(await capture).toMatchObject({ ok: true });
+    observed.resolve();
+    const response = await inspection;
+    expect(response).toMatchObject({ ok: true, result: {
+      observation: { state: 'ready' },
+      recentRequests: expect.arrayContaining([
+        { id: 2, method: 'capture', status: 'succeeded' },
+        { id: 4, method: 'cancel', status: 'succeeded' },
+      ]),
+    } });
+    if (!response.ok) throw new Error('Expected inspection.');
+    expect((response.result as { activeRequests: { requestId: number }[] }).activeRequests.some(work => work.requestId === 2)).toBe(false);
+  });
+
   it('preserves a successful publication after cancellation and during shutdown, awaiting request settlement separately from dispose', async () => {
     const { value, session } = await connection(); await value.request(load(1));
     const pending = deferred<CapturePublication>(); session.onCapture = () => pending.promise;

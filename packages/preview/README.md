@@ -22,8 +22,8 @@ Source revisions and resolved view digests are separate. A load ID aliases an
 actual returned commit receipt within the unique session; it is never a pending
 request counter. Device/driver failure permanently invalidates the session.
 
-API output roots must already exist; the CLI creates its output root. Each capture
-reserves a new child directory, writes and verifies `image.png`, then atomically
+API output roots must already exist; the one-shot capture CLI creates its output
+root. Each capture reserves a new child directory, writes and verifies `image.png`, then atomically
 publishes `receipt.json` last without overwriting an existing capture. PNG
 verification checks the header,
 dimensions and exact written bytes; it does not decode pixels or prove visual
@@ -33,8 +33,8 @@ for the real result. Once published, a capture remains published even if later
 reporting fails. Cleanup warnings identify incomplete owned artifacts.
 
 Operations default to a 30-second deadline and a separate 5-second cancellation
-cleanup deadline. New loads supersede older loads but wait for their actual
-settlement before taking ownership. Other concurrent mutations fail with
+cleanup deadline. On `PreviewSession`, new loads supersede older loads but wait for
+their actual settlement before taking ownership. Other concurrent mutations fail with
 `PREVIEW_BUSY`. A rejected caller does not release unfinished work. Cleanup
 expiry faults the session and starts driver teardown. `dispose()` is idempotent;
 bounded cleanup can reject with `PREVIEW_DISPOSE_FAILED` and identify unresolved
@@ -65,7 +65,8 @@ Run the repository CLI with `node packages/preview/dist/bin.js` in place of
 
 `view.json` supplies `camera`, `light` and `background`. Optional `debugView`
 defaults to `final`; `timeSeconds` defaults to zero; `temporal` may only be false.
-The CLI returns one JSON result and closes its engine, worker, browser and server.
+The one-shot capture CLI returns one JSON result and closes its engine, worker,
+browser and server.
 
 ```js
 import { sceneRevision } from '@strata-engine/authoring';
@@ -86,8 +87,29 @@ try {
 }
 ```
 
-After the Core build, `npm run check:preview` runs the preview CPU suites and an
-isolated packed CPU consumer. Separately scheduled `npm run test:preview:browser`
+The separate `strata-preview-connection` binary and
+`@strata-engine/preview/connection` export provide a persistent local stdio
+connection to one session. Both selected roots must already exist:
+
+```sh
+strata-preview-connection --project-root ./project --output-root ./captures --browser chrome
+```
+
+Use `node packages/preview/dist/connection-bin.js` from a built checkout. The
+protocol is UTF-8 JSON objects terminated by LF; `discover`, `load`, `inspect`,
+`capture`, `resize`, `cancel` and `dispose` share existing preview operations.
+The browser is created only after a valid rooted scene load. Scene edits remain
+in the authoring API/CLI. This connection admits one mutation at a time and rejects
+overlap; it does not supersede a pending load. Six ordinary request slots and two
+reserved control slots keep cancellation available. Output is bounded to eight
+response buffers and 32 MiB including the active write, with at most four MiB per
+response including LF. Cancellation acknowledges a request; it does not prove
+rollback, failed publication or completed cleanup. EOF and broken output close
+admission and start bounded cleanup. See the [connection guide](https://github.com/tylerstuff/strata/blob/main/docs/preview-connection.md)
+for envelopes, root rules and uncertain-delivery handling.
+
+After the Core build, `npm run check:preview` runs the preview CPU suites and
+isolated packed CPU consumers. Separately scheduled `npm run test:preview:browser`
 installs the built Core/authoring/preview archives and exercises 14 submitted
 frames and seven captures across sequential API and installed-CLI sessions. It
 checks visible transform/material edits, input snapshots, same-source commit
@@ -100,3 +122,7 @@ candidate `ea877dc`, headed Chrome 152.0.7977.82 and an Apple `metal-3` nonfallb
 adapter. The linked record identifies the executed source and archive hashes;
 later documentation edits are outside that checkpoint. Captures and reports stay
 outside the repository.
+
+The new stdio connection passed its CPU lifecycle, transport and packed-consumer
+checks. Independent frozen review and browser validation remain pending. The
+earlier preview API/one-shot CLI result does not establish its transport behavior.
