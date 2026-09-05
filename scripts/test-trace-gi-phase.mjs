@@ -203,8 +203,12 @@ export function validatePhaseArtifact(artifact) {
   assert(/^(?:[A-Za-z0-9_-]+\/)+[A-Za-z0-9_-]+\.bin$/.test(artifact.name), 'Unsafe artifact name.');
   assert(Number.isSafeInteger(artifact.bytes) && artifact.bytes >= 0 && artifact.bytes <= PHASE_LIMITS.maxArtifactBytes, 'Artifact byte cap.');
   assert(/^[a-f0-9]{64}$/.test(artifact.sha256));
-  assert(typeof artifact.base64 === 'string' && artifact.base64.length <= Math.ceil(artifact.bytes / 3) * 4 && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(artifact.base64), 'Invalid artifact encoding.');
-  const bytes = Buffer.from(artifact.base64, 'base64'); assert.equal(bytes.length, artifact.bytes); assert.equal(proofHash(bytes), artifact.sha256, 'Artifact payload SHA256 differs.');
+  // Bound decoding first; the native canonical round-trip is linear and does not
+  // consume regex backtracking stack for multi-megabyte texture payloads.
+  assert(typeof artifact.base64 === 'string' && artifact.base64.length === Math.ceil(artifact.bytes / 3) * 4, 'Invalid artifact encoding.');
+  const bytes = Buffer.from(artifact.base64, 'base64'); assert.equal(bytes.length, artifact.bytes);
+  assert(bytes.toString('base64') === artifact.base64, 'Invalid artifact encoding.');
+  assert.equal(proofHash(bytes), artifact.sha256, 'Artifact payload SHA256 differs.');
   if (artifact.format !== undefined) {
     const bpp = { bgra8unorm: 4, rgba8unorm: 4, rgba16float: 8, rg32float: 8, rgba32uint: 16, depth32float: 4, r32float: 4 }[artifact.format];
     assert(bpp && Number.isSafeInteger(artifact.width) && artifact.width > 0 && Number.isSafeInteger(artifact.height) && artifact.height > 0);

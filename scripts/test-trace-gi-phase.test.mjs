@@ -48,6 +48,43 @@ test('raw artifact payloads reject traversal, noncanonical transport, tampering,
     { bytes: PHASE_LIMITS.maxArtifactBytes + 1 }, { base64: 'AA==' }, { base64: valid.base64 + '\n' }, { sha256: '0'.repeat(64) },
     { width: 2 }, { height: NaN }, { format: 'unknown' }]) assert.throws(() => validatePhaseArtifact({ ...valid, ...patch }));
 });
+test('artifact decoding accepts canonical padding and rejects malformed or noncanonical encodings', () => {
+  const artifact = data => ({ name: 'final/source.bin', bytes: data.length, sha256: proofHash(data), base64: data.toString('base64') });
+  // Include empty, one/two-byte padding, complete groups, and both + and /.
+  for (const data of [Buffer.alloc(0), Buffer.from([0]), Buffer.from([0, 0]), Buffer.from([0, 0, 0]), Buffer.from([251, 255, 255])]) {
+    assert(validatePhaseArtifact(artifact(data)).equals(data));
+  }
+  for (const [data, encodings] of [
+    [Buffer.from([0]), ['AB==', 'A/==', 'AA', 'AA=', 'AA===', 'AA= ', '=AA=', 'AAAA', 'AA\n=']],
+    [Buffer.from([0, 0]), ['AAB=', 'AAD=', 'AAA', 'AA==', 'AA=A', 'AAA\n']],
+    [Buffer.from([0, 0, 0]), ['AA A', 'AA\tA', 'AA$A', 'AA\u00a0A', 'AA\u0000A', 'AAA=', 'AAAA====']],
+    [Buffer.from([251, 255, 255]), ['-///', '+___']],
+  ]) for (const base64 of encodings) {
+    assert.throws(() => validatePhaseArtifact({ ...artifact(data), base64 }), undefined, `Accepted ${JSON.stringify(base64)}`);
+  }
+  const original = artifact(Buffer.from([1, 2, 3]));
+  assert.throws(() => validatePhaseArtifact({ ...original, base64: 'AQIE' }), /Artifact payload SHA256 differs/);
+});
+test('artifact validation handles realistic 720p native and HDR textures without regex stack growth', () => {
+  for (const [format, bpp] of [['bgra8unorm', 4], ['rgba16float', 8]]) {
+    const width = 1280, height = 720, data = Buffer.alloc(width * height * bpp, 0xa5);
+    const artifact = { name: 'precondition/texture.bin', bytes: data.length, sha256: proofHash(data), base64: data.toString('base64'), format, width, height };
+    assert(validatePhaseArtifact(artifact).equals(data), `${format} payload changed`);
+    assert.throws(() => validatePhaseArtifact({ ...artifact, base64: artifact.base64.slice(0, -4) }), /Invalid artifact encoding/);
+    assert.throws(() => validatePhaseArtifact({ ...artifact, sha256: '0'.repeat(64) }), /Artifact payload SHA256 differs/);
+  }
+});
+test('artifact decoding admits exactly 32 MiB and rejects larger declarations before reading their encoding', () => {
+  const data = Buffer.alloc(PHASE_LIMITS.maxArtifactBytes, 0xa5);
+  const artifact = { name: 'final/texture.bin', bytes: data.length, sha256: proofHash(data), base64: data.toString('base64'),
+    format: 'rgba16float', width: 2048, height: 2048 };
+  assert.equal(artifact.bytes, 32 * 1024 ** 2);
+  assert(validatePhaseArtifact(artifact).equals(data), 'Cap-sized payload changed');
+  let encodingReads = 0;
+  assert.throws(() => validatePhaseArtifact({ name: artifact.name, bytes: artifact.bytes + 1, sha256: artifact.sha256,
+    get base64() { encodingReads++; throw Error('Over-cap encoding must not be read or decoded.'); } }), /Artifact byte cap/);
+  assert.equal(encodingReads, 0);
+});
 test('native PNG preserves BGRA channel values exactly without exposure, resampling or alpha change', () => {
   const source = Buffer.from([1, 2, 3, 4, 0, 127, 255, 255, 40, 30, 20, 10, 9, 8, 7, 6]);
   const png = phaseNativePng(source, 2, 2); assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
