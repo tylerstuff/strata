@@ -78,6 +78,50 @@ export function reserveTerrainEvidence(used: number, added: number): number {
   return used + added;
 }
 export interface TerrainImageEvidence { index: number; frameId: number; png: Uint8Array; }
+export interface TerrainStreamedImageSchedule {
+  phase: 'B'; mode: 'streamed'; policy: TerrainPolicy; manifestSha256: string;
+  width: number; height: number; frames: number;
+  imageIndices: readonly number[];
+  selectedLodTransitionIndices: readonly number[];
+}
+function orderedIndices(values: readonly number[], label: string, minimum = 0): number[] {
+  require(Array.isArray(values) && values.length <= ORIGINAL_TERRAIN.movingFrames, `Invalid ${label}`);
+  let previous = minimum - 1;
+  return Array.from(values, value => {
+    integer(value, label, ORIGINAL_TERRAIN.movingFrames - 1);
+    require(value > previous, `Unordered or duplicate ${label}`); previous = value; return value;
+  });
+}
+/** Both completed streamed arms precede their reference; the reference has no LOD transitions of its own. */
+export function terrainReferenceImagePlan(sources: readonly TerrainStreamedImageSchedule[]) {
+  require(Array.isArray(sources) && sources.length === 2, 'Both streamed image schedules required');
+  const policies = new Set<TerrainPolicy>(), union = new Set<number>();
+  const boundaryCensoredBrackets: { policy: TerrainPolicy; transitionIndex: number; missingIndex: number }[] = [];
+  const owned = Array.from(sources, source => {
+    require(source && typeof source === 'object', 'Missing streamed source schedule');
+    require(source.phase === 'B' && source.mode === 'streamed' && source.frames === 3600 &&
+      source.manifestSha256 === ORIGINAL_TERRAIN.manifestSha256, 'Incomplete or wrong reference source');
+    require((source.width === 1280 && source.height === 720) || (source.width === 1920 && source.height === 1080), 'Original source dimensions required');
+    require(source.width === sources[0]!.width && source.height === sources[0]!.height, 'Mixed reference resolutions');
+    require((source.policy === 'greedy' || source.policy === 'retain-fallback') && !policies.has(source.policy), 'Both distinct streamed policies required');
+    policies.add(source.policy);
+    const images = orderedIndices(source.imageIndices, 'source image indices');
+    const transitions = orderedIndices(source.selectedLodTransitionIndices, 'source transitions', 1);
+    const expected = new Set(Array.from({ length: 600 }, (_, index) => index * 6));
+    for (const index of transitions) {
+      expected.add(index - 1); expected.add(index);
+      if (index + 1 < 3600) expected.add(index + 1);
+      else boundaryCensoredBrackets.push({ policy: source.policy, transitionIndex: index, missingIndex: 3600 });
+    }
+    require(images.length === expected.size && images.every(index => expected.has(index)), 'Missing or extra streamed bracket images');
+    images.forEach(index => union.add(index));
+    return { ...source, imageIndices: images, selectedLodTransitionIndices: transitions };
+  });
+  require(policies.has('greedy') && policies.has('retain-fallback'), 'Both distinct streamed policies required');
+  return { width: owned[0]!.width, height: owned[0]!.height,
+    indices: [...union].sort((a, b) => a - b), sources: owned,
+    boundaryCensoredBrackets, fullBracketCoverage: boundaryCensoredBrackets.length === 0 };
+}
 export interface TerrainFrameEvidence {
   index: number; frameId: number; feedbackSourceFrameId: number;
   timeSeconds: number; cameraCut: boolean;
@@ -112,14 +156,23 @@ export class TerrainDiagnosticRecorder {
   private failed = false;
   private busy = false;
   private readonly topology: TerrainTopology;
+  private readonly savedImageIndices: number[] = [];
+  private readonly selectedLodTransitionIndices: number[] = [];
+  private readonly referencePlan: ReturnType<typeof terrainReferenceImagePlan> | undefined;
+  private readonly referenceIndices: ReadonlySet<number>;
   readonly expectedFrames: number;
   constructor(readonly phase: TerrainPhase, readonly mode: 'streamed' | 'resident-full', readonly policy: TerrainPolicy,
-    readonly width: number, readonly height: number, topology: TerrainTopology) {
+    readonly width: number, readonly height: number, topology: TerrainTopology,
+    referenceSources?: readonly TerrainStreamedImageSchedule[]) {
     require(phase === 'B' || phase === 'C', 'Unknown phase');
     require(mode === 'streamed' || (mode === 'resident-full' && phase === 'B'), 'Invalid reference mode');
     require(policy === 'greedy' || policy === 'retain-fallback', 'Unknown policy');
     require(mode === 'streamed' || policy === 'greedy', 'Resident reference cannot request retention');
     require((width === 1280 && height === 720) || (width === 1920 && height === 1080), 'Original dimensions required');
+    require(mode === 'resident-full' || referenceSources === undefined, 'Only the resident reference accepts source image schedules');
+    this.referencePlan = mode === 'resident-full' ? terrainReferenceImagePlan(referenceSources ?? []) : undefined;
+    require(!this.referencePlan || (this.referencePlan.width === width && this.referencePlan.height === height), 'Reference/source resolution mismatch');
+    this.referenceIndices = new Set(this.referencePlan?.indices);
     require(topology.manifestSha256 === ORIGINAL_TERRAIN.manifestSha256, 'Original manifest identity required');
     require(topology.dependencies.length === 64 && topology.rootPages.length === 24, 'Original topology required');
     for (const lods of topology.dependencies) {
@@ -141,7 +194,7 @@ export class TerrainDiagnosticRecorder {
     const selected = Uint32Array.from({ length: 64 }, (_, tile) => feedback[17 + tile * 8]!);
     for (const lod of selected) integer(lod, 'selected LOD', 3);
     const transition = this.previousSelected !== undefined && selected.some((lod, tile) => lod !== this.previousSelected![tile]);
-    const current = this.phase === 'C' || this.next % 6 === 0 || this.nextImage || transition;
+    const current = this.phase === 'C' || this.next % 6 === 0 || this.nextImage || transition || this.referenceIndices.has(this.next);
     return { selectedLodTransition: transition, indices: [
       ...(this.phase === 'B' && transition && !this.previousImage ? [this.next - 1] : []),
       ...(current ? [this.next] : []),
@@ -204,6 +257,8 @@ export class TerrainDiagnosticRecorder {
       require(!this.closed && !this.failed, 'Late record after cancellation or failure');
       this.next++; this.lastId = result.frameId; this.bytes += bytes;
       this.imageCount += result.images.length;
+      this.savedImageIndices.push(...result.images.map(image => image.index));
+      if (result.selectedLodTransition) this.selectedLodTransitionIndices.push(result.step.index);
       this.previousSelected = selected;
       this.previousImage = requirements.indices.includes(result.step.index);
       this.nextImage = this.phase === 'B' && requirements.selectedLodTransition;
@@ -220,7 +275,13 @@ export class TerrainDiagnosticRecorder {
     const boundaryCensoredBrackets = this.phase === 'B' && this.nextImage
       ? [{ transitionIndex: this.expectedFrames - 1, missingIndex: this.expectedFrames }] : [];
     return { status: 'complete' as const, frames: this.next, images: this.imageCount, bytes: this.bytes,
-      boundaryCensoredBrackets, fullBracketCoverage: boundaryCensoredBrackets.length === 0,
+      boundaryCensoredBrackets, fullBracketCoverage: boundaryCensoredBrackets.length === 0 && (this.referencePlan?.fullBracketCoverage ?? true),
+      referenceImagePlan: this.referencePlan ? structuredClone(this.referencePlan) : null,
+      streamedImageSchedule: this.phase === 'B' && this.mode === 'streamed' ? {
+        phase: 'B' as const, mode: 'streamed' as const, policy: this.policy, manifestSha256: this.topology.manifestSha256,
+        width: this.width, height: this.height, frames: this.next,
+        imageIndices: [...this.savedImageIndices], selectedLodTransitionIndices: [...this.selectedLodTransitionIndices],
+      } satisfies TerrainStreamedImageSchedule : null,
       cleanup: structuredClone(cleanup), qualityAccepted: false };
   }
   get progress() { return { frames: this.next, images: this.imageCount, bytes: this.bytes, failed: this.failed, closed: this.closed }; }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { ORIGINAL_TERRAIN, TerrainDiagnosticRecorder, observeTerrainFeedback, terrainDiagnosticStep, terrainTimingWindows, reserveTerrainEvidence } from '../helpers/original-terrain-recording.js';
-import type { GeometrySnapshot, TerrainFrameEvidence, TerrainTopology } from '../helpers/original-terrain-recording.js';
+import { ORIGINAL_TERRAIN, TerrainDiagnosticRecorder, observeTerrainFeedback, terrainDiagnosticStep, terrainTimingWindows, reserveTerrainEvidence, terrainReferenceImagePlan } from '../helpers/original-terrain-recording.js';
+import type { GeometrySnapshot, TerrainFrameEvidence, TerrainTopology, TerrainStreamedImageSchedule, TerrainPolicy } from '../helpers/original-terrain-recording.js';
 function geometry(overrides: Partial<GeometrySnapshot> = {}): GeometrySnapshot {
   return { sourceFrameId: 0, requestsStarted: 24, requestsCompleted: 24, requestsFailed: 0, requestsCancelled: 0,
     evictions: 0, uploadedPages: 24, uploadedBytes: 24 * 65536, fetchedBytes: 24 * 65536, discardedCompletions: 0,
@@ -23,6 +23,16 @@ function frame(index = 0): TerrainFrameEvidence {
 }
 const make=()=>new TerrainDiagnosticRecorder('B','streamed','greedy',1280,720,topology());
 const cleanup={disposed:true,buffers:0,textures:0,wasm:0,pendingRequests:0,pendingReadbacks:0,errors:[]};
+function schedule(policy: TerrainPolicy, transitions: number[] = []): TerrainStreamedImageSchedule {
+  const indices=new Set(Array.from({length:600},(_,i)=>i*6));
+  for(const index of transitions)for(const i of [index-1,index,index+1])if(i<3600)indices.add(i);
+  return {phase:'B',mode:'streamed',policy,manifestSha256:ORIGINAL_TERRAIN.manifestSha256,width:1280,height:720,frames:3600,
+    imageIndices:[...indices].sort((a,b)=>a-b),selectedLodTransitionIndices:transitions};
+}
+function referenceFrame(index: number): TerrainFrameEvidence {
+  const value=frame(index);value.residency=Uint32Array.from({length:1199},(_,i)=>i);
+  value.geometry=geometry({poolBytes:1199*65536,residentPages:1199});return value;
+}
 describe('original terrain capture counter boundary',()=>{
   it('separates capture-start, last measured and later drained bytes without mutating the source',()=>{
     const start=geometry(), last=geometry({sourceFrameId:2,uploadedPages:26,uploadedBytes:26*65536}), drained=geometry({sourceFrameId:4,uploadedPages:29,uploadedBytes:29*65536});
@@ -53,6 +63,7 @@ describe('original moving observation schema',()=>{
   it('retains all3600 frame receipts with600 fixed 10Hz images; completion never claims visual acceptance',async()=>{
     const recorder=make();for(let i=0;i<3600;i++) await recorder.record(frame(i));
     const result=recorder.complete(cleanup);expect(result.frames).toBe(3600);expect(result.images).toBe(600);expect(result.boundaryCensoredBrackets).toEqual([]);expect(result.fullBracketCoverage).toBe(true);expect(result.qualityAccepted).toBe(false);
+    expect(result.streamedImageSchedule).toEqual(schedule('greedy'));
     await expect(recorder.record(frame(3600))).rejects.toThrow(/closed/);
   });
   it('exposes a deliberate all-root quality regression despite preserved physical coverage',async()=>{
@@ -137,6 +148,56 @@ describe('original moving observation schema',()=>{
     expect(r.imageRequirements(f.feedback).indices).toEqual([1,2]);
     f.images=[{index:2,frameId:102,png:frame().images[0]!.png}];
     await expect(r.record(f)).rejects.toThrow(/required images/);expect(()=>r.complete(cleanup)).toThrow(/Incomplete/);
+  });
+});
+describe('matched reference image union',()=>{
+  it('unions both actual streamed schedules and preserves the missing3600 bracket without adding a submission',()=>{
+    const sources=[schedule('greedy',[2,3599]),schedule('retain-fallback',[4])];
+    const plan=terrainReferenceImagePlan(sources);
+    expect(plan.indices.filter(i=>i<8)).toEqual([0,1,2,3,4,5,6]);
+    expect(plan.indices.slice(-3)).toEqual([3594,3598,3599]);
+    expect(plan.boundaryCensoredBrackets).toEqual([{policy:'greedy',transitionIndex:3599,missingIndex:3600}]);
+    expect(plan.fullBracketCoverage).toBe(false);expect(plan.indices).not.toContain(3600);
+    (sources[0]!.selectedLodTransitionIndices as number[])[0]=10;
+    expect(plan.sources[0]!.selectedLodTransitionIndices[0]).toBe(2);
+  });
+  it('rejects incomplete, mixed, duplicate and incorrectly captured source schedules',()=>{
+    const a=schedule('greedy',[2]),b=schedule('retain-fallback');
+    for(const sources of [[a],[a,a],[{...a,frames:3599},b],[{...a,width:1920,height:1080},b],
+      [{...a,imageIndices:a.imageIndices.filter(i=>i!==1)},b],[{...a,imageIndices:[...a.imageIndices,3599]},b],
+      [{...a,selectedLodTransitionIndices:[0]},b],[{...a,selectedLodTransitionIndices:[2,2]},b],
+      [{...a,imageIndices:[...a.imageIndices,3600]},b],[{...a,imageIndices:[NaN]},b],
+      [{...a,imageIndices:new Array<number>(603)},b],[{...a,selectedLodTransitionIndices:new Array<number>(1)},b]]){
+      expect(()=>terrainReferenceImagePlan(sources)).toThrow();
+    }
+    const sparse=new Array<TerrainStreamedImageSchedule>(2);sparse[0]=a;
+    expect(()=>terrainReferenceImagePlan(sparse)).toThrow(/Missing streamed/);
+    expect(()=>new TerrainDiagnosticRecorder('B','resident-full','greedy',1280,720,topology())).toThrow(/Both streamed/);
+    expect(()=>new TerrainDiagnosticRecorder('B','streamed','greedy',1280,720,topology(),[a,b])).toThrow(/Only the resident/);
+    expect(()=>new TerrainDiagnosticRecorder('B','resident-full','greedy',1920,1080,topology(),[a,b])).toThrow(/resolution mismatch/);
+  });
+  it('captures the supplied union despite stable finest LODs and owns the supplied schedule',async()=>{
+    const sources=[schedule('greedy',[2,3599]),schedule('retain-fallback',[4])];
+    const plan=terrainReferenceImagePlan(sources);
+    const recorder=new TerrainDiagnosticRecorder('B','resident-full','greedy',1280,720,topology(),sources);
+    (sources[0]!.imageIndices as number[]).fill(0);const captured:number[]=[];
+    for(let i=0;i<3600;i++){
+      const value=referenceFrame(i),requirements=recorder.imageRequirements(value.feedback);
+      expect(requirements.selectedLodTransition).toBe(false);
+      value.images=requirements.indices.map(index=>({index,frameId:index+100,png:frame().images[0]!.png}));
+      captured.push(...(await recorder.record(value)).images.map(image=>image.index));
+    }
+    const result=recorder.complete(cleanup);
+    expect(captured).toEqual(plan.indices);expect(result.frames).toBe(3600);
+    expect(result.fullBracketCoverage).toBe(false);expect(result.referenceImagePlan).toEqual(plan);
+    expect(result.streamedImageSchedule).toBe(null);expect(result.qualityAccepted).toBe(false);
+  });
+  it('fails when a streamed transition image is absent from the stable reference',async()=>{
+    const recorder=new TerrainDiagnosticRecorder('B','resident-full','greedy',1280,720,topology(),[schedule('greedy',[2]),schedule('retain-fallback')]);
+    await recorder.record(referenceFrame(0));
+    expect(recorder.imageRequirements(referenceFrame(1).feedback).indices).toEqual([1]);
+    await expect(recorder.record(referenceFrame(1))).rejects.toThrow(/required images/);
+    expect(()=>recorder.complete(cleanup)).toThrow(/Incomplete/);
   });
 });
 describe('native feedback interception without a new pass/buffer',()=>{

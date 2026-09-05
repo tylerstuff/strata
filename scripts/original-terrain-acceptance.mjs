@@ -21,6 +21,7 @@ export const TERRAIN_ALLOCATIONS = freeze({
     ['retain-fallback',1920,1080,'streamed'],['greedy',1920,1080,'streamed'],['greedy',1920,1080,'resident-full']],
     framesPerRun:3600, framesPerSecondSimulation:60, imageEveryFrame:false, imageStride:6, transitionBrackets:[-1,0,1], maxImagesPerRun:3600, maxRetainedCanvases:2, imageCapPolicy:'incomplete if any required image exceeds caps; never trim frame receipts', resetBetweenImages:false,
     maxImages:21600, maxImageBytes:16*1024**2, maxCaseBytes:4*1024**3, maxArtifactBytes:16*1024**3,
+    referenceImages:'Union of both completed streamed arms at the same resolution', independentReferenceGeometryBytes:41091072,
     outerDeadlineMs:1800000, cleanupDeadlineMs:20000, onePendingReadbackPerCase:true,
     qualification:'Cold root-ready, all3600 submission receipts; 10Hz images plus deduplicated previous/current/next actual selected-LOD transition brackets.21600 is a worst-case allocation cap, not the capture schedule. Not wall-clock timing or network-performance evidence.' },
   C: { name:'delayed-coverage', runOrder:[['greedy',1280,720],['retain-fallback',1280,720],['retain-fallback',1920,1080],['greedy',1920,1080]],
@@ -69,12 +70,20 @@ export function assertAllocationComplete(allocation,record) {
     assert.equal(r.policy,policy);assert.equal(r.width,width);assert.equal(r.height,height);assert.equal(r.geometryMode,mode);
     if(allocation!=='A'){
       assert.equal(r.frames,plan.framesPerRun);assert.equal(r.missingFrameIds,0);
-      const required=allocation==='B'?terrainRequiredImageIndices(r.selectedLodTransitionIndices):Array.from({length:plan.framesPerRun},(_,i)=>i);
+      let required=allocation==='B'?terrainRequiredImageIndices(r.selectedLodTransitionIndices):Array.from({length:plan.framesPerRun},(_,i)=>i);
+      let referenceSources=[];
+      if(allocation==='B'&&mode==='resident-full'){
+        assert.deepEqual(r.selectedLodTransitionIndices,[],'Finest reference cannot change selected LOD');
+        referenceSources=record.runs.slice(0,i).filter(s=>s.geometryMode==='streamed'&&s.width===width&&s.height===height);
+        assert.equal(referenceSources.length,2,'Both streamed arms must precede their reference');
+        assert.equal(new Set(referenceSources.map(s=>s.policy)).size,2);
+        required=[...new Set(referenceSources.flatMap(s=>s.imageIndices))].sort((a,b)=>a-b);
+      }
       assert.deepEqual(r.imageIndices,required,'Missing, extra or repeated required images');assert.equal(r.images,required.length);
       assert.equal(r.imageCapExceeded,false,'Required image cap makes the allocation incomplete');
       const censored=allocation==='B'&&r.selectedLodTransitionIndices.includes(3599)?[{transitionIndex:3599,missingIndex:3600}]:[];
       assert.deepEqual(r.boundaryCensoredBrackets,censored,'Outside-span brackets must remain explicit');
-      assert.equal(r.fullBracketCoverage,censored.length===0);fullBracketCoverage &&=r.fullBracketCoverage;
+      assert.equal(r.fullBracketCoverage,censored.length===0&&referenceSources.every(s=>s.fullBracketCoverage));fullBracketCoverage &&=r.fullBracketCoverage;
     }
     else {assert.equal(r.warmupSeconds,30);assert.equal(r.durationSeconds,60);assert.equal(r.diagnosticObservation,false);}
   }

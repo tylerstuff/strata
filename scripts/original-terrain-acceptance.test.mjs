@@ -53,8 +53,27 @@ test('10Hz plus exact selected-LOD transition brackets are deduplicated and clip
  const r=complete('B');r.runs[0].selectedLodTransitionIndices=[1,2,3599];r.runs[0].imageIndices=required;r.runs[0].images=required.length;
  assert.throws(()=>assertAllocationComplete('B',r),/Outside-span/);
  r.runs[0].boundaryCensoredBrackets=[{transitionIndex:3599,missingIndex:3600}];r.runs[0].fullBracketCoverage=false;
+ assert.throws(()=>assertAllocationComplete('B',r),/required images/);
+ r.runs[2].imageIndices=required;r.runs[2].images=required.length;r.runs[2].fullBracketCoverage=false;
  assert.deepEqual(assertAllocationComplete('B',r),{collected:true,fullBracketCoverage:false,qualityAccepted:false});
  r.runs[0].fullBracketCoverage=true;assert.throws(()=>assertAllocationComplete('B',r));
+});
+
+test('reference images match the union of both streamed policies independently at each resolution',()=>{
+ const r=complete('B');
+ for(const [index,transition] of [[0,2],[1,4],[3,8],[4,10]]){
+  const s=r.runs[index];s.selectedLodTransitionIndices=[transition];s.imageIndices=terrainRequiredImageIndices([transition]);s.images=s.imageIndices.length;
+ }
+ assert.throws(()=>assertAllocationComplete('B',r),/required images/);
+ for(const [reference,a,b] of [[2,0,1],[5,3,4]]){
+  r.runs[reference].imageIndices=[...new Set([...r.runs[a].imageIndices,...r.runs[b].imageIndices])].sort((x,y)=>x-y);
+  r.runs[reference].images=r.runs[reference].imageIndices.length;
+ }
+ assert.equal(assertAllocationComplete('B',r).collected,true);
+ assert(r.runs[2].imageIndices.includes(1)&&r.runs[2].imageIndices.includes(5));
+ assert(!r.runs[5].imageIndices.includes(1)&&r.runs[5].imageIndices.includes(11));
+ r.runs[5].imageIndices=r.runs[2].imageIndices;r.runs[5].images=r.runs[5].imageIndices.length;
+ assert.throws(()=>assertAllocationComplete('B',r),/required images/);
 });
 
 test('a final-directory creation race rejects admission without replacing concurrent evidence',async(t)=>{
