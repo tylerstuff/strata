@@ -1,4 +1,5 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {mkdtemp,mkdir,rm,symlink,realpath} from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';
+import test from 'node:test';import assert from 'node:assert/strict';import {mkdtemp,mkdir,rm,symlink,realpath} from 'node:fs/promises';import {tmpdir} from 'node:os';import {join,dirname} from 'node:path';
+import fs from 'node:fs/promises';import {syncBuiltinESMExports} from 'node:module';
 import {TERRAIN_ALLOCATIONS,originalTerrainOptions,assertOriginalManifest,terrainAssetRoute,assertAllocationComplete,terrainExternalOutput,terrainPrepareArguments,terrainPracticalComparison,terrainRequiredImageIndices} from './original-terrain-acceptance.mjs';
 test('original8MiB default and policy arms cannot alter source, resolution, shading or geometry reference semantics',()=>{
  const d=originalTerrainOptions();assert.equal(d.residencyPolicy,'greedy');assert.equal(d.poolBytes,8388608);assert.equal(d.cssWidth,1280);
@@ -54,4 +55,22 @@ test('10Hz plus exact selected-LOD transition brackets are deduplicated and clip
  r.runs[0].boundaryCensoredBrackets=[{transitionIndex:3599,missingIndex:3600}];r.runs[0].fullBracketCoverage=false;
  assert.deepEqual(assertAllocationComplete('B',r),{collected:true,fullBracketCoverage:false,qualityAccepted:false});
  r.runs[0].fullBracketCoverage=true;assert.throws(()=>assertAllocationComplete('B',r));
+});
+
+test('a final-directory creation race rejects admission without replacing concurrent evidence',async(t)=>{
+ const root=await mkdtemp(join(tmpdir(),'terrain-output-race-'));
+ const target=join(await realpath(root),'new-parent','result'),marker=join(target,'other-run.json');
+ const nativeMkdir=fs.mkdir;let injected=false;
+ const mocked=t.mock.method(fs,'mkdir',async(path,options)=>{
+  if(!injected&&(path===target||path===dirname(target))){
+   injected=true;await nativeMkdir(target,{recursive:true});await fs.writeFile(marker,'concurrent evidence\n',{flag:'wx'});
+  }
+  return nativeMkdir(path,options);
+ });
+ syncBuiltinESMExports();
+ try{
+  await assert.rejects(terrainExternalOutput(target),error=>error.code==='EEXIST');assert.equal(injected,true);
+  assert.equal(await fs.readFile(marker,'utf8'),'concurrent evidence\n');
+  assert.deepEqual(await fs.readdir(target),['other-run.json']);
+ }finally{mocked.mock.restore();syncBuiltinESMExports();await rm(root,{recursive:true,force:true});}
 });

@@ -44,7 +44,7 @@ export function terrainTimingWindows(run: {
   let previousId = -1, previousElapsed = -1, previous = start;
   for (const frame of run.frames) {
     integer(frame.frameId, 'frame ID'); require(frame.frameId > previousId, 'Frame IDs must advance');
-    require(Number.isFinite(frame.elapsedMs) && frame.elapsedMs > previousElapsed && frame.elapsedMs < 60000, 'Invalid measured time');
+    require(Number.isFinite(frame.elapsedMs) && frame.elapsedMs >= 0 && frame.elapsedMs > previousElapsed && frame.elapsedMs < 60000, 'Invalid measured time');
     const current = snapshot(frame.geometry); delta(current, previous);
     if (current.sourceFrameId !== null) require(current.sourceFrameId <= frame.frameId, 'Feedback is from the future');
     previousId = frame.frameId; previousElapsed = frame.elapsedMs; previous = current;

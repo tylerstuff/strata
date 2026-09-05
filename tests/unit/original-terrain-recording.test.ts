@@ -30,6 +30,13 @@ describe('original terrain capture counter boundary',()=>{
     expect(value.measuredDelta.uploadedBytes).toBe(2*65536);expect(value.postMeasurementDrainDelta.uploadedBytes).toBe(3*65536);
     last.uploadedBytes=0;expect(value.lastMeasured.uploadedBytes).toBe(26*65536);
   });
+  it('rejects negative first elapsed time, including the formerly admitted fractional interval',()=>{
+    const base={frames:[{frameId:1,elapsedMs:0,geometry:geometry()}],assetTraffic:{geometryAtCaptureStart:geometry(),geometryAtCaptureEnd:geometry()}};
+    expect(()=>terrainTimingWindows(base)).not.toThrow();
+    for(const elapsedMs of [-.5,-Number.MIN_VALUE,-1,-100]){
+      expect(()=>terrainTimingWindows({...base,frames:[{...base.frames[0]!,elapsedMs}]})).toThrow(/Invalid measured time/);
+    }
+  });
   it('rejects counter reset, duplicate/unordered frames and future feedback',()=>{
     const run={frames:[{frameId:1,elapsedMs:0,geometry:geometry()}],assetTraffic:{geometryAtCaptureStart:geometry(),geometryAtCaptureEnd:geometry()}};
     expect(()=>terrainTimingWindows({...run,frames:[{...run.frames[0]!,geometry:geometry({uploadedBytes:0})}]})).toThrow(/decreased/);

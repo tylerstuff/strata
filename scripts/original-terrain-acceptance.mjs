@@ -110,7 +110,9 @@ export async function terrainExternalOutput(destination) {
   for(;;){try{const s=await lstat(p);assert(!s.isSymbolicLink(),'Output ancestor is a symlink');break;}catch(e){if(e.code!=='ENOENT')throw e;absent.unshift(p.split(sep).at(-1));const up=dirname(p);assert.notEqual(up,p);p=up;}}
   const parent=await realpath(p);for(let q=parent;;q=dirname(q)){try{await lstat(resolve(q,'.git'));throw Error('Output cannot be inside Git');}catch(e){if(e.code!=='ENOENT')throw e;}if(dirname(q)===q)break;}
   assert(absent.length,'Output already exists');const result=resolve(parent,...absent);assert(!within(await realpath(repository),result));
-  await mkdir(result,{recursive:true});return result;
+  await mkdir(dirname(result),{recursive:true});
+  // Only the atomic final mkdir admits this caller; never reuse a concurrently created evidence directory.
+  await mkdir(result);return result;
 }
 export function terrainPrepareArguments(args){
   const result={};for(let i=0;i<args.length;i++){const k=args[i];assert(!Object.hasOwn(result,k),'Duplicate option');
