@@ -107,8 +107,10 @@ settle. Overrides are positive integer milliseconds bounded to 300 seconds.
 New loads supersede older loads while retaining the gate until actual settlement.
 Capture/resize conflicts return `PREVIEW_BUSY`. An uncooperative driver faults
 the session after the cleanup deadline and triggers teardown; late work never
-regains permission to mutate a fresh session. `dispose()` releases driver-owned
-resources exactly once and remains safe to call repeatedly.
+regains permission to mutate a fresh session. `dispose()` starts one bounded
+cleanup attempt for driver-owned resources and remains safe to call repeatedly.
+Cleanup can reject with `PREVIEW_DISPOSE_FAILED`, including errors and any
+unresolved resources; a cleanup deadline is not proof that every resource closed.
 
 After `npm run build` produces Core's distribution, `npm run check:preview`
 builds authoring, typechecks/tests/builds preview and runs
