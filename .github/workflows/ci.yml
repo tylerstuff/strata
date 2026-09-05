@@ -53,6 +53,11 @@ jobs:
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
+      - name: Validate installed preview connection revisions, captures and shutdown
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:preview:connection:browser
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
       - name: Validate the procedural benchmark on software WebGPU
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run benchmark:smoke
         env:
