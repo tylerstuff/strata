@@ -1,4 +1,4 @@
-import type { GeometryMode, GeometryTelemetry, RasterControls, GiTelemetry } from '@strata-engine/core';
+import type { GeometryMode, GeometryTelemetry, RasterControls, GiTelemetry, ReflectionTelemetry, ReflectionMode } from '@strata-engine/core';
 
 export interface Distribution {
   count: number;
@@ -44,6 +44,7 @@ export interface FrameSample {
   triangleCountSourceFrameId?: number | null;
   geometry?: GeometryTelemetry;
   gi?: GiTelemetry;
+  reflections?: ReflectionTelemetry;
   uploadBytes: number;
   allocatedGpuBufferBytes: number;
   allocatedGpuTextureBytes: number;
@@ -74,7 +75,7 @@ export interface BenchmarkOptions {
   durationSeconds: number;
   seed: number;
   instanceCount: number;
-  renderer: 'diffuse' | 'raster' | 'virtual' | 'gi';
+  renderer: 'diffuse' | 'raster' | 'virtual' | 'gi' | 'reflections';
   temporal: boolean;
   debugView: NonNullable<RasterControls['debugView']>;
   manifestUrl?: string;
@@ -87,6 +88,12 @@ export interface BenchmarkOptions {
   probesPerUpdate: number;
   raysPerProbe: number;
   giScenario: 'static' | 'door-light';
+  reflectionMode: ReflectionMode;
+  reflectionResolutionScale: 0.25 | 0.5 | 1;
+  reflectionMaxRays: number;
+  reflectionRoughness: number;
+  reflectionMaxDistance: number;
+  reflectionUpdateEvery: number;
   mode: 'performance' | 'sustained' | 'smoke';
   metadata: Record<string, unknown>;
 }
@@ -98,7 +105,7 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     warmupSeconds: input.warmupSeconds ?? 30,
     durationSeconds: input.durationSeconds ?? 60,
     seed: input.seed ?? 1337,
-    instanceCount: input.renderer === 'gi' || input.renderer === 'virtual' ? 0 : input.instanceCount ?? 512,
+    instanceCount: input.renderer === 'gi' || input.renderer === 'reflections' || input.renderer === 'virtual' ? 0 : input.instanceCount ?? 512,
     renderer: input.renderer ?? 'diffuse',
     temporal: input.temporal ?? true,
     debugView: input.debugView ?? 'final',
@@ -107,11 +114,14 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     poolBytes: input.poolBytes ?? 8 * 1024 * 1024,
     pixelError: input.pixelError ?? 2,
     pageLoadDelayMs: input.pageLoadDelayMs ?? 0,
-    cameraMode: input.cameraMode ?? (input.renderer === 'gi' ? 'overview' : 'tour'),
+    cameraMode: input.cameraMode ?? (input.renderer === 'reflections' ? 'receiver' : input.renderer === 'gi' ? 'overview' : 'tour'),
     giEnabled: input.giEnabled ?? true,
     probesPerUpdate: input.probesPerUpdate ?? 32,
     raysPerProbe: input.raysPerProbe ?? 64,
-    giScenario: input.giScenario ?? 'door-light',
+    giScenario: input.giScenario ?? (input.renderer === 'reflections' ? 'static' : 'door-light'),
+    reflectionMode: input.reflectionMode ?? 'world', reflectionResolutionScale: input.reflectionResolutionScale ?? 0.25,
+    reflectionMaxRays: input.reflectionMaxRays ?? 32768, reflectionRoughness: input.reflectionRoughness ?? 0.08,
+    reflectionMaxDistance: input.reflectionMaxDistance ?? 16, reflectionUpdateEvery: input.reflectionUpdateEvery ?? 1,
     mode: input.mode ?? 'performance',
     metadata: input.metadata ?? {},
   };
@@ -123,13 +133,13 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
     throw new RangeError('Warm-up must be 0–600 seconds and capture must be 0–1800 seconds (exclusive of zero).');
   }
   if (!Number.isInteger(result.seed) || result.seed < 0 || result.seed > 0xffff_ffff
-    || !Number.isInteger(result.instanceCount) || result.instanceCount < (result.renderer === 'gi' || result.renderer === 'virtual' ? 0 : 1) || result.instanceCount > 16_384) {
+    || !Number.isInteger(result.instanceCount) || result.instanceCount < (result.renderer === 'gi' || result.renderer === 'reflections' || result.renderer === 'virtual' ? 0 : 1) || result.instanceCount > 16_384) {
     throw new RangeError('Use a uint32 seed and 1–16384 instances.');
   }
-  if (result.renderer === 'gi' && result.seed !== 1337) throw new RangeError('The GI fixture uses fixed probe seed 1337.');
+  if ((result.renderer === 'gi' || result.renderer === 'reflections') && result.seed !== 1337) throw new RangeError('The GI fixture uses fixed probe seed 1337.');
   if (!['performance', 'sustained', 'smoke'].includes(result.mode)) throw new RangeError('Unknown benchmark mode.');
-  if (!['diffuse', 'raster', 'virtual', 'gi'].includes(result.renderer) || typeof result.temporal !== 'boolean'
-    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility'].includes(result.debugView)) {
+  if (!['diffuse', 'raster', 'virtual', 'gi', 'reflections'].includes(result.renderer) || typeof result.temporal !== 'boolean'
+    || !['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility', 'reflections', 'reflection-source'].includes(result.debugView)) {
     throw new RangeError('Unknown renderer, temporal setting, or debug view.');
   }
   if (result.renderer === 'diffuse' && result.debugView !== 'final') throw new RangeError('Debug views require the raster renderer.');
@@ -143,11 +153,19 @@ export function normalizeOptions(input: Partial<BenchmarkOptions> = {}): Benchma
       throw new RangeError('Use a positive geometry pool/error and a bounded page delay.');
     }
   }
-  if (result.renderer === 'gi' && (typeof result.giEnabled !== 'boolean' || !['static', 'door-light'].includes(result.giScenario)
+  if ((result.renderer === 'gi' || result.renderer === 'reflections') && (typeof result.giEnabled !== 'boolean' || !['static', 'door-light'].includes(result.giScenario)
     || !['overview', 'receiver', 'tour'].includes(result.cameraMode)
     || !Number.isInteger(result.probesPerUpdate) || result.probesPerUpdate < 1 || result.probesPerUpdate > 128
     || !Number.isInteger(result.raysPerProbe) || result.raysPerProbe < 16 || result.raysPerProbe > 128)) {
     throw new RangeError('GI requires a supported camera/scenario and bounded probe/ray budget.');
+  }
+  if (result.renderer === 'reflections' && (!['off', 'probe-only', 'world'].includes(result.reflectionMode)
+    || ![0.25, 0.5, 1].includes(result.reflectionResolutionScale)
+    || !Number.isInteger(result.reflectionMaxRays) || result.reflectionMaxRays < 1 || result.reflectionMaxRays > 131072
+    || !Number.isFinite(result.reflectionRoughness) || result.reflectionRoughness < 0 || result.reflectionRoughness > 0.35
+    || !Number.isFinite(result.reflectionMaxDistance) || result.reflectionMaxDistance < 1 || result.reflectionMaxDistance > 32
+    || !Number.isInteger(result.reflectionUpdateEvery) || result.reflectionUpdateEvery < 1 || result.reflectionUpdateEvery > 4)) {
+    throw new RangeError('Reflections require a supported mode, resolution, ray quota, roughness, distance and update interval.');
   }
   return result;
 }

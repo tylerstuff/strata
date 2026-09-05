@@ -13,6 +13,7 @@ const artifacts = join(root, 'test-results', 'consumers');
 const softwareGpu = process.env.STRATA_TEST_SOFTWARE_GPU === '1';
 const artifactSuffix = softwareGpu ? '-software' : '';
 const giModuleMarker = 'Strata one-bounce software probe trace';
+const reflectionModuleMarker = 'Strata bounded software reflections';
 let browser;
 const servers = [];
 
@@ -158,12 +159,16 @@ async function checkConsumer(kind, url) {
     const defaultModules = await loadedModules();
     assert.equal(defaultModules.some(module => module.source.includes(giModuleMarker)), false,
       `${kind}: the default consumer eagerly fetched GI implementation code`);
+    assert.equal(defaultModules.some(module => module.source.includes(reflectionModuleMarker)), false,
+      `${kind}: the default consumer eagerly fetched reflection implementation code`);
     assert.equal((await page.evaluate(() => strataTest.start())).state, 'ready');
     const diffuse = await page.evaluate(() => strataTest.exerciseScene({ renderer: 'diffuse', instanceCount: 8 }));
     assert.equal(diffuse.metrics.drawCalls, 1);
     assert.equal(diffuse.telemetry.gpuErrorCount, 0);
     assert.equal((await loadedModules()).some(module => module.source.includes(giModuleMarker)), false,
       `${kind}: choosing the diffuse baseline fetched the optional GI implementation`);
+    assert.equal((await loadedModules()).some(module => module.source.includes(reflectionModuleMarker)), false,
+      `${kind}: choosing the diffuse baseline fetched the optional reflection implementation`);
     const gi = await page.evaluate(() => strataTest.exerciseScene({ renderer: 'gi', cameraMode: 'overview', probesPerUpdate: 16, raysPerProbe: 32 }));
     assert.equal(gi.metrics.dispatchCalls, 3, `${kind}: optional GI trace/update/shade did not execute`);
     assert.equal(gi.metrics.drawCalls, 3);
@@ -174,11 +179,49 @@ async function checkConsumer(kind, url) {
     assert.equal(gi.telemetry.gi?.sourceFrameId, gi.metrics.frameId);
     const giModules = (await loadedModules()).filter(module => module.source.includes(giModuleMarker));
     assert.ok(giModules.length > 0, `${kind}: opting into GI did not load its separate implementation`);
+    assert.equal((await loadedModules()).some(module => module.source.includes(reflectionModuleMarker)), false,
+      `${kind}: choosing GI fetched the optional reflection implementation`);
+    const reflection = await page.evaluate(() => strataTest.exerciseScene({ renderer: 'reflections', cameraMode: 'receiver',
+      probesPerUpdate: 16, raysPerProbe: 32, resolutionScale: 0.25, maxRaysPerFrame: 32768, roughness: 0.08, objectOffset: 0 },
+    { gi: { enabled: true }, reflections: { mode: 'world', roughness: 0.08, maxDistance: 16, updateEvery: 1 } }));
+    assert.equal(reflection.metrics.dispatchCalls, 5, `${kind}: GI and selective reflection trace/resolve did not execute`);
+    assert.equal(reflection.metrics.drawCalls, 3);
+    assert.equal(reflection.metrics.triangles, 313);
+    assert.equal(reflection.telemetry.gpuErrorCount, 0, reflection.telemetry.lastGpuError ?? undefined);
+    assert.equal(reflection.telemetry.gi?.enabled, true);
+    assert.equal(reflection.telemetry.gi?.primaryRaysPerFrame, 512);
+    assert.equal(reflection.telemetry.gi?.traceGeometryBytes, 14624);
+    assert.equal(reflection.telemetry.gi?.sourceFrameId, reflection.metrics.frameId);
+    const reflected = reflection.telemetry.reflections;
+    assert.ok(reflected, `${kind}: the optional renderer did not expose reflection telemetry`);
+    assert.equal(reflected.mode, 'world');
+    assert.equal(reflected.cacheEpoch, 1);
+    assert.equal(reflected.framesSinceReset, 1);
+    assert.equal(reflected.sourceFrameId, reflection.metrics.frameId);
+    assert.equal(reflected.worldRevision, reflection.telemetry.gi.worldRevision);
+    assert.equal(reflected.giEnabled, true);
+    assert.equal(reflected.traceGeometryBytes, 14624);
+    assert.equal(reflected.screenTracing, false);
+    assert.equal(reflected.resolutionScale, 0.25);
+    assert.equal(reflected.roughness, 0.08);
+    assert.equal(reflected.maxRaysPerFrame, 32768);
+    assert.ok(reflected.scheduledCandidates > 0 && reflected.scheduledCandidates <= reflected.maxRaysPerFrame);
+    assert.equal(reflected.gpuBufferBytes, 512);
+    assert.equal(reflected.gpuTextureBytes, 32 * 24 * 88);
+    assert.equal(reflected.composeTextureBytes, 128 * 96 * 8);
+    for (const name of ['actualPrimaryRays', 'actualShadowRays', 'traceFailures', 'historyReusedPixels']) {
+      assert.equal(reflected[name], null, `${kind}: unread reflection counter ${name} must remain null`);
+    }
+    assert.deepEqual(reflection.metrics.reflections, reflected);
+    const reflectionModules = (await loadedModules()).filter(module => module.source.includes(reflectionModuleMarker));
+    assert.ok(reflectionModules.length > 0, `${kind}: opting into reflections did not load its separate implementation`);
     const cleared = await page.evaluate(() => strataTest.exerciseScene(null));
     assert.equal(cleared.metrics.dispatchCalls, 0);
+    assert.equal(cleared.telemetry.allocatedGpuBufferBytes, 0);
     assert.equal(cleared.telemetry.allocatedGpuTextureBytes, 0);
+    assert.equal(cleared.telemetry.reflections, undefined);
     assert.equal((await page.evaluate(() => strataTest.dispose())).workers, 0);
-    console.log(`${kind}: default and diffuse imports skipped GI; opt-in GI loaded ${giModules.length} module(s), rendered, and released its resources`);
+    console.log(`${kind}: default/diffuse skipped GI and reflections; GI skipped reflections; opt-in GI loaded ${giModules.length} module(s) and reflections loaded ${reflectionModules.length} module(s), rendered, and released resources`);
 
     for (const fixture of ['missing', 'corrupt']) {
       const failure = await page.evaluate((wasmUrl) => strataTest.fail({ wasmUrl }), `${url}/__fixtures__/${fixture}.wasm`);
@@ -213,10 +256,14 @@ try {
   }
   const optionalGiFiles = [...files].filter(file => /^dist\/gi-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
   assert.equal(optionalGiFiles.length, 1, 'Packed ESM distribution must contain one separate GI entry chunk');
+  const optionalReflectionFiles = [...files].filter(file => /^dist\/reflection-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
+  assert.equal(optionalReflectionFiles.length, 1, 'Packed ESM distribution must contain one separate reflection entry chunk');
   const archive = join(temporary, packed.filename);
   const indexSource = run('tar', ['-xOf', archive, 'package/dist/index.js'], root);
   assert.ok(indexSource.includes(`import("./${optionalGiFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import the shipped GI chunk');
   assert.equal(indexSource.includes(giModuleMarker), false, 'Package entry must not inline GI implementation code');
+  assert.ok(indexSource.includes(`import("./${optionalReflectionFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import the shipped reflection chunk');
+  assert.equal(indexSource.includes(reflectionModuleMarker), false, 'Package entry must not inline reflection implementation code');
   const manifest = JSON.parse(run('tar', ['-xOf', archive, 'package/package.json'], root));
   for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
     assert.equal(manifest.scripts?.[lifecycle], undefined, `Consumers must not need a ${lifecycle} build`);

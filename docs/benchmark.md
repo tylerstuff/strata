@@ -59,3 +59,20 @@ The three additional named compute passes are `gi-trace`, `gi-update` and `gi-sh
 `npm run test:gi` runs the exact BVH/SDF comparison, cache tests and rendered offscreen/door/light validation. `npm run test:gi -- --measure` runs an isolated hardware representation microbenchmark with named ray distributions; its timings do not establish total-frame GI cost. CI runs functional validation only and uploads no raw GI evidence.
 
 Smoke mode allows a bounded 30-second final timestamp flush for software adapters; performance mode retains the five-second deadline. The flush occurs after measurement. The small-resolution GI validation harness separately checks 240-frame convergence; full-resolution smoke screenshots check package/render/report operation only.
+
+
+## Selective reflections
+
+Run the same selected-mirror fixture with the three modes, preserving GI/TAA/camera and all quality settings:
+
+```sh
+npm run benchmark -- --renderer reflections --reflections off --require-ac-performance
+npm run benchmark -- --renderer reflections --reflections probe-only --require-ac-performance
+npm run benchmark -- --renderer reflections --reflections world --require-ac-performance
+```
+
+Defaults are receiver camera, static lighting, GI/TAA enabled, 156 source triangles, quarter-width/quarter-height reflections, 32,768 candidate rays per frame, roughness 0.08, distance 16 m and every-frame tracing. Options are `--reflection-scale 0.25|0.5|1`, `--reflection-rays 1..131072`, `--roughness 0..0.35`, `--reflection-distance 1..32` and `--reflection-update 1..4`. The ordinary GI controls and `--gi-scenario door-light` also apply. Object offset stays zero in this benchmark; separate functional tests exercise movement, camera cuts, disocclusion and roughness changes.
+
+The world path records `reflection-trace` and `reflection-resolve` between raster and shared composition. An empty or skipped trace update still records its timing pass, with zero trace dispatches. Other modes skip both passes. The report preserves the configured and actual scheduled candidate ceilings; unread GPU hit/failure/history counts remain null. A candidate slot can fail the material mask and issue no ray, so its count is not measured ray throughput. Source view is green for a fresh represented-world hit, orange for history, blue for the probe approximation, magenta for exhaustion and black for none. `probe-only` is a low-frequency approximation, not evidence of sharp reflections.
+
+Reflection allocations are 512 buffer bytes plus 88 bytes per low-resolution pixel. Fresh never-world off/probe-only scenes have only 1×1 placeholders; disabling a previously active cache retains its history allocation. Shared trace/probe/composition memory is counted once in total allocations. See [the reflection guide](reflections.md) for the complete layout and limitations. The final screenshot is outside measurement: 240 held-time submissions with GI enabled, 32 for reflections with GI disabled, and 8 in smoke mode. Smoke is not a convergence or performance result.

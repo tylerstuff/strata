@@ -1,9 +1,11 @@
 import type { CameraFrame } from './raster-math.js';
-import type { RasterControls, RasterOutputs, RasterTimestamps } from './raster-types.js';
+import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from './raster-types.js';
 
 /** GI ownership stays separate from geometry and from screen temporal history. */
 export interface RasterGiProvider {
   readonly active: boolean;
+  readonly preparePassNames?: readonly RasterPassName[];
+  readonly composePassNames?: readonly RasterPassName[];
   readonly gpuBufferBytes: number;
   readonly gpuTextureBytes: number;
   readonly initialUploadBytes: number;

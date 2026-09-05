@@ -35,17 +35,20 @@
   <body>
     <header>
       <h1>Strata / Renderer</h1>
-      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option><option value="virtual">Cooked terrain</option><option value="gi">World-space GI · two rooms</option></select>
+      <select id="renderer" aria-label="Renderer"><option value="diffuse">Diffuse baseline</option><option value="raster">PBR + shadows</option><option value="virtual">Cooked terrain</option><option value="gi">World-space GI · two rooms</option><option value="reflections">Selective reflections · mirror</option></select>
       <select id="debug" aria-label="Rendering view">
         <option value="final">Final</option>
-        <optgroup label="Scene views" data-renderers="raster virtual gi">
+        <optgroup label="Scene views" data-renderers="raster virtual gi reflections">
           <option value="direct">Direct light</option><option value="shadow">Shadows</option><option value="depth">Depth</option><option value="normal">Normals</option><option value="motion">Motion</option><option value="material">Materials</option>
         </optgroup>
         <optgroup label="Terrain views" data-renderers="virtual">
           <option value="clusters">Clusters</option><option value="lod">LOD</option><option value="residency">Residency</option><option value="coverage">Coverage</option>
         </optgroup>
-        <optgroup label="Global illumination views" data-renderers="gi">
+        <optgroup label="Global illumination views" data-renderers="gi reflections">
           <option value="indirect">Indirect light only · ×20 display</option><option value="trace">Tracing geometry</option><option value="probe-age">Probe freshness</option><option value="probe-irradiance">Probe irradiance</option><option value="probe-visibility">Probe visibility</option>
+        </optgroup>
+        <optgroup label="Reflection views" data-renderers="reflections">
+          <option value="reflections">Reflections only</option><option value="reflection-source">Reflection source</option>
         </optgroup>
       </select>
       <label><input id="temporal" type="checkbox" checked> Temporal AA</label>
@@ -78,6 +81,18 @@
         </div>
         <p id="gi-budget-note">2,048 primary rays and up to 2,048 shadow rays per frame. A complete probe sweep takes 12 frames.</p>
       </details>
+    </section>
+    <section id="reflection-controls" class="settings-panel" aria-label="Reflection settings" hidden>
+      <div class="settings-row">
+        <label>Reflections<select id="reflection-mode"><option value="world">World tracing</option><option value="probe-only">Probe approximation</option><option value="off">Off</option></select></label>
+        <label>Reflection resolution<select id="reflection-scale"><option value="0.25">Quarter width and height</option><option value="0.5">Half width and height</option><option value="1">Full resolution</option></select></label>
+        <label>Roughness<select id="reflection-roughness"><option value="0">Mirror · 0</option><option value="0.08" selected>Glossy · 0.08</option><option value="0.2">0.2</option><option value="0.35">0.35</option></select></label>
+        <label>Maximum rays per frame<select id="reflection-rays"><option value="8192">8,192</option><option value="32768" selected>32,768</option><option value="131072">131,072</option></select></label>
+        <label>Ray distance<select id="reflection-distance"><option value="1">1 m · fallback comparison</option><option value="8">8 m</option><option value="16" selected>16 m</option><option value="32">32 m</option></select></label>
+        <label>Trace frequency<select id="reflection-update"><option value="1">Every frame</option><option value="2">Every second frame</option><option value="4">Every fourth frame</option></select></label>
+      </div>
+      <p>A selected floor mirror reflects an object outside the receiver camera. Probe approximation supplies low-frequency lighting and cannot reproduce its sharp image.</p>
+      <p>Source view: green = fresh world hit, orange = reused history, blue = probe fallback, magenta = traversal exhaustion, black = no reflection. These runs hold the object fixed; separate validation exercises motion and history rejection.</p>
     </section>
     <details id="geometry" class="settings-panel" hidden>
       <summary>Cooked terrain settings</summary>

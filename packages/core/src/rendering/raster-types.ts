@@ -2,11 +2,11 @@
 export interface RasterControls {
   temporal?: boolean;
   debugView?: 'final' | 'direct' | 'shadow' | 'depth' | 'normal' | 'motion' | 'material' | 'clusters' | 'lod' | 'residency' | 'coverage'
-    | 'indirect' | 'trace' | 'probe-age' | 'probe-irradiance' | 'probe-visibility';
+    | 'indirect' | 'trace' | 'probe-age' | 'probe-irradiance' | 'probe-visibility' | 'reflections' | 'reflection-source';
   cameraCut?: boolean;
 }
 
-export type RasterPassName = 'selection' | 'shadow' | 'raster' | 'temporal' | 'presentation' | 'gi-trace' | 'gi-update' | 'gi-shade';
+export type RasterPassName = 'selection' | 'shadow' | 'raster' | 'temporal' | 'presentation' | 'gi-trace' | 'gi-update' | 'gi-shade' | 'reflection-trace' | 'reflection-resolve';
 export type RasterTimestamps = Partial<Record<RasterPassName, GPURenderPassTimestampWrites>>;
 
 /**

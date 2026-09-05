@@ -6,4 +6,5 @@ export type {
   FrameMetrics, GpuTiming, ProceduralSceneOptions, RasterControls, RenderOptions,
   SceneOptions, VirtualSceneOptions, GeometryTelemetry, GeometryMode,
   GiSceneOptions, GiControls, GiTelemetry,
+  ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, ReflectionMode,
 } from './types.js';

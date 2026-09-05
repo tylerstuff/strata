@@ -1,6 +1,6 @@
 # Runtime foundation
 
-The package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, diffuse/PBR rendering, bounded static-terrain streaming, experimental two-room world-space GI, CPU/GPU telemetry, physical-pixel resizing, and disposal. General imported virtual geometry, integrated lighting, reflections, game systems and the editor remain planned. See [the raster guide](raster.md), [virtual geometry guide](virtual-geometry.md) and [GI guide](gi.md) for each restricted scene path. The final graphics performance target is unverified.
+The package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, diffuse/PBR rendering, bounded static-terrain streaming, experimental two-room world-space GI and selective reflections, CPU/GPU telemetry, physical-pixel resizing, and disposal. General imported virtual geometry, general integrated lighting, game systems and the editor remain planned. See [the raster guide](raster.md), [virtual geometry guide](virtual-geometry.md), [GI guide](gi.md) and [reflection guide](reflections.md) for each restricted scene path. The final graphics performance target is unverified.
 
 ## Build and run
 
@@ -55,6 +55,8 @@ Initialization failures release partially created resources. A device request th
 
 `engine.info` describes the selected canvas format, enabled features, texture dimension limit, and CPU ABI/linear-memory size. WASM linear-memory bytes are not total browser memory or GPU memory.
 
+`setScene({ renderer: 'reflections', resolutionScale: 0.25, maxRaysPerFrame: 32768 })` creates the shared room plus a selected metallic floor mirror and an offscreen emissive cube. `render({ reflections: { mode: 'world', objectOffset: 0.4, roughness: 0.08 } })` patches persistent reflection/world controls; modes `off` and `probe-only` provide matched baselines. `gi.enabled` independently controls diffuse probe work. Reflection-only and source debug views bypass screen TAA. Object/roughness changes reset world and reflection histories; camera cuts reset screen/specular history while retaining diffuse probes. `FrameMetrics.reflections` and `getTelemetry().reflections` identify budgets, allocations and the source submission. This remains a restricted opaque-scene proof, with no arbitrary scene-authoring API.
+
 ## Device loss and errors
 
 Device loss ends the current engine's usable lifetime. It releases the GPU configuration and CPU worker, changes `state` to `lost`, and prevents further rendering. Strata does not automatically reconstruct resources; the application creates a fresh instance. Explicit disposal changes the state to `disposed`.
@@ -63,7 +65,7 @@ Device loss ends the current engine's usable lifetime. It releases the GPU confi
 
 ## Asset delivery and the CPU boundary
 
-The distribution contains `index.js`, TypeScript declarations, `worker.js`, `strata_runtime.wasm`, and ESM chunks for optional renderers/shared code. Publish or copy the complete `dist` directory: renderer modules load on first use, so copying only `index.js` is insufficient. The default engine/diffuse path does not fetch the GI renderer. Default worker/WASM URLs are module-relative, including when installed as a package. The package is tested through a production Vite build and a plain HTML ES-module import. Other bundlers need equivalent support for dynamic ESM imports, module workers and static `new URL(..., import.meta.url)` assets.
+The distribution contains `index.js`, TypeScript declarations, `worker.js`, `strata_runtime.wasm`, and ESM chunks for optional renderers/shared code. Publish or copy the complete `dist` directory: renderer modules load on first use, so copying only `index.js` is insufficient. The default engine/diffuse path does not fetch the GI or reflection renderer; selecting GI also leaves reflections unloaded. Default worker/WASM URLs are module-relative, including when installed as a package. The package is tested through a production Vite build and a plain HTML ES-module import. Other bundlers need equivalent support for dynamic ESM imports, module workers and static `new URL(..., import.meta.url)` assets.
 
 Keep the worker same-origin with the page. Applications with a custom asset pipeline may set `workerUrl` and `wasmUrl`; relative overrides resolve against the document URL. Preserve the worker/WASM version pairing. A cross-origin WASM URL also needs a CORS response. Serving WASM as `application/wasm` is recommended, but the initial byte-buffer loader does not depend on that MIME type.
 
@@ -91,3 +93,5 @@ Platform references: [WebGPU adapter creation](https://developer.mozilla.org/en-
 Pass `profiling: true` to request optional timestamp queries. An unsupported optional feature falls back to CPU/counter telemetry with an explicit reason in `engine.info.profiling`; explicitly required features never silently fall back. `render` returns per-frame CPU submission time, draw/dispatch/triangle counts, upload bytes and requested GPU buffer/texture bytes. `getTelemetry()` reports cumulative counters, WASM memory, GPU readback drops and uncaptured GPU errors. Uncaptured errors prevent further rendering; dispose and recreate the engine.
 
 `drainGpuTimings()` returns completed `{frameId, pass, gpuMs, startOffsetMs, endOffsetMs}` values without waiting. Offsets are relative to the earliest recorded GPU boundary for that frame and preserve overlapping passes; summing durations does not yield elapsed frame time. Call it regularly to avoid overflowing the bounded result queue. `flushGpuTimings(timeoutMs?)` waits for pending samples only at capture boundaries, with a 5-second default deadline. GPU measurements can be quantized to zero. Missing samples must remain unavailable. Profiling overhead is part of the selected configuration; tracked buffers/textures are not total VRAM. Adapter features, adapter/device limits and available browser adapter strings are preserved in `engine.info`.
+
+The profiler has four asynchronous slots, each supporting up to ten named passes (1,280 bytes of requested resolve/readback buffer payload in total). The default GI + world-reflection + TAA path records nine passes. Unused capacity does not create additional passes or waits.

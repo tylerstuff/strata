@@ -29,7 +29,9 @@ function validateScene(scene: GiSceneData): void {
   if (!scene.boxes.length || scene.boxes.length * 12 > giTraceLimits.triangles || !scene.materials.length || scene.materials.length > 256) invalid('scene exceeds fixed primitive/material limits.');
   scene.materials.forEach((material, id) => {
     if (material.id !== id || material.albedo.some(v => !Number.isFinite(v) || v < 0 || v > 1)
-      || material.emission.some(v => !Number.isFinite(v) || v < 0 || v > 1000) || !Number.isFinite(material.roughness)) invalid('invalid material.');
+      || material.emission.some(v => !Number.isFinite(v) || v < 0 || v > 1000) || !Number.isFinite(material.roughness)
+      || material.roughness < 0 || material.roughness > 1
+      || (material.metallic !== undefined && (!Number.isFinite(material.metallic) || material.metallic < 0 || material.metallic > 1))) invalid('invalid material.');
   });
   scene.boxes.forEach((box, id) => {
     if (box.id !== id || box.center.some(v => !Number.isFinite(v) || Math.abs(v) > 1000)
@@ -119,6 +121,7 @@ export function refitGiTraceData(data: GiTraceData, scene: GiSceneData): void {
   const materials = new DataView(data.materialData);
   scene.materials.forEach((material, id) => {
     setVector(materials, id * 32, material.albedo); materials.setFloat32(id * 32 + 12, material.roughness, true); setVector(materials, id * 32 + 16, material.emission);
+    materials.setFloat32(id * 32 + 28, material.metallic ?? 0, true);
   });
   const uniform = new DataView(data.uniformData);
   setVector(uniform, 0, scene.light.direction); uniform.setFloat32(12, giTraceLimits.epsilon, true);
