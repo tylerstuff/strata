@@ -169,6 +169,10 @@ fn sampleProbeDiagnostics(world: vec3f) -> vec4f {
 fn sampleProbeIrradiance(world: vec3f, normal: vec3f, viewDirection: vec3f) -> vec3f {
   let point = world + normal * giProbeConfig.settings.z + viewDirection * 0.02;
   let grid = (point - giProbeConfig.origin.xyz) / giProbeConfig.origin.w;
+  // Probes are cell centers in a finite volume. A surviving boundary donor
+  // must not extrapolate indoor irradiance onto exterior surfaces: normalizing
+  // its tiny visibility/orientation weight can otherwise restore full energy.
+  if (any(grid < vec3f(-0.5)) || any(grid > vec3f(giProbeConfig.grid.xyz) - vec3f(0.5))) { return vec3f(0.0); }
   let base = vec3i(floor(grid)); let fraction = fract(grid);
   var irradiance = vec3f(0.0); var totalWeight = 0.0;
   for (var corner = 0u; corner < 8u; corner++) {

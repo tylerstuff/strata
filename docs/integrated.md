@@ -42,6 +42,8 @@ The proxy is sampled from the cooker's same analytic heightfield, with a separat
 
 The fixed 384-probe room grid covers the indoor experiment and its immediate boundary. Outdoor diffuse GI is unsupported; there is no outdoor probe clipmap or environment light. Reflection selection remains the one metallic floor slab, one specular bounce and roughness <=0.35. The permanent trace representation keeps offscreen contributors available; it does not make these effects general or photorealistic.
 
+The biased GI lookup is restricted to the closed room sampling volume `[-6,0,-4]` through `[6,4,4]` metres. Queries outside it receive no indoor probe contribution; support can change abruptly when the normal/view bias crosses this boundary. The reproduced north-facing exterior back wall has outside queries and receives no direct sunlight, so it remains dark without an outdoor lighting system. Indoor light leaking through it is a defect, not outdoor GI. The scripted sun-off interval at tour seconds 14–18 also darkens the scene intentionally. The blue background supplies no illumination.
+
 ## Shared rendering and frame accounting
 
 Terrain and room use separate pipelines and geometry bindings inside one shadow pass and one four-attachment raster pass. One frame uniform supplies the same current/previous camera and light matrix to both. A single composition, temporal resolve and presentation process the combined result.
