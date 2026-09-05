@@ -256,7 +256,8 @@ export const importedIndirectBarycentricWitness = {
   colors: [[1, 0, 0], [0, 1, 0], [0, 0, 1]] as const,
   expectedUv: [0.5, 0.25] as const,
   expectedVertexColor: [0.25, 0.5, 0.25] as ReferenceRgb,
-  /** Nearest sample of a known 2x2 source at UV(.5,.25), top-right texel. */
+  /** Nearest sample of a known 3x2 source at UV(.5,.25), upper-middle texel center. */
+  sourceTextureSize: [3, 2] as const,
   sourceSrgbTexel: [128, 64, 192] as const,
   materialFactor: [0.5, 0.75, 0.25] as ReferenceRgb,
   expectedAlbedo: [0.026982562514237408, 0.019226046890266215, 0.03294469535661332] as ReferenceRgb,
