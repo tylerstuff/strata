@@ -1,5 +1,10 @@
 /** Raster foundation controls; the temporal path defaults to enabled. */
 export interface RasterControls {
+  /** Per-render exposure compensation in stops [-16,16], default 0. Positive brightens.
+   * Applies only to tone-mapped presentation; scene-linear lighting and histories are unchanged.
+   * Nonzero values require a raster-based renderer (not clear, diffuse or authored-boxes).
+   */
+  exposureEV?: number;
   temporal?: boolean;
   debugView?: 'final' | 'direct' | 'shadow' | 'depth' | 'normal' | 'motion' | 'material' | 'clusters' | 'lod' | 'residency' | 'coverage'
     | 'indirect' | 'trace' | 'probe-age' | 'probe-irradiance' | 'probe-visibility' | 'reflections' | 'reflection-source';

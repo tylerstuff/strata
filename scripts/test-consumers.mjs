@@ -16,6 +16,8 @@ const giModuleMarker = 'Strata one-bounce software probe trace';
 const reflectionModuleMarker = 'Strata bounded software reflections';
 const authoredModuleMarker = 'Strata authored root boxes direct PBR';
 const integratedModuleMarker = 'Integrated scenes require cooked terrain/proxy URLs';
+const importedModuleMarker = 'Strata imported directional light and explicit fill';
+const gltfModuleMarker = 'glTF source/decoded data exceeds maxSourceBytes.';
 const integratedFixture = join(temporary, 'integrated-fixture');
 let browser;
 const servers = [];
@@ -144,7 +146,7 @@ async function checkConsumer(kind, url) {
     for (let cycle = 0; cycle < 3; cycle++) {
       const initialized = await page.evaluate(() => strataTest.start());
       assert.equal(initialized.state, 'ready');
-      assert.equal(initialized.info.cpu.abiVersion, 1);
+      assert.equal(initialized.info.cpu.abiVersion, 2);
       assert.ok(initialized.info.cpu.memoryBytes >= 65_536);
       assert.equal(initialized.workers, 1);
       assert.equal(initialized.crossOriginIsolated, false);
@@ -169,6 +171,8 @@ async function checkConsumer(kind, url) {
 
     // Dynamic import must remain lazy in both the native ESM package and Vite's production output.
     const defaultModules = await loadedModules();
+    assert.equal(defaultModules.some(module => module.source.includes(importedModuleMarker)), false, `${kind}: default consumer fetched imported rendering`);
+    assert.equal(defaultModules.some(module => module.source.includes(gltfModuleMarker)), false, `${kind}: default consumer fetched glTF parsing`);
     assert.equal(defaultModules.some(module => module.source.includes(authoredModuleMarker)), false, `${kind}: default consumer fetched authored rendering`);
     assert.equal(defaultModules.some(module => module.source.includes(integratedModuleMarker)), false, `${kind}: default consumer fetched integrated geometry`);
     assert.equal(defaultModules.some(module => module.source.includes(giModuleMarker)), false,
@@ -306,7 +310,7 @@ try {
     '--output', integratedFixture, '--tiles', '4', '--cells', '64', '--seed', '1337', '--trace-proxy'], root);
   const [packed] = JSON.parse(run('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temporary], join(root, 'packages', 'core')));
   const files = new Set(packed.files.map((file) => file.path));
-  for (const required of ['dist/index.js', 'dist/index.d.ts', 'dist/worker.js', 'dist/strata_runtime.wasm']) {
+  for (const required of ['dist/index.js', 'dist/index.d.ts', 'dist/gltf.js', 'dist/gltf.d.ts', 'dist/worker.js', 'dist/strata_runtime.wasm']) {
     assert.ok(files.has(required), `Packed package is missing ${required}`);
   }
   const optionalGiFiles = [...files].filter(file => /^dist\/gi-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
@@ -315,6 +319,8 @@ try {
   assert.equal(optionalReflectionFiles.length, 1, 'Packed ESM distribution must contain one separate reflection entry chunk');
   const optionalIntegratedFiles = [...files].filter(file => /^dist\/integrated-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
   assert.equal(optionalIntegratedFiles.length, 1, 'Packed ESM distribution must contain one separate integrated entry chunk');
+  const optionalImportedFiles = [...files].filter(file => /^dist\/imported-renderer-[A-Za-z0-9_-]+\.js$/.test(file));
+  assert.equal(optionalImportedFiles.length, 1, 'Packed distribution must contain a separate imported renderer chunk');
   const archive = join(temporary, packed.filename);
   const indexSource = run('tar', ['-xOf', archive, 'package/dist/index.js'], root);
   assert.ok(indexSource.includes(`import("./${optionalGiFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import the shipped GI chunk');
@@ -323,7 +329,12 @@ try {
   assert.equal(indexSource.includes(reflectionModuleMarker), false, 'Package entry must not inline reflection implementation code');
   assert.ok(indexSource.includes(`import("./${optionalIntegratedFiles[0].slice('dist/'.length)}")`), 'Package entry must dynamically import its integrated chunk');
   assert.equal(indexSource.includes(integratedModuleMarker), false, 'Package entry must not inline integrated geometry');
+  assert.ok(indexSource.includes(`import("./${optionalImportedFiles[0].slice('dist/'.length)}")`), 'Imported renderer must load dynamically');
+  assert.equal(indexSource.includes(importedModuleMarker), false);
+  assert.equal(indexSource.includes(gltfModuleMarker), false);
   const manifest = JSON.parse(run('tar', ['-xOf', archive, 'package/package.json'], root));
+  assert.equal(manifest.exports['./gltf'].import, './dist/gltf.js');
+  assert.equal(manifest.exports['./gltf'].types, './dist/gltf.d.ts');
   for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
     assert.equal(manifest.scripts?.[lifecycle], undefined, `Consumers must not need a ${lifecycle} build`);
   }
@@ -352,6 +363,9 @@ try {
     }
     const api = await import('@strata-engine/core');
     assert.equal(typeof api.createEngine, 'function');
+    assert.equal('loadGltf' in api, false);
+    const gltf = await import('@strata-engine/core/gltf');
+    assert.equal(typeof gltf.loadGltf, 'function');
   `], plain);
   console.log('Packed package: distributable assets, installation without build hooks, consumer TypeScript declarations, and SSR import passed');
 

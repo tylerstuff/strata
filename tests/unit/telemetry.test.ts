@@ -330,7 +330,7 @@ describe('engine telemetry and scene ownership', () => {
     vi.resetAllMocks();
     f = fixture();
     vi.stubGlobal('navigator', { gpu: f.gpu });
-    vi.mocked(initializeCpuRuntime).mockResolvedValue({ info: { abiVersion: 1, memoryBytes: 65536 }, dispose: vi.fn() });
+    vi.mocked(initializeCpuRuntime).mockResolvedValue({ info: { abiVersion: 2, memoryBytes: 65536 }, buildStaticBvh: vi.fn(), waitForStaticBvhIdle: vi.fn(), dispose: vi.fn() });
   });
   afterEach(() => {
     for (const engine of engines.splice(0)) engine.dispose();
@@ -529,7 +529,7 @@ describe('engine telemetry and scene ownership', () => {
   });
 
   it('rejects GPU errors during initialization and releases a late CPU runtime', async () => {
-    const cpu = { info: { abiVersion: 1, memoryBytes: 65536 }, dispose: vi.fn() };
+    const cpu = { info: { abiVersion: 2, memoryBytes: 65536 }, buildStaticBvh: vi.fn(), waitForStaticBvhIdle: vi.fn(), dispose: vi.fn() };
     const wait = deferred<typeof cpu>();
     vi.mocked(initializeCpuRuntime).mockReturnValue(wait.promise);
     const pending = createEngine({ canvas: f.canvas });

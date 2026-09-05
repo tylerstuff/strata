@@ -1,3 +1,4 @@
+import { loadGltf, type LoadGltfOptions } from '@strata-engine/core/gltf';
 import { createEngine, StrataError, SceneCommitError, validateAuthoredBoxScene, validateBoxCamera, validateAuthoredFrameCamera } from '@strata-engine/core';
 import type { BoxSceneDescriptor, BoxCamera, SceneCommitReceipt, SceneOptions, AuthoredFrameMetadata, AuthoredBoxSceneOptions, ReflectionMode, ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode } from '@strata-engine/core';
 
@@ -50,6 +51,13 @@ async function lifecycle() {
     // @ts-expect-error A persistent trace proxy is mandatory for integrated coverage.
     const missingProxy: IntegratedSceneOptions = { renderer: 'integrated', manifestUrl: '/manifest.json' };
     void integratedTelemetry; void missingProxy;
+    const importedOptions: LoadGltfOptions = { maxTextureDimension: 2048, signal: new AbortController().signal };
+    const imported = await loadGltf('/model/scene.gltf', importedOptions);
+    await engine.setScene({ renderer: 'imported', asset: imported });
+    const importedFrame = engine.render({ imported: { camera: { eye: [3, 2, 3], target: [0, 1, 0], verticalFov: 1 },
+      animation: { clipId: imported.clips[0]?.id ?? null, timeSeconds: 0.5, loop: false }, presentation: 'ground' } });
+    const importedTime: number | undefined = importedFrame.imported?.animation.timeSeconds;
+    void importedTime;
     const camera: BoxCamera = { position: [0, 0, 3], rotation: [0, 0, 0, 1],
       projection: { kind: 'perspective', verticalFovRadians: 1, near: 0.1, far: 32 } };
     const boxes: BoxSceneDescriptor = validateAuthoredBoxScene({

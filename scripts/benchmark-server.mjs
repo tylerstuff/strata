@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readGalleryCatalog } from './gallery-catalog.mjs';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const mimeTypes = {
@@ -53,9 +54,39 @@ async function proceduralFixture(root, canonicalRepository) {
   return [directory, paths];
 }
 
+async function proceduralGalleryFixture(root, canonicalRepository) {
+  const directory = await realpath(resolve(root));
+  const temporary = await realpath(tmpdir());
+  if (directory === temporary || !isWithin(temporary, directory) || isWithin(canonicalRepository, directory)) {
+    throw new Error('Gallery fixtures must use a dedicated temporary directory outside the repository.');
+  }
+  const file = await containedFile(directory, 'fixture.json');
+  if (!file || file.size > 4096) throw new Error('A small generated gallery fixture manifest is required.');
+  const manifest = JSON.parse(await readFile(file.path, 'utf8'));
+  const allowed = ['catalog.json', 'green.gltf', 'red.gltf', 'scene.bin'];
+  if (manifest.format !== 'strata-gallery-fixture' || manifest.version !== 1 || manifest.source?.kind !== 'procedural-box-skin-v1'
+    || !Array.isArray(manifest.files) || manifest.files.length !== allowed.length
+    || manifest.files.some(entry => !entry || !allowed.includes(entry.path))
+    || new Set(manifest.files.map(entry => entry.path)).size !== allowed.length) {
+    throw new Error('Only the small generated box-skin gallery fixture may use the procedural gallery route.');
+  }
+  let bytes = 0;
+  for (const entry of manifest.files) {
+    if (!Number.isSafeInteger(entry.byteLength) || entry.byteLength < 1 || entry.byteLength > 65536) {
+      throw new Error('Generated gallery fixture sizes must be bounded.');
+    }
+    const source = await containedFile(directory, entry.path);
+    if (!source || source.size !== entry.byteLength) throw new Error('Generated gallery fixture files must be contained and match declared sizes.');
+    bytes += source.size;
+  }
+  if (bytes > 65536) throw new Error('Generated gallery fixture exceeds the 64 KiB source budget.');
+  return [directory, new Set(['red.gltf', 'green.gltf', 'scene.bin'])];
+}
+
 /** Read-only localhost server. External collections are never copied or exposed to CI. */
-export async function createBenchmarkServer({ port = 0, assetRoot = process.env.STRATA_BENCHMARK_ASSET_DIR, proceduralRoot } = {}) {
+export async function createBenchmarkServer({ port = 0, assetRoot = process.env.STRATA_BENCHMARK_ASSET_DIR, proceduralRoot, galleryFixtureRoot } = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Port must be an integer from 0 to 65535.');
+  if (assetRoot && galleryFixtureRoot) throw new Error('Generated gallery fixtures cannot be combined with an external collection.');
   const canonicalRepository = await realpath(repository);
   let canonicalAssets = null;
   if (assetRoot) {
@@ -72,6 +103,7 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
   const roots = [
     ['/packages/core/dist/', resolve(canonicalRepository, 'packages/core/dist')],
     ['/benchmarks/browser/', resolve(canonicalRepository, 'benchmarks/browser')],
+    ['/gallery/', resolve(canonicalRepository, 'examples/gallery'), new Set(['index.html', 'gallery.css', 'app.js', 'app.js.map'])],
   ];
   // Canonicalizing the allowed roots prevents a symlink in a served file from
   // escaping its own package/fixture directory, including into the repository.
@@ -87,6 +119,12 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
     const [directory, paths] = await proceduralFixture(proceduralRoot, canonicalRepository);
     roots.push(['/procedural-assets/', directory, paths]);
   }
+  let canonicalGalleryFixture = null;
+  if (galleryFixtureRoot) {
+    const [directory, paths] = await proceduralGalleryFixture(galleryFixtureRoot, canonicalRepository);
+    canonicalGalleryFixture = directory;
+    roots.push(['/procedural-gallery-assets/', directory, paths]);
+  }
   let catalogAvailable = false;
   if (canonicalAssets) {
     try { catalogAvailable = Boolean(await containedFile(canonicalAssets, 'catalog.json')); }
@@ -100,9 +138,16 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405);
     try {
       const url = new URL(request.url, 'http://127.0.0.1');
-      const path = decodeURIComponent(url.pathname === '/' ? '/benchmarks/browser/index.html' : url.pathname);
+      const path = decodeURIComponent(url.pathname === '/' ? '/benchmarks/browser/index.html'
+        : url.pathname === '/gallery/' ? '/gallery/index.html' : url.pathname);
       if (path.includes('\0') || path.includes('\\')) return fail(404);
       if (path === '/favicon.ico') return response.writeHead(204, headers).end();
+      if (path === '/api/gallery/catalog') {
+        const body = JSON.stringify(await readGalleryCatalog(canonicalGalleryFixture ?? canonicalAssets, containedFile,
+          canonicalGalleryFixture ? '/procedural-gallery-assets/' : '/external-assets/'));
+        response.writeHead(200, { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+        return response.end(request.method === 'HEAD' ? undefined : body);
+      }
       if (path === '/benchmark-config.json') {
         const body = JSON.stringify({ externalAssets: { available: catalogAvailable, catalogUrl: catalogAvailable ? '/external-assets/catalog.json' : null } });
         response.writeHead(200, { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });

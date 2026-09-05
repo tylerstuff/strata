@@ -1,0 +1,795 @@
+import { createEngine, SceneCommitError, type Engine, type FrameMetrics, type RenderOptions, type SceneCommitReceipt } from '@strata-engine/core';
+import { estimateImportedTextureAllocation, loadGltf, measureImportedPoseBounds, type ImportedSceneOptions } from '@strata-engine/core/gltf';
+import type { GalleryAsset } from './catalog.js';
+import { fitOrbitToBounds, normalizeOrbit, orbitEye, type GalleryOrbit } from './orbit.js';
+import { GalleryMeasurements } from './state.js';
+import { chooseTextureCap, defaultGalleryTextureCap, galleryTextureCaps, type GalleryTextureCap, type TextureCapDecision } from './texture-policy.js';
+export type { GalleryTextureCap } from './texture-policy.js';
+
+type PreparedAsset = Awaited<ReturnType<typeof loadGltf>>;
+type ImportedControls = NonNullable<RenderOptions['imported']>;
+type TextureCandidate = { readonly asset: PreparedAsset; readonly decision: Extract<TextureCapDecision, { status: 'ready' }> };
+interface RetainedProgressiveSelection {
+  readonly requestedModel: GalleryAsset | null;
+  readonly model: GalleryAsset | null;
+  readonly asset: PreparedAsset;
+  readonly receipt: SceneCommitReceipt;
+  readonly textureDecision: TextureCapDecision | null;
+  readonly live: boolean;
+}
+export type GalleryShading = NonNullable<ImportedControls['shading']>;
+export type GallerySceneMode = 'ordinary' | 'progressive';
+export interface GalleryEnvironment {
+  readonly preset: 'off' | 'studio' | 'sky';
+  readonly intensity: number;
+  readonly rotationRadians: number;
+}
+export type GalleryPhase = 'initializing' | 'empty' | 'loading' | 'ready' | 'unsupported' | 'error' | 'disposed';
+export const scenePresets = { 'model-only': 'Model only', ground: 'Ground plane' } as const;
+export const lightingPresets = {
+  studio: { label: 'Soft studio', directionToLight: [0.5, 0.8, 0.7], color: [1, 0.94, 0.86], intensity: 3, ambient: [0.12, 0.14, 0.17], background: [0.055, 0.065, 0.07] },
+  daylight: { label: 'Daylight', directionToLight: [-0.6, 1, 0.4], color: [1, 0.98, 0.9], intensity: 4, ambient: [0.12, 0.17, 0.23], background: [0.36, 0.46, 0.56] },
+  dusk: { label: 'Warm dusk', directionToLight: [0.8, 0.3, -0.4], color: [1, 0.48, 0.2], intensity: 3.5, ambient: [0.05, 0.06, 0.12], background: [0.055, 0.035, 0.065] },
+} as const;
+export const debugViews = { final: 'Final', direct: 'Direct light', shadow: 'Shadow', depth: 'Depth', normal: 'Normals', motion: 'Motion', material: 'Material' } as const;
+export type ScenePreset = keyof typeof scenePresets;
+export type LightingPreset = keyof typeof lightingPresets;
+export type DebugView = keyof typeof debugViews;
+export interface GalleryAnimation {
+  readonly clipId: string | null;
+  readonly timeSeconds: number;
+  readonly loop: boolean;
+  readonly playing: boolean;
+}
+interface PoseFrameIdentity {
+  readonly engineEpoch: number;
+  readonly sceneCommit: SceneCommitReceipt;
+  readonly modelId: string;
+  readonly viewRevision: number;
+  readonly frameId: number;
+  readonly viewport: { readonly width: number; readonly height: number };
+  readonly requestedAnimation: NonNullable<ImportedControls['animation']>;
+  /** Resolved pose from this submitted frame's Core receipt, not delayed telemetry. */
+  readonly animation: NonNullable<ImportedControls['animation']>;
+}
+export interface GalleryPoseFrameReceipt {
+  readonly format: 'strata.gallery.pose-frame';
+  readonly version: 1;
+  readonly source: PoseFrameIdentity;
+  readonly measurement: Awaited<ReturnType<typeof measureImportedPoseBounds>>;
+  readonly applied: PoseFrameIdentity & { readonly orbit: GalleryOrbit };
+}
+
+const limits = { minimumDistance: 0.15, maximumDistance: 50 };
+const verticalFov = .84;
+// An explicit gallery admission budget, passed unchanged to Core. Core owns
+// further BVH, buffer, dispatch and material validation.
+const progressiveOptions = Object.freeze({ maxPixels: 262144 });
+const initialOrbit: GalleryOrbit = { azimuth: 0.55, elevation: 0.24, distance: 4.5, target: [0, 1, 0] };
+const freshAnimation = (): GalleryAnimation => ({ clipId: null, timeSeconds: 0, loop: true, playing: false });
+
+function failure(error: unknown) {
+  return { code: error !== null && typeof error === 'object' && 'code' in error ? String(error.code) : 'GALLERY_FAILED', message: error instanceof Error ? error.message : String(error) };
+}
+function stopped(message: string): Error { return new DOMException(message, 'AbortError'); }
+
+/** Owns one real Strata engine. The gallery does not contain another renderer. */
+export class GalleryRuntime {
+  readonly #canvas: HTMLCanvasElement;
+  readonly #changed: () => void;
+  readonly #measurements = new GalleryMeasurements();
+  #engine: Engine | null = null;
+  #epoch = 0;
+  #phase: GalleryPhase = 'initializing';
+  #error: ReturnType<typeof failure> | null = null;
+  #model: GalleryAsset | null = null;
+  #requestedModel: GalleryAsset | null = null;
+  #asset: PreparedAsset | null = null;
+  #sceneCommit: SceneCommitReceipt | null = null;
+  #viewRevision = 0;
+  #scenePreset: ScenePreset = 'model-only';
+  #lightingPreset: LightingPreset = 'studio';
+  #debugView: DebugView = 'final';
+  #temporal = true;
+  #exposureEV = 0;
+  #sceneMode: GallerySceneMode = 'ordinary';
+  #pendingSceneMode: GallerySceneMode | null = null;
+  #indirectEnabled = true;
+  #liveReadback: Promise<void> | null = null;
+  readonly #idlePending = new Set<{ scene: SceneCommitReceipt }>();
+  #shading: GalleryShading = 'authored';
+  #environment: GalleryEnvironment = { preset: 'off', intensity: 1, rotationRadians: 0 };
+  #textureCap: GalleryTextureCap = defaultGalleryTextureCap;
+  #textureDecision: TextureCapDecision | null = null;
+  #orbit: GalleryOrbit = normalizeOrbit(initialOrbit, limits);
+  #cameraIsFitted = false;
+  #animation: GalleryAnimation = freshAnimation();
+  #live = false;
+  #busy: 'settings' | 'capture' | 'pose-frame' | null = null;
+  #poseFrameJob: { controller: AbortController; stage: 'measuring' | 'submitting' } | null = null;
+  #poseFrame: GalleryPoseFrameReceipt | null = null;
+  #raf: number | null = null;
+  #lastTimestamp: number | null = null;
+  #lastUiTimestamp = 0;
+  #lastFrame: FrameMetrics | null = null;
+  #submittedView: { frameId: number; controls: ImportedControls; exposureEV: number } | null = null;
+  #load: AbortController | null = null;
+  #initialization = new AbortController();
+  #request = 0;
+  // The newest selection may inherit this only while Core still owns its receipt.
+  #selectionRecovery: { request: number; retained: RetainedProgressiveSelection } | null = null;
+  #pendingSize: readonly [number, number] | null = null;
+
+  constructor(canvas: HTMLCanvasElement, changed: () => void) { this.#canvas = canvas; this.#changed = changed; }
+  reportFailure(error: unknown) { this.#fault(error); }
+
+  async initialize(): Promise<void> {
+    try {
+      const engine = await createEngine({ canvas: this.#canvas, profiling: true, signal: this.#initialization.signal, initializationTimeoutMs: 30_000 });
+      if (this.#phase === 'disposed') { engine.dispose(); throw stopped('Gallery was disposed during initialization.'); }
+      this.#engine = engine;
+      this.#epoch += 1;
+      this.#measurements.clear();
+      this.#phase = 'empty';
+      this.#applySize();
+      this.#changed();
+    } catch (error) {
+      if (this.#phase !== 'disposed') {
+        this.#error = failure(error);
+        this.#phase = /WEBGPU|ADAPTER|FEATURE|LIMIT/.test(this.#error.code) ? 'unsupported' : 'error';
+        this.#changed();
+      }
+      throw error;
+    }
+  }
+
+  #identity() { return { engineEpoch: this.#epoch, viewRevision: this.#viewRevision, modelId: this.#model?.id ?? null }; }
+  #ownsRequest(request: number) { return request === this.#request && this.#phase !== 'disposed'; }
+  #healthy(): Engine {
+    if (!this.#engine || this.#phase === 'disposed') throw new Error('The gallery runtime is not available.');
+    const telemetry = this.#engine.getTelemetry();
+    if (this.#engine.state !== 'ready' || telemetry.gpuErrorCount > 0) {
+      const error = new Error(telemetry.lastGpuError ?? `The Strata engine is ${this.#engine.state}. Reload the gallery to recreate it.`);
+      this.#fault(error);
+      throw error;
+    }
+    return this.#engine;
+  }
+  #ready(): Engine {
+    if (this.#phase !== 'ready' || this.#busy) throw new Error('The gallery must be ready and idle for this operation.');
+    return this.#healthy();
+  }
+  #stopFrames() {
+    if (this.#raf !== null) cancelAnimationFrame(this.#raf);
+    this.#raf = null;
+    this.#lastTimestamp = null;
+    this.#measurements.resetCallback();
+  }
+  #fault(error: unknown) {
+    if (this.#phase === 'disposed') return;
+    this.#poseFrameJob?.controller.abort(stopped('The gallery stopped while measuring the pose.'));
+    this.#stopFrames();
+    this.#live = false;
+    this.#error = failure(error);
+    this.#phase = 'error';
+    this.#changed();
+  }
+
+  async selectModel(model: GalleryAsset): Promise<void> {
+    model = structuredClone(model);
+    if (this.#busy && !(this.#busy === 'pose-frame' && this.#poseFrameJob?.stage === 'measuring')) throw new Error('A capture or view change is still settling.');
+    const engine = this.#healthy();
+    const retained: RetainedProgressiveSelection | null = this.#sceneMode === 'progressive' && this.#phase === 'ready' && this.#asset && this.#sceneCommit ? {
+      requestedModel: this.#requestedModel, model: this.#model, asset: this.#asset, receipt: this.#sceneCommit,
+      textureDecision: this.#textureDecision, live: this.#live,
+    } : this.#phase === 'loading' && this.#selectionRecovery && this.#sameScene(engine, this.#selectionRecovery.retained.receipt)
+      ? this.#selectionRecovery.retained : null;
+    if (retained && (model.entryUrl === null || model.unavailableReason !== null)) {
+      throw new Error(model.unavailableReason ?? 'The model entry is unavailable.');
+    }
+    if (this.#poseFrameJob) {
+      this.#poseFrameJob.controller.abort(stopped('Model selection canceled current-pose framing.'));
+      this.#poseFrameJob = null;
+      this.#busy = null;
+    }
+    this.#poseFrame = null;
+    const request = ++this.#request;
+    this.#selectionRecovery = retained ? { request, retained } : null;
+    this.#load?.abort(stopped('A newer model selection superseded this load.'));
+    this.#stopFrames();
+    this.#live = false;
+    this.#requestedModel = model;
+    this.#error = null;
+    if (model.entryUrl === null || model.unavailableReason !== null) {
+      this.#phase = 'unsupported';
+      this.#error = { code: 'GALLERY_ASSET_UNAVAILABLE', message: model.unavailableReason ?? 'The model entry is unavailable.' };
+      this.#changed();
+      throw new Error(this.#error.message);
+    }
+    const load = new AbortController();
+    this.#load = load;
+    const timeout = setTimeout(() => load.abort(new Error('Model loading exceeded 120 seconds.')), 120_000);
+    let sceneReplacementStarted = false;
+    let candidate: TextureCandidate | null = null;
+    let recovery: AbortController | null = null;
+    this.#phase = 'loading';
+    this.#changed();
+    try {
+      if (this.#liveReadback) await this.#liveReadback;
+      if (load.signal.aborted || request !== this.#request) throw load.signal.reason ?? stopped('Model load was superseded.');
+      const loaded = await loadGltf(model.entryUrl, { signal: load.signal, maxTextureDimension: this.#textureCap });
+      if (load.signal.aborted || request !== this.#request) throw load.signal.reason ?? stopped('Model load was superseded.');
+      if (this.#sceneMode === 'progressive') this.#assertProgressiveEligible(loaded);
+      candidate = this.#prepareTexture(loaded, this.#textureCap, this.#healthy());
+      const { asset, decision } = candidate;
+      sceneReplacementStarted = true;
+      const commit = await this.#healthy().setScene(this.#sceneOptions(asset, load.signal, this.#sceneMode));
+      if (load.signal.aborted || request !== this.#request) throw load.signal.reason ?? stopped('Model load was superseded.');
+      if (this.#selectionRecovery?.request === request) this.#selectionRecovery = null;
+      this.#asset = asset;
+      this.#model = model;
+      this.#sceneCommit = commit;
+      this.#textureDecision = decision;
+      this.#assertScene(this.#healthy(), commit);
+      const idle = asset.clips.find(clip => /^(?:idle|f_idle|idle01)$/i.test(clip.name.trim()));
+      this.#animation = idle ? { clipId: idle.id, timeSeconds: 0, loop: true, playing: true } : freshAnimation();
+      // Fit the new rest bounds after applying the actual pending drawing-buffer
+      // dimensions. A previous model's fit/manual state must not affect this load.
+      this.#cameraIsFitted = false;
+      this.#applySize();
+      this.#orbit = this.#fitCamera(this.#canvas.width, this.#canvas.height);
+      this.#cameraIsFitted = true;
+      this.#viewRevision += 1;
+      this.#submit(true);
+      await this.#settleFrames(this.#healthy(), load.signal);
+      if (load.signal.aborted || request !== this.#request) throw load.signal.reason ?? stopped('Model load was superseded.');
+      this.#healthy();
+      this.#phase = 'ready';
+      this.#live = Boolean(idle);
+      this.#changed();
+      this.#schedule();
+    } catch (error) {
+      if (this.#ownsRequest(request)) {
+        if (retained && this.#phase === 'loading' && !(error instanceof SceneCommitError) && engine.state === 'ready'
+          && engine.getTelemetry().gpuErrorCount === 0 && this.#sameScene(engine, retained.receipt)) {
+          this.#requestedModel = retained.requestedModel; this.#model = retained.model; this.#asset = retained.asset;
+          this.#sceneCommit = retained.receipt; this.#textureDecision = retained.textureDecision;
+          this.#live = retained.live; this.#error = null;
+          // A fresh recovery signal still permits newer selections/disposal to
+          // cancel a resize fence, even when the rejected load itself timed out.
+          recovery = new AbortController(); this.#load = recovery;
+          try {
+            if (this.#pendingSize) { this.#applySize(); this.#submit(true); await this.#settleFrames(engine, recovery.signal); }
+            if (!this.#ownsRequest(request) || recovery.signal.aborted) throw stopped('Model recovery was superseded.');
+            this.#assertScene(engine, retained.receipt);
+            this.#phase = 'ready'; this.#changed(); this.#schedule();
+          } catch (recoveryError) { if (this.#ownsRequest(request)) this.#fault(recoveryError); }
+        } else {
+          if (error instanceof SceneCommitError && candidate) {
+            // The new scene is already active even though retiring the old one failed.
+            this.#model = model; this.#asset = candidate.asset; this.#sceneCommit = error.committedScene;
+            this.#textureDecision = candidate.decision;
+          } else if (sceneReplacementStarted) {
+            this.#model = null; this.#asset = null; this.#sceneCommit = null; this.#textureDecision = null;
+          }
+          this.#error = failure(error);
+          this.#phase = /UNSUPPORTED/.test(this.#error.code) ? 'unsupported' : 'error';
+          this.#changed();
+        }
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      if (this.#load === load || this.#load === recovery) this.#load = null;
+      if (this.#selectionRecovery?.request === request) this.#selectionRecovery = null;
+    }
+  }
+
+  #controls(): ImportedControls {
+    const light = lightingPresets[this.#lightingPreset];
+    return {
+      shading: this.#shading,
+      ...(this.#sceneMode === 'progressive' ? { indirect: { enabled: this.#indirectEnabled } } : {}),
+      camera: { eye: orbitEye(this.#orbit), target: this.#orbit.target, verticalFov },
+      lighting: { directionToLight: light.directionToLight, color: light.color, intensity: light.intensity, ambient: this.#sceneMode === 'progressive' ? [0, 0, 0] : light.ambient,
+        // Core retains this requested incident source while excluding raster IBL
+        // for both the enabled and disabled progressive comparison.
+        environment: this.#environment.preset === 'off' ? null : { ...this.#environment, preset: this.#environment.preset } },
+      presentation: this.#scenePreset, background: light.background,
+      animation: { clipId: this.#animation.clipId, timeSeconds: this.#animation.timeSeconds, loop: this.#animation.loop },
+    };
+  }
+  #submit(cameraCut = false): FrameMetrics {
+    const engine = this.#healthy();
+    const controls = this.#controls();
+    const frame = engine.render({ imported: controls, temporal: this.#effectiveTemporal(), debugView: this.#debugView, cameraCut, timeSeconds: this.#animation.timeSeconds, exposureEV: this.#exposureEV });
+    this.#lastFrame = frame;
+    this.#submittedView = { frameId: frame.frameId, controls: structuredClone(controls), exposureEV: this.#exposureEV };
+    this.#measurements.recordFrame(frame, this.#identity());
+    this.#measurements.recordGpuTimings(engine.drainGpuTimings());
+    return frame;
+  }
+  async #settleFrames(engine: Engine, signal?: AbortSignal, collectTimings = false, preserveResizeCamera = false) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await this.#waitForIdle(engine);
+      if (collectTimings) await engine.flushGpuTimings();
+      if (signal?.aborted) throw signal.reason ?? stopped('Model load was canceled.');
+      this.#healthy();
+      if (!this.#pendingSize) return;
+      if (attempt === 3) throw new Error('Viewport kept changing while the gallery was preparing a stable frame.');
+      this.#applySize(preserveResizeCamera);
+      this.#submit(true);
+    }
+  }
+  #effectiveTemporal() { return this.#sceneMode === 'progressive' ? false : this.#temporal; }
+  async #waitForIdle(engine: Engine) {
+    const pending = { scene: engine.getTelemetry().scene.identity };
+    this.#idlePending.add(pending);
+    try { await engine.waitForIdle(); }
+    finally { this.#idlePending.delete(pending); }
+  }
+  #collectLiveCounters(engine: Engine) {
+    const scene = this.#sceneCommit;
+    const pending = this.#waitForIdle(engine);
+    this.#liveReadback = pending;
+    void pending.then(() => {
+      if (this.#liveReadback === pending) this.#liveReadback = null;
+      if (this.#phase !== 'ready' || this.#busy || !this.#sameScene(engine, scene)) return;
+      try {
+        this.#healthy();
+        if (this.#pendingSize) {
+          this.#applySize(); this.#submit(true); this.#collectLiveCounters(engine);
+        } else { this.#changed(); this.#schedule(); }
+      } catch (error) { this.#fault(error); }
+    }, error => {
+      if (this.#liveReadback === pending) this.#liveReadback = null;
+      if (this.#phase !== 'disposed' && this.#sameScene(engine, scene)) this.#fault(error);
+    });
+  }
+  #schedule() {
+    if (!this.#live || this.#phase !== 'ready' || this.#busy || this.#liveReadback || this.#raf !== null || document.hidden) return;
+    this.#raf = requestAnimationFrame(timestamp => {
+      this.#raf = null;
+      try {
+        if (this.#animation.playing && this.#animation.clipId !== null && this.#lastTimestamp !== null) {
+          const clip = this.#asset?.clips.find(item => item.id === this.#animation.clipId);
+          let timeSeconds = this.#animation.timeSeconds + Math.max(0, (timestamp - this.#lastTimestamp) / 1000);
+          if (clip && !this.#animation.loop && timeSeconds >= clip.duration) {
+            timeSeconds = clip.duration;
+            this.#animation = { ...this.#animation, playing: false };
+          } else if (clip && this.#animation.loop) timeSeconds = clip.duration > 0 ? timeSeconds % clip.duration : 0;
+          this.#animation = { ...this.#animation, timeSeconds };
+        }
+        this.#lastTimestamp = timestamp;
+        this.#measurements.recordCallback(timestamp);
+        this.#applySize();
+        this.#submit();
+        if (this.#sceneMode === 'progressive') this.#collectLiveCounters(this.#healthy());
+        else {
+          if (timestamp - this.#lastUiTimestamp >= 150) { this.#lastUiTimestamp = timestamp; this.#changed(); }
+          this.#schedule();
+        }
+      } catch (error) { this.#fault(error); }
+    });
+  }
+  setLive(value: boolean) {
+    this.#ready();
+    if (typeof value !== 'boolean') throw new Error('Live view must be a boolean.');
+    this.#live = value;
+    this.#stopFrames();
+    this.#schedule();
+    this.#changed();
+  }
+  visibilityChanged() { this.#stopFrames(); this.#schedule(); }
+
+  async #change(apply: () => void, cameraCut = true) {
+    const engine = this.#ready();
+    this.#busy = 'settings';
+    this.#stopFrames();
+    this.#changed();
+    try {
+      if (this.#liveReadback) await this.#liveReadback;
+      this.#healthy();
+      apply();
+      this.#viewRevision += 1;
+      this.#applySize();
+      this.#submit(cameraCut);
+      await this.#settleFrames(engine);
+      this.#healthy();
+    } catch (error) { this.#fault(error); throw error; }
+    finally { this.#busy = null; this.#changed(); this.#schedule(); }
+  }
+  async setScenePreset(id: ScenePreset) {
+    if (!Object.hasOwn(scenePresets, id)) throw new Error('Unknown scene preset.');
+    if (this.#sceneMode === 'progressive' && id === 'ground') throw new Error('Progressive lighting supports model-only presentation; return to ordinary mode to use ground.');
+    await this.#change(() => { this.#scenePreset = id; });
+  }
+  async setLightingPreset(id: LightingPreset) {
+    if (!Object.hasOwn(lightingPresets, id)) throw new Error('Unknown lighting preset.');
+    await this.#change(() => { this.#lightingPreset = id; });
+  }
+  async setDebugView(id: DebugView) {
+    if (!Object.hasOwn(debugViews, id)) throw new Error('Unknown debug view.');
+    await this.#change(() => { this.#debugView = id; });
+  }
+  async setTemporal(value: boolean) {
+    if (typeof value !== 'boolean') throw new Error('Temporal anti-aliasing must be a boolean.');
+    if (this.#sceneMode === 'progressive' && value) throw new Error('Progressive lighting requires temporal anti-aliasing off; return to ordinary mode to enable it.');
+    await this.#change(() => { this.#temporal = value; }, true);
+  }
+  async setExposureEV(value: number) {
+    if (!Number.isFinite(value) || value < -16 || value > 16) throw new Error('Exposure EV must be a finite number from -16 to 16.');
+    // Exposure changes presentation only; preserve scene-linear TAA/GI history.
+    await this.#change(() => { this.#exposureEV = value; }, false);
+  }
+  async setShading(value: GalleryShading) {
+    if (value !== 'authored' && value !== 'relit') throw new Error('Shading must be authored or relit.');
+    await this.#change(() => { this.#shading = value; });
+  }
+  async setEnvironment(value: Partial<GalleryEnvironment>) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).some(key => !['preset', 'intensity', 'rotationRadians'].includes(key))) throw new Error('Environment settings must contain only preset, intensity and rotationRadians.');
+    const next = { ...this.#environment, ...value };
+    if (!['off', 'studio', 'sky'].includes(next.preset) || !Number.isFinite(next.intensity) || next.intensity < 0 || next.intensity > 64
+      || !Number.isFinite(next.rotationRadians) || Math.abs(next.rotationRadians) > 1e6) throw new Error('Environment needs off/studio/sky, intensity 0–64, and finite rotation within +/-1e6 radians.');
+    await this.#change(() => { this.#environment = next; });
+  }
+  #prepareTexture(asset: PreparedAsset, cap: GalleryTextureCap, engine: Engine): TextureCandidate {
+    const decision = chooseTextureCap({ requestedCap: cap, estimate: requested => estimateImportedTextureAllocation(asset, {
+      maxTextureDimension: requested, maxTextureDimension2D: Math.min(16384, engine.info.maxTextureDimension2D),
+    }) });
+    if (decision.status !== 'ready') throw Object.assign(new Error('The model exceeds the texture budget at every supported upload cap.'), {
+      code: 'GALLERY_TEXTURE_BUDGET', textureDecision: decision,
+    });
+    // Core keeps CPU data caller-owned. Only replace the upload cap; retain encoded
+    // image bytes, geometry, material references and animation data without refetch.
+    return { asset: Object.freeze({ ...asset, maxTextureDimension: decision.selectedCap }), decision };
+  }
+  #sameScene(engine: Engine, receipt: SceneCommitReceipt | null) {
+    const current = engine.getTelemetry().scene.identity;
+    return receipt !== null && current.sceneGeneration === receipt.sceneGeneration && current.renderer === receipt.renderer
+      && current.sceneId === receipt.sceneId && current.sourceRevision === receipt.sourceRevision;
+  }
+  #assertScene(engine: Engine, receipt: SceneCommitReceipt) {
+    this.#healthy();
+    if (!this.#sameScene(engine, receipt)) throw new Error('The active scene changed while gallery settings were settling.');
+  }
+  #progressiveViewportReason(width: number, height: number, label: string): string | null {
+    return width * height > progressiveOptions.maxPixels
+      ? `${label} viewport ${width}×${height} exceeds the progressive ${progressiveOptions.maxPixels}-pixel budget. Explicitly select 640×360 or 320×180 first.` : null;
+  }
+  #progressiveEligibility(asset = this.#asset) {
+    const reasons: string[] = [];
+    if (!asset) reasons.push('Load a static model before activating progressive lighting.');
+    else {
+      if (asset.rig !== undefined || asset.clips.length > 0 || asset.primitives.some(primitive => primitive.deformation !== undefined)) reasons.push('Progressive lighting requires static geometry without a rig, clips or deformation.');
+      const used = new Set(asset.primitives.map(primitive => primitive.material));
+      if (used.size !== 1) reasons.push('Progressive lighting requires exactly one used material.');
+      else {
+        const material = asset.materials[used.values().next().value!];
+        if (!material || material.alphaMode !== 'OPAQUE' || material.unlit === true) reasons.push('The used source material must be lit and OPAQUE, including in relit mode.');
+      }
+    }
+    if (this.#scenePreset !== 'model-only') reasons.push('Select model-only presentation before activating progressive lighting.');
+    const current = this.#progressiveViewportReason(this.#canvas.width, this.#canvas.height, 'Current');
+    if (current) reasons.push(current);
+    if (this.#pendingSize) {
+      const pending = this.#progressiveViewportReason(this.#pendingSize[0], this.#pendingSize[1], 'Pending');
+      if (pending) reasons.push(pending);
+    }
+    return { eligible: reasons.length === 0, reasons };
+  }
+  #assertProgressiveEligible(asset: PreparedAsset) {
+    const eligibility = this.#progressiveEligibility(asset);
+    if (!eligibility.eligible) throw new Error(eligibility.reasons.join(' '));
+  }
+  #sceneOptions(asset: PreparedAsset, signal: AbortSignal, mode: GallerySceneMode): ImportedSceneOptions {
+    return { renderer: 'imported', asset, signal, ...(mode === 'progressive' ? { indirect: progressiveOptions } : {}) };
+  }
+  async setSceneMode(value: GallerySceneMode) {
+    if (value !== 'ordinary' && value !== 'progressive') throw new Error('Scene mode must be ordinary or progressive.');
+    this.#ready();
+    if (!this.#asset || this.#textureDecision?.status !== 'ready') throw new Error('A loaded model is required to change scene mode.');
+    if (value === 'progressive') this.#assertProgressiveEligible(this.#asset);
+    if (value === this.#sceneMode) return;
+    await this.#recreateScene({ asset: this.#asset, decision: this.#textureDecision }, this.#textureCap, value);
+  }
+  async setIndirectEnabled(value: boolean) {
+    if (typeof value !== 'boolean') throw new Error('Indirect contribution must be a boolean.');
+    if (this.#sceneMode !== 'progressive') throw new Error('Activate progressive scene mode before changing the indirect contribution.');
+    await this.#change(() => { this.#indirectEnabled = value; });
+  }
+  async setTextureCap(value: GalleryTextureCap) {
+    if (!galleryTextureCaps.includes(value)) throw new Error('Gallery texture cap must be 2048, 4096 or 8192.');
+    const engine = this.#ready();
+    if (!this.#asset) throw new Error('A loaded model is required to change the texture cap.');
+    // All estimation and validation happen before stopping playback or changing state.
+    const candidate = this.#prepareTexture(this.#asset, value, engine);
+    await this.#recreateScene(candidate, value, this.#sceneMode);
+  }
+  async #recreateScene(candidate: TextureCandidate, textureCap: GalleryTextureCap, mode: GallerySceneMode) {
+    const engine = this.#ready();
+    if (mode === 'progressive') this.#assertProgressiveEligible(candidate.asset);
+    const previous = this.#sceneCommit, request = ++this.#request;
+    const load = new AbortController();
+    const timeout = setTimeout(() => load.abort(new Error('Scene recreation exceeded 120 seconds.')), 120_000);
+    this.#load = load;
+    this.#pendingSceneMode = mode;
+    this.#busy = 'settings'; this.#stopFrames(); this.#changed();
+    let committed = false;
+    const adopt = (receipt: SceneCommitReceipt) => {
+      this.#asset = candidate.asset; this.#sceneCommit = receipt;
+      this.#textureCap = textureCap; this.#textureDecision = candidate.decision; this.#sceneMode = mode;
+      this.#viewRevision += 1; committed = true;
+    };
+    try {
+      if (this.#liveReadback) await this.#liveReadback;
+      this.#healthy();
+      if (mode === 'progressive') this.#assertProgressiveEligible(candidate.asset);
+      const receipt = await engine.setScene(this.#sceneOptions(candidate.asset, load.signal, mode));
+      if (!this.#ownsRequest(request)) throw stopped('Scene recreation was canceled.');
+      adopt(receipt);
+      this.#assertScene(engine, receipt);
+      if (load.signal.aborted) throw load.signal.reason;
+      this.#applySize(); this.#submit(true);
+      await this.#settleFrames(engine, load.signal);
+      this.#assertScene(engine, receipt);
+    } catch (error) {
+      if (this.#ownsRequest(request)) {
+        if (!committed && error instanceof SceneCommitError) adopt(error.committedScene);
+        if (committed || engine.state !== 'ready' || engine.getTelemetry().gpuErrorCount > 0 || !this.#sameScene(engine, previous)) {
+          this.#fault(error);
+        } else if (this.#pendingSize) {
+          // A failed candidate leaves the old scene active; honor any viewport
+          // change queued during creation before resuming the old view.
+          try { this.#applySize(); this.#submit(true); await this.#settleFrames(engine); }
+          catch (resizeError) { this.#fault(resizeError); }
+        }
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      if (this.#load === load) this.#load = null;
+      this.#pendingSceneMode = null;
+      this.#busy = null; this.#changed(); this.#schedule();
+    }
+  }
+  async setOrbit(value: Partial<GalleryOrbit>) {
+    const next = normalizeOrbit({ ...this.#orbit, ...value }, limits);
+    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = false; this.#poseFrame = null; });
+  }
+  async resetCamera() {
+    const engine = this.#ready();
+    const [width, height] = this.#pendingSize?.map(value => Math.min(engine.info.maxTextureDimension2D, value))
+      ?? [this.#canvas.width, this.#canvas.height];
+    // Reject an impossible fit before mutating an otherwise healthy ready view.
+    const next = this.#fitCamera(width!, height!);
+    await this.#change(() => { this.#orbit = next; this.#cameraIsFitted = true; this.#poseFrame = null; });
+  }
+  async frameCurrentPose(): Promise<GalleryPoseFrameReceipt> {
+    const engine = this.#ready(), prepared = this.#asset, model = this.#model, scene = this.#sceneCommit;
+    const submitted = this.#submittedView, frame = this.#lastFrame;
+    const resolvedAnimation = frame?.imported?.animation;
+    if (!prepared || !model || !scene || !submitted?.controls.animation || !frame || !resolvedAnimation
+      || submitted.frameId !== frame.frameId || engine.getTelemetry().submittedFrames !== frame.frameId
+      || resolvedAnimation.clipId !== submitted.controls.animation.clipId || resolvedAnimation.loop !== submitted.controls.animation.loop
+      || !this.#sameScene(engine, scene) || this.#pendingSize) {
+      throw new Error('Current-pose framing requires a settled submitted model view.');
+    }
+    const source: PoseFrameIdentity = structuredClone({ engineEpoch: this.#epoch, sceneCommit: scene, modelId: model.id,
+      viewRevision: this.#viewRevision, frameId: frame.frameId,
+      viewport: { width: this.#canvas.width, height: this.#canvas.height },
+      requestedAnimation: submitted.controls.animation, animation: resolvedAnimation });
+    const request = this.#request;
+    const playback = { live: this.#live, animation: structuredClone(this.#animation) };
+    const direction = { azimuth: this.#orbit.azimuth, elevation: this.#orbit.elevation };
+    const job = { controller: new AbortController(), stage: 'measuring' as 'measuring' | 'submitting' };
+    const owns = () => this.#poseFrameJob === job && this.#ownsRequest(request);
+    const assertCurrent = (frameId = source.frameId, viewRevision = source.viewRevision, viewport = source.viewport) => {
+      if (!owns()) throw stopped('Current-pose framing was superseded.');
+      job.controller.signal.throwIfAborted();
+      this.#healthy();
+      const pose = this.#lastFrame?.imported?.animation;
+      if (this.#phase !== 'ready' || this.#engine !== engine || this.#epoch !== source.engineEpoch
+        || this.#asset !== prepared || this.#model !== model || !this.#sameScene(engine, source.sceneCommit)
+        || this.#viewRevision !== viewRevision || this.#lastFrame?.frameId !== frameId
+        || this.#submittedView?.frameId !== frameId || engine.getTelemetry().submittedFrames !== frameId
+        || pose?.clipId !== source.animation.clipId || pose?.timeSeconds !== source.animation.timeSeconds || pose?.loop !== source.animation.loop
+        || this.#canvas.width !== viewport.width || this.#canvas.height !== viewport.height || this.#pendingSize) {
+        throw stopped('The submitted view changed while current-pose framing was pending.');
+      }
+    };
+    this.#poseFrameJob = job; this.#busy = 'pose-frame'; this.#stopFrames();
+    let applied = false, initialFencePending = false;
+    try {
+      this.#changed(); assertCurrent();
+      // Fence the already submitted pose without creating a new animation frame.
+      // Progressive live sampling may already own a readback. Let it settle
+      // before starting this action's tracked fence or resetting the camera.
+      initialFencePending = true;
+      if (this.#liveReadback) await this.#liveReadback;
+      initialFencePending = false; assertCurrent();
+      initialFencePending = true;
+      await this.#waitForIdle(engine); initialFencePending = false; assertCurrent();
+      const measurement = structuredClone(await measureImportedPoseBounds(prepared, structuredClone(source.animation), { signal: job.controller.signal }));
+      assertCurrent();
+      if (measurement.animation.clipId !== source.animation.clipId || measurement.animation.timeSeconds !== source.animation.timeSeconds
+        || measurement.animation.loop !== source.animation.loop) throw new Error('Measured animation does not match the submitted pose.');
+      const next = fitOrbitToBounds(measurement.bounds, direction, source.viewport.width / source.viewport.height, verticalFov, limits);
+      // No asynchronous boundary separates the final identity check and camera commit.
+      assertCurrent(); job.stage = 'submitting';
+      this.#orbit = next; this.#cameraIsFitted = false; this.#viewRevision += 1; applied = true;
+      this.#submit(true);
+      // A responsive resize after camera application keeps this manual orbit.
+      // The receipt identifies the final fenced frame, including a queued size.
+      await this.#settleFrames(engine, job.controller.signal, false, true);
+      const fittedFrame = this.#lastFrame!, fittedRevision = this.#viewRevision;
+      const viewport = { width: this.#canvas.width, height: this.#canvas.height };
+      assertCurrent(fittedFrame.frameId, fittedRevision, viewport);
+      const receipt: GalleryPoseFrameReceipt = { format: 'strata.gallery.pose-frame', version: 1, source, measurement,
+        applied: { ...structuredClone(source), frameId: fittedFrame.frameId, viewRevision: fittedRevision, viewport, orbit: structuredClone(next) } };
+      this.#poseFrame = structuredClone(receipt);
+      return structuredClone(receipt);
+    } catch (error) {
+      if (owns()) {
+        if (applied || initialFencePending || engine.state !== 'ready' || engine.getTelemetry().gpuErrorCount > 0 || !this.#sameScene(engine, source.sceneCommit)) {
+          this.#fault(error);
+        } else if (this.#phase === 'ready' && this.#pendingSize) {
+          // A responsive resize cancels measurement. Honor it without making the
+          // failed pose-fit action refit the old rest bounds or move the camera.
+          job.stage = 'submitting';
+          try {
+            this.#applySize(true); this.#submit(true);
+            await this.#settleFrames(engine, undefined, false, true);
+            if (owns()) this.#assertScene(engine, source.sceneCommit);
+          } catch (resizeError) { if (owns()) this.#fault(resizeError); }
+        }
+      }
+      // The optional CPU helper wraps cancellation in a StrataError. Preserve
+      // the gallery's AbortError reason so a superseded UI action stays quiet.
+      if (job.controller.signal.aborted && (error as { code?: unknown } | null)?.code === 'SCENE_LOAD_ABORTED') {
+        throw job.controller.signal.reason ?? error;
+      }
+      throw error;
+    } finally {
+      if (owns()) {
+        this.#poseFrameJob = null; this.#busy = null;
+        if (this.#phase === 'ready') { this.#live = playback.live; this.#animation = playback.animation; }
+        // The first resumed callback has no elapsed-job delta.
+        this.#stopFrames(); this.#changed(); this.#schedule();
+      }
+    }
+  }
+  async setAnimation(value: Partial<GalleryAnimation>) {
+    const next = { ...this.#animation, ...value };
+    if (typeof next.loop !== 'boolean' || typeof next.playing !== 'boolean' || !Number.isFinite(next.timeSeconds) || next.timeSeconds < 0) throw new Error('Animation requires nonnegative finite time and boolean playback settings.');
+    if (this.#sceneMode === 'progressive' && (next.clipId !== null || next.timeSeconds !== 0 || next.playing)) throw new Error('Progressive lighting requires the static rest pose; return to ordinary mode for animation.');
+    const clip = this.#asset?.clips.find(item => item.id === next.clipId);
+    if (next.clipId !== null && !clip) throw new Error('The runtime does not expose that animation clip.');
+    if (next.clipId === null) { next.timeSeconds = 0; next.playing = false; }
+    else if (clip) next.timeSeconds = next.loop && clip.duration > 0 ? next.timeSeconds % clip.duration : Math.min(clip.duration, next.timeSeconds);
+    await this.#change(() => { this.#animation = next; if (next.playing) this.#live = true; });
+  }
+
+  resize(width: number, height: number) {
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) throw new Error('Viewport dimensions must be positive integers.');
+    const max = this.#engine?.info.maxTextureDimension2D ?? Infinity;
+    width = Math.min(max, width); height = Math.min(max, height);
+    if (this.#sceneMode === 'progressive' || this.#pendingSceneMode === 'progressive') {
+      const reason = this.#progressiveViewportReason(width, height, 'Requested');
+      if (reason) throw new Error(reason);
+    }
+    if (this.#canvas.width === width && this.#canvas.height === height) { this.#pendingSize = null; return; }
+    if (this.#poseFrameJob) {
+      this.#pendingSize = [width, height];
+      if (this.#poseFrameJob.stage === 'measuring') this.#poseFrameJob.controller.abort(stopped('Viewport resize canceled current-pose framing.'));
+      return;
+    }
+    if (this.#cameraIsFitted && this.#asset) this.#fitCamera(width, height);
+    this.#pendingSize = [width, height];
+    if (!this.#busy && !this.#liveReadback && this.#phase === 'ready') {
+      try {
+        this.#applySize(); this.#submit(true); this.#changed();
+        if (this.#sceneMode === 'progressive') this.#collectLiveCounters(this.#healthy());
+      } catch (error) { this.#fault(error); }
+    }
+  }
+  async setViewport(width: number, height: number) {
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > this.#healthy().info.maxTextureDimension2D || height > this.#healthy().info.maxTextureDimension2D) throw new Error('Viewport dimensions exceed the supported physical pixel range.');
+    if (this.#sceneMode === 'progressive' || this.#pendingSceneMode === 'progressive') {
+      const reason = this.#progressiveViewportReason(width, height, 'Requested');
+      if (reason) throw new Error(reason);
+    }
+    if (this.#cameraIsFitted && this.#asset) this.#fitCamera(width, height);
+    await this.#change(() => { this.#pendingSize = [width, height]; });
+    return this.getState();
+  }
+  #fitCamera(width: number, height: number): GalleryOrbit {
+    if (!this.#asset) throw new Error('A loaded model is required to fit the camera.');
+    return fitOrbitToBounds(this.#asset.bounds, initialOrbit, width / height, verticalFov, limits);
+  }
+  #applySize(preserveCamera = false) {
+    if (!this.#pendingSize || !this.#engine) return;
+    const max = this.#engine.info.maxTextureDimension2D;
+    const [width, height] = this.#pendingSize.map(value => Math.min(max, value)) as [number, number];
+    if (this.#canvas.width === width && this.#canvas.height === height) { this.#pendingSize = null; return; }
+    const fitted = !preserveCamera && this.#cameraIsFitted && this.#asset ? this.#fitCamera(width, height) : null;
+    this.#engine.resize(width, height);
+    this.#pendingSize = null;
+    if (fitted) this.#orbit = fitted;
+    this.#viewRevision += 1;
+  }
+
+  async renderFrames(count = 1) {
+    const engine = this.#ready();
+    if (!Number.isInteger(count) || count < 1 || count > 120) throw new Error('Explicit frames must be an integer from 1 to 120.');
+    this.#busy = 'capture';
+    this.#live = false;
+    this.#animation = { ...this.#animation, playing: false };
+    this.#stopFrames();
+    this.#changed();
+    try {
+      if (this.#liveReadback) await this.#liveReadback;
+      this.#healthy();
+      this.#applySize();
+      for (let index = 0; index < count; index += 1) this.#submit(this.#sceneMode === 'ordinary' && index === 0);
+      await this.#settleFrames(engine, undefined, true);
+      this.#measurements.recordGpuTimings(engine.drainGpuTimings());
+      this.#healthy();
+      const state = this.getState();
+      state.busy = null;
+      return state;
+    } catch (error) { this.#fault(error); throw error; }
+    finally { this.#busy = null; this.#changed(); }
+  }
+  async captureState(frames = 4) {
+    const state = await this.renderFrames(frames);
+    return { format: 'strata.gallery.capture-state', version: 1, capturedAt: new Date().toISOString(), presentedFrameId: null, state };
+  }
+  getState() {
+    if (this.#phase === 'ready' && this.#engine && (this.#engine.state !== 'ready' || this.#engine.getTelemetry().gpuErrorCount > 0)) {
+      this.#fault(new Error(this.#engine.getTelemetry().lastGpuError ?? `The Strata engine is ${this.#engine.state}.`));
+    }
+    const asset = this.#asset;
+    const telemetry = this.#engine?.getTelemetry() ?? null;
+    const indirect = this.#sceneMode === 'progressive' && this.#engine && this.#sameScene(this.#engine, this.#sceneCommit)
+      ? telemetry?.imported?.indirect ?? null : null;
+    const progressiveTelemetry = indirect ? { ...indirect, sampleCounters: !indirect.progress.pendingReset
+      && indirect.sampleCounters?.revision === indirect.progress.revision ? indirect.sampleCounters : null } : null;
+    const result = {
+      format: 'strata.gallery.state', version: 1, phase: this.#phase, error: this.#error,
+      requestedModelId: this.#requestedModel?.id ?? null, modelId: this.#model?.id ?? null,
+      engineEpoch: this.#epoch, sceneCommit: this.#sceneCommit, viewRevision: this.#viewRevision,
+      source: this.#model ? { entryUrl: this.#model.entryUrl, catalogGltfSha256: this.#model.sourceSha256 } : null,
+      asset: asset ? { sourceUrl: asset.sourceUrl, bounds: asset.bounds, sourceBounds: asset.sourceBounds, normalization: asset.normalization, stats: asset.stats, warnings: asset.warnings, maxTextureDimension: asset.maxTextureDimension, clips: asset.clips.map(({ id, name, duration }) => ({ id, name, duration })) } : null,
+      settings: { scenePreset: this.#scenePreset, lightingPreset: this.#lightingPreset, debugView: this.#debugView, orbit: this.#orbit, animation: this.#animation, temporal: this.#effectiveTemporal(), temporalRequested: this.#temporal,
+        sceneMode: this.#sceneMode, indirectEnabled: this.#indirectEnabled, exposureEV: this.#exposureEV,
+        shading: this.#shading, environment: this.#environment, textureCap: this.#textureCap, textureDecision: this.#textureDecision, effective: this.#controls() },
+      live: this.#live, busy: this.#busy, viewport: { width: this.#canvas.width, height: this.#canvas.height },
+      frame: this.#lastFrame, submittedView: this.#submittedView, poseFrame: this.#poseFrame, measurements: this.#measurements.snapshot(this.#identity()),
+      progressive: { maxPixels: progressiveOptions.maxPixels, eligibility: this.#progressiveEligibility(), telemetry: progressiveTelemetry,
+        countersPending: this.#sceneMode === 'progressive' && [...this.#idlePending].some(pending => pending.scene.sceneGeneration === this.#sceneCommit?.sceneGeneration) },
+      telemetry, engineInfo: this.#engine?.info ?? null,
+    };
+    return structuredClone(result);
+  }
+  dispose() {
+    if (this.#phase === 'disposed') return;
+    this.#phase = 'disposed';
+    this.#request += 1;
+    this.#selectionRecovery = null;
+    this.#initialization.abort();
+    this.#load?.abort();
+    this.#poseFrameJob?.controller.abort(stopped('Gallery disposal canceled current-pose framing.'));
+    this.#poseFrameJob = null;
+    if (this.#busy === 'pose-frame') this.#busy = null;
+    this.#poseFrame = null;
+    this.#stopFrames();
+    this.#live = false;
+    this.#engine?.dispose();
+    this.#asset = null;
+    this.#changed();
+  }
+}
+
+export type GalleryState = ReturnType<GalleryRuntime['getState']>;

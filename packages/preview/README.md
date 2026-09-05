@@ -94,6 +94,6 @@ checks visible transform/material edits, input snapshots, same-source commit
 generations, stale tokens, resize, PNG pixels and receipt identities, zero reported
 GPU errors, disposal and CLI output. This is procedural-box correctness evidence,
 not a performance or cross-device determinism claim. The prior workflow passed
-against external Core checkpoint `b17b8ac`; the final browser check after rebasing
-onto merged Core `8ec74f1` remains pending. Captures and reports stay outside the
+against external Core checkpoint `b17b8ac`; the final browser check after updating
+onto integrated Core candidate `ea877dc` remains pending. Captures and reports stay outside the
 repository.

@@ -9,8 +9,8 @@ textures, animation, shadows, temporal accumulation, GI and reflections are
 unsupported. The packed browser workflow checks revision-bound pixels and
 receipts across 14 submitted frames and seven captures. Its
 [prior run passed](https://github.com/tylerstuff/strata/issues/8#issuecomment-5550219762)
-against external Core checkpoint `b17b8ac`; the final browser check after rebasing
-onto merged Core `8ec74f1` is pending. CPU fake-driver checks alone do not prove
+against external Core checkpoint `b17b8ac`; the final browser check after updating
+onto integrated Core candidate `ea877dc` is pending. CPU fake-driver checks alone do not prove
 rendering, browser compatibility, precision or performance.
 
 ## Start a preview
@@ -161,7 +161,7 @@ The browser assertions cover:
 These are bounded correctness checks for procedural boxes, not a numeric PBR
 reference, cross-device determinism guarantee, broad precision test or performance
 result. The earlier 14-frame/seven-capture PASS used external Core `b17b8ac`;
-validation of the final integrated baseline on merged Core `8ec74f1` remains
+validation of the final integrated baseline on Core candidate `ea877dc` remains
 pending. Run the final check without `STRATA_PREVIEW_CORE_ARCHIVE` so it consumes
 the built workspace Core. When testing an external checkpoint, the harness records
 its archive identity separately from the worktree source identity.

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="description" content="A local model gallery for previewing assets in Strata." />
+    <title>Model gallery · Strata</title>
+    <link rel="stylesheet" href="./gallery.css" />
+    <script type="importmap">
+      { "imports": { "@strata-engine/core": "/packages/core/dist/index.js", "@strata-engine/core/gltf": "/packages/core/dist/gltf.js" } }
+    </script>
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#gallery-main">Skip to preview</a>
+
+    <div class="gallery-shell">
+      <aside class="catalog-panel" aria-labelledby="catalog-heading">
+        <div class="brand" aria-label="Strata">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span>strata<span class="brand-period">.</span></span>
+        </div>
+
+        <div class="catalog-heading">
+          <p class="eyebrow">Your collection</p>
+          <h2 id="catalog-heading">Models</h2>
+          <p class="catalog-description">Explore your local assets.</p>
+        </div>
+
+        <nav id="model-list" class="model-list" aria-label="Model catalog">
+          <p class="catalog-placeholder">Loading catalog…</p>
+        </nav>
+
+        <div class="catalog-note">
+          <span class="note-rule" aria-hidden="true"></span>
+          <p>A closer look,<br />one model at a time.</p>
+          <span class="small-label">Local model preview</span>
+        </div>
+      </aside>
+
+      <main id="gallery-main" class="gallery-main">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">Strata / Model gallery</p>
+            <h1 id="model-title">Model gallery</h1>
+            <p id="model-subtitle" class="model-subtitle">Select a local model to begin.</p>
+          </div>
+          <p id="connection-status" class="connection-status" role="status" aria-live="polite">Loading catalog</p>
+        </header>
+
+        <div class="workspace">
+          <section class="preview-panel" aria-label="Model preview">
+            <div class="view-controls" aria-label="Preview settings">
+              <div class="control-field">
+                <label for="scene-preset">Scene</label>
+                <select id="scene-preset" disabled>
+                  <option value="">Loading presets…</option>
+                </select>
+              </div>
+              <div class="control-field">
+                <label for="lighting-preset">Lighting</label>
+                <select id="lighting-preset" disabled>
+                  <option value="">Loading presets…</option>
+                </select>
+              </div>
+              <div class="control-field">
+                <label for="debug-view">View</label>
+                <select id="debug-view" disabled>
+                  <option value="">Loading views…</option>
+                </select>
+              </div>
+              <div class="control-field">
+                <label for="resolution">Render size</label>
+                <select id="resolution" disabled aria-describedby="resolution-status"><option value="fit">Fit viewport (native)</option><option value="320x180">320 × 180 px · preview</option><option value="640x360">640 × 360 px · preview</option><option value="1280x720">1280 × 720 px</option><option value="1920x1080">1920 × 1080 px</option></select>
+              </div>
+            </div>
+
+            <div class="quality-controls" aria-label="Material, environment and texture settings">
+              <div class="control-field">
+                <label for="material-shading">Materials</label>
+                <select id="material-shading" aria-describedby="quality-status" disabled><option value="authored">Authored (source)</option><option value="relit">Relight unlit</option></select>
+              </div>
+              <div class="control-field">
+                <label id="environment-label" for="environment-preset">Distant environment</label>
+                <select id="environment-preset" aria-describedby="quality-status" disabled><option value="off">Off</option><option value="studio">Studio</option><option value="sky">Sky</option></select>
+              </div>
+              <div class="control-field">
+                <label for="texture-cap">Texture cap</label>
+                <select id="texture-cap" disabled><option value="2048">2,048 px</option><option value="4096" selected>4,096 px</option><option value="8192">8,192 px</option></select>
+              </div>
+            </div>
+            <div id="environment-controls" class="environment-controls" hidden>
+              <div class="control-field">
+                <label for="environment-intensity">Environment intensity</label>
+                <input id="environment-intensity" type="number" min="0" max="64" step="0.25" value="1" disabled />
+              </div>
+              <div class="control-field">
+                <label for="environment-rotation">Rotation (degrees)</label>
+                <input id="environment-rotation" type="number" step="15" value="0" disabled />
+              </div>
+            </div>
+            <p id="quality-status" class="quality-note">Source-authored materials. Environment off.</p>
+
+            <div class="exposure-controls" aria-label="Camera brightness">
+              <div class="control-field">
+                <label for="exposure-ev">Exposure compensation (EV)</label>
+                <input id="exposure-ev" type="number" min="-16" max="16" step="0.25" value="0" aria-describedby="exposure-guidance" disabled />
+              </div>
+              <button id="reset-exposure" class="button button-secondary" type="button" disabled>Reset to EV 0</button>
+            </div>
+            <p id="exposure-guidance" class="quality-note">Positive EV brightens the image; negative EV darkens it. Each +1 EV doubles the exposure. EV 0 is the default. Use Final view to compare brightness.</p>
+
+            <details class="progressive-panel">
+              <summary>Static progressive diffuse preview <span id="progressive-mode-label">· off</span></summary>
+              <p class="progressive-note">Accumulates diffuse lighting while the view stays still. For static models with one used lit, opaque material.</p>
+              <div class="progressive-actions">
+                <button id="progressive-mode" class="button button-secondary" type="button" aria-pressed="false" aria-describedby="progressive-guidance" disabled>Start progressive preview</button>
+                <label class="animation-loop-label"><input id="indirect-enabled" type="checkbox" checked disabled />Include indirect lighting</label>
+              </div>
+              <p id="progressive-guidance" class="progressive-note">Choose a model and an explicit small render size to prepare this preview.</p>
+              <div id="progressive-diagnostics" hidden>
+                <p class="progressive-note">GPU sample counters</p>
+                <dl class="progressive-counts">
+                  <div><dt>Attempted</dt><dd id="progressive-attempted">—</dd></div>
+                  <div><dt>Completed</dt><dd id="progressive-completed">—</dd></div>
+                  <div><dt>Exhausted</dt><dd id="progressive-exhausted">—</dd></div>
+                  <div><dt>Invalid</dt><dd id="progressive-invalid">—</dd></div>
+                </dl>
+                <p id="progressive-counter-identity" class="progressive-note"></p>
+                <p id="progressive-counter-status" class="progressive-note"></p>
+              </div>
+            </details>
+
+            <div id="viewport-wrap" class="viewport-wrap">
+              <canvas id="viewport" aria-label="Interactive model preview" aria-describedby="orbit-guidance" tabindex="0">
+                This browser does not support the canvas needed to display a model preview.
+              </canvas>
+              <div class="viewport-label" aria-hidden="true"><span></span>Viewport</div>
+              <p id="stage-status" class="stage-status" role="status" aria-live="polite" aria-atomic="true">Loading catalog</p>
+              <p id="stage-error" class="stage-error" role="alert" hidden></p>
+              <p id="orbit-guidance" class="orbit-guidance"><span>Drag to orbit</span><span>Scroll to zoom</span></p>
+            </div>
+
+            <p id="resolution-status" class="telemetry-note">Measuring display resolution…</p>
+            <div class="preview-toolbar" aria-label="Preview actions">
+              <button id="reset-camera" class="button button-quiet" type="button" disabled>Reset camera</button>
+              <button id="frame-current-pose" class="button button-secondary" type="button" title="Fit the currently submitted model pose once, keeping your viewing direction." disabled>Frame current pose</button>
+              <label class="animation-loop-label"><input id="temporal-aa" type="checkbox" checked disabled />Temporal AA</label>
+              <div class="playback-actions">
+                <button id="toggle-motion" class="button button-secondary" type="button" aria-pressed="false" disabled>Resume live view</button>
+                <button id="render-frame" class="button button-primary" type="button" disabled>Render frame</button>
+              </div>
+            </div>
+
+            <section class="animation-panel" aria-labelledby="animation-heading">
+              <div class="section-heading">
+                <h2 id="animation-heading">Animation</h2>
+              </div>
+              <div class="animation-controls">
+                <div class="control-field animation-clip-field">
+                  <label for="animation-clip">Clip</label>
+                  <select id="animation-clip" aria-describedby="animation-status" disabled>
+                    <option value="">Waiting for runtime…</option>
+                  </select>
+                </div>
+                <button id="animation-play" class="button button-secondary" type="button" aria-pressed="false" disabled>Play animation</button>
+                <label class="animation-loop-label" for="animation-loop"><input id="animation-loop" type="checkbox" disabled />Loop</label>
+              </div>
+              <div class="animation-timeline">
+                <div class="timeline-labels">
+                  <label for="animation-time">Clip time <span class="metric-unit">(seconds)</span></label>
+                  <output id="animation-time-label" for="animation-time" aria-live="off">—</output>
+                </div>
+                <input id="animation-time" type="range" min="0" max="0" step="0.01" value="0" aria-describedby="animation-status" disabled />
+              </div>
+              <p id="animation-status" class="animation-status" role="status" aria-live="polite">Animation support is reported by the runtime.</p>
+            </section>
+
+            <section class="telemetry-panel" aria-labelledby="telemetry-heading">
+              <div class="section-heading">
+                <h2 id="telemetry-heading">Runtime telemetry</h2>
+                <span class="small-label">Current session</span>
+              </div>
+              <dl class="telemetry-grid">
+                <div class="metric"><dt>CPU submission</dt><dd id="metric-cpu">—</dd></div>
+                <div class="metric" title="Asynchronous timestamp sample of measured GPU work; not a complete frame or presented FPS."><dt>Measured GPU span <span class="metric-unit">(ms)</span></dt><dd id="metric-gpu">—</dd></div>
+                <div class="metric"><dt>Callback interval</dt><dd id="metric-cadence">—</dd></div>
+                <div class="metric"><dt>Submitted frame</dt><dd id="metric-frame">—</dd></div>
+                <div class="metric metric-device"><dt>Device</dt><dd id="metric-device">Waiting for runtime</dd></div>
+              </dl>
+              <p class="telemetry-note">CPU submission, measured GPU span and callback interval measure different work. GPU samples arrive asynchronously and may omit work. None measures presented FPS.</p>
+            </section>
+          </section>
+
+          <aside class="inspector-panel" aria-label="About this model">
+            <section class="detail-section">
+              <p class="eyebrow">The asset</p>
+              <h2>Model details</h2>
+              <div id="model-details" class="detail-content"><p>Select a model to view its details.</p></div>
+            </section>
+            <section class="detail-section">
+              <h2>Attribution</h2>
+              <div id="attribution" class="detail-content"><p>Source and creator information will appear here.</p></div>
+            </section>
+            <section class="detail-section limitations-section">
+              <h2>Preview limits</h2>
+              <div id="limitations" class="detail-content"><p>Select a model to see supported features and known limitations.</p></div>
+            </section>
+          </aside>
+        </div>
+
+        <footer class="page-footer">
+          <p id="operation-status" role="status" aria-live="polite" aria-atomic="true">Loading catalog…</p>
+          <span class="footer-caption">Strata · Local preview</span>
+        </footer>
+      </main>
+    </div>
+
+    <noscript><p class="noscript-message">JavaScript is required to load the local catalog and display model previews.</p></noscript>
+  </body>
+</html>
