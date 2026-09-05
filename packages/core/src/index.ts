@@ -8,4 +8,5 @@ export type {
   GiSceneOptions, GiControls, GiTelemetry,
   ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, ReflectionMode,
   IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode,
+  ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip,
 } from './types.js';

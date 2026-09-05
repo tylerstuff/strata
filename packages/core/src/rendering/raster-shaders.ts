@@ -99,8 +99,7 @@ fn shadowVisibility(world: vec3f) -> f32 {
   }
   return visibility / 9.0;
 }
-fn evaluateDirect(base: vec3f, roughness: f32, metallic: f32, n: vec3f, v: vec3f) -> vec3f {
-  let l = normalize(vec3f(0.35, 0.8, 0.4));
+fn evaluateDirectLight(base: vec3f, roughness: f32, metallic: f32, n: vec3f, v: vec3f, l: vec3f, radiance: vec3f) -> vec3f {
   let h = normalize(v + l);
   let nl = max(dot(n, l), 0.0);
   let nv = max(dot(n, v), 0.0001);
@@ -113,7 +112,10 @@ fn evaluateDirect(base: vec3f, roughness: f32, metallic: f32, n: vec3f, v: vec3f
   let f0 = mix(vec3f(0.04), base, metallic);
   let fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
   let diffuse = (1.0 - fresnel) * (1.0 - metallic) * base / 3.14159265;
-  return (diffuse + distribution * visibility * fresnel) * nl * vec3f(4.0, 3.8, 3.5);
+  return (diffuse + distribution * visibility * fresnel) * nl * radiance;
+}
+fn evaluateDirect(base: vec3f, roughness: f32, metallic: f32, n: vec3f, v: vec3f) -> vec3f {
+  return evaluateDirectLight(base, roughness, metallic, n, v, normalize(vec3f(0.35, 0.8, 0.4)), vec3f(4.0, 3.8, 3.5));
 }
 struct GBufferOutput {
   @location(0) hdr: vec4f,

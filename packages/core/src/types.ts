@@ -13,13 +13,17 @@ import type { ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry } 
 export type { IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode } from './integrated/integrated-types.js';
 import type { IntegratedSceneOptions, IntegratedTelemetry } from './integrated/integrated-types.js';
 
-export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions | ReflectionSceneOptions | IntegratedSceneOptions;
+export type { ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip } from './imported/imported-types.js';
+import type { ImportedSceneOptions, ImportedControls, ImportedTelemetry } from './imported/imported-types.js';
+
+export type SceneOptions = ProceduralSceneOptions | VirtualSceneOptions | GiSceneOptions | ReflectionSceneOptions | IntegratedSceneOptions | ImportedSceneOptions;
 
 export interface RenderOptions extends RasterControls {
   /** Deterministic scene time, independent of wall-clock scheduling. */
   timeSeconds?: number;
   gi?: GiControls;
   reflections?: ReflectionControls;
+  imported?: ImportedControls;
 }
 
 export interface CreateEngineOptions {
@@ -84,6 +88,7 @@ export interface FrameMetrics {
   readonly gi?: GiTelemetry;
   readonly reflections?: ReflectionTelemetry;
   readonly integrated?: IntegratedTelemetry;
+  readonly imported?: ImportedTelemetry;
   readonly uploadBytes: number;
   readonly allocatedGpuBufferBytes: number;
   /** Texture payload estimates exclude canvas/driver allocations and alignment. */
@@ -118,6 +123,7 @@ export interface EngineTelemetry {
   readonly gi?: GiTelemetry;
   readonly reflections?: ReflectionTelemetry;
   readonly integrated?: IntegratedTelemetry;
+  readonly imported?: ImportedTelemetry;
 }
 
 export interface Engine {
