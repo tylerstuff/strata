@@ -46,14 +46,14 @@ fn completeLod(lod: u32) -> bool {
   let visible = visibleBox(minimum, maximum);
   let depth = select(nearestDepth(minimum, maximum), 1.0, selectionFrame.settings.w != 0u);
   let firstLod = metadata[record + 8u]; let count = metadata[record + 9u];
-  var desired = count - 1u;
-  if (visible) {
+  // The full-resident reference keeps every shadow caster at finest detail,
+  // including tiles outside the camera frustum. Visibility only culls raster work.
+  var desired = select(count - 1u, 0u, selectionFrame.settings.y != 0u);
+  if (visible && selectionFrame.settings.y == 0u) {
     desired = 0u;
-    if (selectionFrame.settings.y == 0u) {
-      for (var level = i32(count) - 1; level >= 0; level--) {
-        let error = bitcast<f32>(metadata[metadata[5] + (firstLod + u32(level)) * 8u + 4u]);
-        if (error * selectionFrame.parameters.x / depth <= selectionFrame.parameters.y) { desired = u32(level); break; }
-      }
+    for (var level = i32(count) - 1; level >= 0; level--) {
+      let error = bitcast<f32>(metadata[metadata[5] + (firstLod + u32(level)) * 8u + 4u]);
+      if (error * selectionFrame.parameters.x / depth <= selectionFrame.parameters.y) { desired = u32(level); break; }
     }
   }
   var selected = 0xffffffffu;
@@ -85,7 +85,7 @@ var<workgroup> triangleCount: u32;
       let tile = metadata[record + 4u];
       if (selections[tile * 8u + 1u] == metadata[record + 5u]) {
         triangleCount = metadata[record + 3u];
-        // All selected tiles cast shadows; offscreen tiles explicitly retain coarse geometry.
+        // Every selected tile casts shadows; resident-full keeps offscreen detail too.
         shadowBase = atomicAdd(&arguments[4], triangleCount * 3u) / 3u;
         atomicAdd(&arguments[9], 1u);
         if (selections[tile * 8u + 2u] != 0u && visibleBox(vectorAt(record + 8u), vectorAt(record + 12u))) {

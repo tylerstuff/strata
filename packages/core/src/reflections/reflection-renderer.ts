@@ -28,6 +28,7 @@ export class ReflectionEffect implements RasterGiProvider {
   giEnabled = true;
   controls: NormalizedReflectionControls;
   private revision = 1;
+  private diffuseInvalidationRevision = 1;
   private frames = 0;
   private traceDirty = false;
   private resetPending = false;
@@ -78,6 +79,7 @@ export class ReflectionEffect implements RasterGiProvider {
   get composePassNames(): readonly RasterPassName[] { return [...(this.controls.mode === 'world' ? ['reflection-trace', 'reflection-resolve'] as const : []), 'gi-shade']; }
   get giTelemetry(): GiTelemetry {
     return { ...this.probeCache.telemetry, enabled: this.giEnabled, worldRevision: this.revision,
+      objectMotionRollingRefresh: true,
       doorOpen: this.scene.state.doorOpen, wallColor: this.scene.state.wallColor, lightIntensity: this.scene.state.lightIntensity,
       traceRepresentation: 'triangle-bvh-v1', traceGeometryBytes: this.traceData.gpuBufferBytes,
       cacheBufferBytes: this.probeCache.gpuBufferBytes, cacheTextureBytes: this.probeCache.gpuTextureBytes,
@@ -106,13 +108,16 @@ export class ReflectionEffect implements RasterGiProvider {
   update(input: Controls): boolean {
     validateGiControls(input.gi); const controls = this.mergedControls(input.reflections); const gi = input.gi ?? {};
     const state = this.scene.state;
-    const changed = (gi.doorOpen !== undefined && gi.doorOpen !== state.doorOpen)
+    const hardChanged = (gi.doorOpen !== undefined && gi.doorOpen !== state.doorOpen)
       || (gi.wallColor !== undefined && gi.wallColor !== state.wallColor)
       || (gi.lightIntensity !== undefined && gi.lightIntensity !== state.lightIntensity)
-      || controls.objectOffset !== state.objectOffset || controls.roughness !== state.roughness;
+      || controls.roughness !== state.roughness;
+    const changed = hardChanged || controls.objectOffset !== state.objectOffset;
     const giEnabled = gi.enabled ?? this.giEnabled; const toggled = giEnabled !== this.giEnabled;
     const resetWorld = changed || gi.resetCache || (toggled && giEnabled);
+    const resetDiffuse = hardChanged || gi.resetCache || (toggled && giEnabled);
     if (resetWorld && this.revision === 0xffffffff) throw new StrataError('UNSUPPORTED_LIMIT', 'Reflection world revisions exhausted; recreate the scene.');
+    if (resetDiffuse && this.diffuseInvalidationRevision === 0xffffffff) throw new StrataError('UNSUPPORTED_LIMIT', 'Diffuse invalidation revisions exhausted; recreate the scene.');
     const settingsChanged = Object.entries(controls).some(([key, value]) => key !== 'resetHistory' && value !== this.controls[key as keyof NormalizedReflectionControls]);
     if (changed) {
       const next = this.sceneFactory({ doorOpen: gi.doorOpen ?? state.doorOpen,
@@ -121,6 +126,9 @@ export class ReflectionEffect implements RasterGiProvider {
       refitGiTraceData(this.traceData, next); this.scene = next; this.traceDirty = true;
     }
     if (resetWorld) this.revision++;
+    // A rigid object's continuous motion refits tracing and resets reflection/TAA history,
+    // but diffuse probes refresh on their bounded cycle instead of starving at frontier zero.
+    if (resetDiffuse) this.diffuseInvalidationRevision++;
     this.controls = controls; this.giEnabled = giEnabled;
     this.resetPending ||= Boolean(resetWorld || toggled || settingsChanged || input.cameraCut || controls.resetHistory);
     return Boolean(resetWorld || toggled || settingsChanged || controls.resetHistory);
@@ -132,7 +140,7 @@ export class ReflectionEffect implements RasterGiProvider {
       uploadBytes += this.traceData.gpuBufferBytes; this.traceDirty = false;
     }
     if (!this.giEnabled) { this.pendingProbes = this.probeCache.bindings; return { uploadBytes, dispatchCalls: 0 }; }
-    const result = this.probeCache.encode(encoder, { revision: this.revision, frameIndex: this.frames,
+    const result = this.probeCache.encode(encoder, { revision: this.revision, invalidationRevision: this.diffuseInvalidationRevision, frameIndex: this.frames,
       timestamps: { ...(timestamps['gi-trace'] ? { trace: timestamps['gi-trace'] } : {}), ...(timestamps['gi-update'] ? { update: timestamps['gi-update'] } : {}) },
     });
     this.pendingProbes = result.bindings;

@@ -24,7 +24,7 @@ Each tile has complete LODs whose finest boundary vertices and edges agree exact
 
 The GPU calculates tile visibility and projected approximation error, selects a complete resident level, culls clusters, and compacts triangle references for two indirect draws. The hardware rasterizer pulls actual positions, normals and UVs from the page pool. There is one indirect geometry draw for the main view and one for shadows, regardless of cluster count. Two dispatches share the `selection` timing pass. Depth, materials, normals and motion use the existing PBR intermediate targets, followed by temporal resolve and presentation.
 
-Visible tiles cast shadows at their selected level. Offscreen tiles retain coarse shadow geometry. This deliberately preserves offscreen casters but approximates their shape; it is not a separate shadow error hierarchy. All comparison modes use this policy. A tile changing LOD invalidates its previous-depth history for temporal rejection. Camera cuts, failed submissions, resize and temporal changes also reset the appropriate history.
+Visible tiles cast shadows at their selected level. In `streamed`, `resident-lod` and `mesh-lod`, offscreen tiles retain coarse shadow geometry. This deliberately preserves offscreen casters but approximates their shape; it is not a separate shadow error hierarchy. `resident-full` instead keeps every tile at finest detail for shadows, including tiles outside the camera frustum, so it provides a stable full-geometry reference. Camera visibility only culls its main-view work. A tile changing LOD invalidates its previous-depth history for temporal rejection. Camera cuts, failed submissions, resize and temporal changes also reset the appropriate history.
 
 ## Residency and traffic
 
@@ -42,7 +42,7 @@ The geometry pool is only one part of GPU memory. Metadata, page mappings, trian
 | --- | --- |
 | `streamed` | Fixed page pool, asynchronous demand/loading/eviction, GPU selection and indirect submission. |
 | `resident-lod` | Preload all pages, retaining the GPU LOD path to isolate the cost of streaming. |
-| `resident-full` | Preload all pages and select finest visible geometry, retaining coarse offscreen shadows. |
+| `resident-full` | Preload all pages and select finest geometry for every shadow caster; cull camera-invisible geometry only from the main view. |
 | `mesh-lod` | Conventional indexed mesh buffers, CPU tile LOD selection and one indexed draw per tile. |
 
 The conventional path repacks all source pages into vertex/index buffers at startup and retains no GPU page pool. It reports its packed allocation and temporary CPU packing/staging separately. It culls whole tiles; the GPU path additionally culls clusters inside visible tiles. This is a useful conventional reference, not identical submission work: the results must report that difference as well as timing and memory.
@@ -52,6 +52,10 @@ The conventional path repacks all source pages into vertex/index buffers at star
 GPU counters are delayed. Their `sourceFrameId` explicitly identifies the measured submission, and `triangleCountSourceFrameId` labels the geometry contribution to the frame's triangle count. Fullscreen pass triangles are included in the total. Before the first feedback arrives, the source ID is null and GPU counts are unavailable. Timestamp and geometry readbacks use bounded rings and never block the frame loop. `flushGpuTimings()` also drains outstanding geometry feedback after a capture; it does not wait for all asset requests.
 
 ## Local measurements
+
+The resident-full offscreen fix is a prerequisite for the terrain-stability work in [#13](https://github.com/tylerstuff/strata/issues/13), not a resolution of streamed surface popping. Its browser regression runs production GPU selection, compaction, vertex pulling and shadow filtering against independently decoded ordinary finest/coarse vertex buffers. On the generated 4×4-tile, 32-cell fixture, all 32,768 finest shadow triangles remain across visible → offscreen → visible camera changes while main-view triangles change 32,768 → 0 → 32,768. Shadow depth maps match the independent finest reference exactly, and the receiver remains fully shadowed; using the 2,048-triangle coarse surface makes that receiver fully lit.
+
+Hardware Chrome and SwiftShader passed this regression on 2026-09-05, with raw reports and shadow images retained locally under `~/Downloads/Strata-Benchmark-Results/2026-09-05T04-31-39.276Z-geometry-validation` and `2026-09-05T04-32-11.826Z-geometry-validation`. The pre-fix shader failed the new offscreen finest-shadow count assertion (`2026-09-05T04-32-35.478Z-geometry-validation`), confirming the test detects the original error. These are functional results, not performance measurements; streamed budgets and other modes are unchanged. Earlier resident-full benchmark reports retain their original coarse-offscreen policy and must not be presented as measurements of the corrected reference.
 
 The [M2 comparison](benchmarks/2026-09-05-m2-geometry.md) records the first matched conventional/resident/streamed runs. Streaming lowers tracked buffer memory and CPU submission cost, but increases the sum of overlapping GPU pass intervals and misses requested detail in 16.47% of sampled frames. Complete coarse coverage is validated separately from refinement quality.
 

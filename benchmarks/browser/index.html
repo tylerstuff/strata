@@ -92,7 +92,7 @@
         <label>Trace frequency<select id="reflection-update"><option value="1">Every frame</option><option value="2">Every second frame</option><option value="4">Every fourth frame</option></select></label>
       </div>
       <p>A selected floor mirror reflects an object outside the receiver camera. Probe approximation supplies low-frequency lighting and cannot reproduce its sharp image.</p>
-      <p>Source view: green = fresh world hit, orange = reused history, blue = probe fallback, magenta = traversal exhaustion, black = no reflection.</p>
+      <p>Source view: green = fresh world hit, orange = accumulated/reused history, cyan = completed bounded-world miss, blue = probe fallback, magenta = traversal exhaustion, black = no reflection or a zero-contribution sample.</p>
       <p id="reflection-motion-note">Mirror runs hold the object fixed; the integrated courtyard includes object motion.</p>
     </section>
     <details id="geometry" class="settings-panel" hidden>

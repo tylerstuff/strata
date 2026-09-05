@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ReflectionCache, reflectionCacheLayout } from '../../packages/core/src/reflections/reflection-cache.js';
 import type { ReflectionFrame, ReflectionCacheOptions } from '../../packages/core/src/reflections/reflection-cache.js';
-import { acceptsReflectionHistory, normalizeReflectionControls, reflectionCandidateRegion, reflectionFresnel, sampleReflectionDirection } from '../../packages/core/src/reflections/reflection-reference.js';
+import { acceptsReflectionHistory, accumulateReflectionSample, reflectionSources, normalizeReflectionControls, reflectionCandidateRegion, reflectionFresnel, sampleReflectionDirection } from '../../packages/core/src/reflections/reflection-reference.js';
 import type { ReflectionVector } from '../../packages/core/src/reflections/reflection-reference.js';
 import { createGiCamera } from '../../packages/core/src/gi/room-geometry.js';
 import { reflectionSurface } from '../../packages/core/src/reflections/reflection-scene.js';
@@ -75,6 +75,41 @@ describe('reflection estimator and history qualification', () => {
       expect(acceptsReflectionHistory(query, { ...tap, ...patch })).toBe(false);
     }
     expect(acceptsReflectionHistory(query, { ...tap, freshFrame: 6, source: 3 })).toBe(true);
+    expect(acceptsReflectionHistory(query, { ...tap, source: reflectionSources.worldMiss })).toBe(true);
+    for (const patch of [{ epoch: 1 }, { freshFrame: 11 }, { freshFrame: 5 }, { depth: 0 }, { depth: 3.1 },
+      { normal: [1, 0, 0] as const }, { roughness: 0.2 }, { reflector: false }]) {
+      expect(acceptsReflectionHistory(query, { ...tap, source: reflectionSources.worldMiss, ...patch })).toBe(false);
+    }
+  });
+
+  it('averages valid misses with hits without mislabelling mixed estimates as fresh hits', () => {
+    let history: ReflectionVector | undefined;
+    const tail: number[] = [];
+    for (let frame = 0; frame < 240; frame++) {
+      const hit = frame % 2 === 0;
+      const current = { source: hit ? reflectionSources.worldHit : reflectionSources.worldMiss,
+        radiance: [hit ? 1 : 0, 0, 0] as ReflectionVector };
+      const result = accumulateReflectionSample(current, history, 0.08);
+      expect(result.source).toBe(frame ? reflectionSources.history : reflectionSources.worldHit);
+      history = result.radiance;
+      if (frame >= 180) tail.push(result.radiance[0]);
+    }
+    // Closed-form steady alternating EMA, not another implementation of the loop.
+    expect(tail[0]).toBeCloseTo(1 / 1.8, 10);
+    expect(tail[1]).toBeCloseTo(0.8 / 1.8, 10);
+    expect(tail.reduce((sum, value) => sum + value, 0) / tail.length).toBeCloseTo(0.5, 10);
+    expect(Math.max(...tail) - Math.min(...tail)).toBeCloseTo(1 / 9, 10);
+  });
+
+  it('keeps perfect misses zero and refuses fallback/exhaustion accumulation', () => {
+    const history: ReflectionVector = [4, 3, 2];
+    expect(accumulateReflectionSample({ source: reflectionSources.worldMiss, radiance: [0, 0, 0] }, history, 0))
+      .toEqual({ source: reflectionSources.worldMiss, radiance: [0, 0, 0] });
+    for (const source of [reflectionSources.probeFallback, reflectionSources.traversalFailure]) {
+      expect(accumulateReflectionSample({ source, radiance: [0, 0, 0] }, history, 0.08)).toEqual({ source, radiance: [0, 0, 0] });
+    }
+    expect(accumulateReflectionSample({ source: reflectionSources.worldMiss, radiance: [0, 0, 0] }, undefined, 0.08))
+      .toEqual({ source: reflectionSources.worldMiss, radiance: [0, 0, 0] });
   });
 
   it('bounds the projected reflector and handles near-plane crossings conservatively', () => {

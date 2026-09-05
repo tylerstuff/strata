@@ -60,6 +60,7 @@ function validateGiFrame(run, frame, prior, prefix) {
   const composeActive = gi.enabled || (reflections && run.workload.reflectionMode !== 'off');
   const { probesPerUpdate, raysPerProbe } = run.quality;
   const rayBudget = probesPerUpdate * raysPerProbe;
+  const rolling = gi.objectMotionRollingRefresh === true;
   ensure(gi.enabled === run.workload.giEnabled && gi.probesPerUpdate === probesPerUpdate && gi.raysPerProbe === raysPerProbe,
     `${prefix} GI enabled state or probe budget differs from its workload`);
   ensure(gi.primaryRaysPerFrame === (gi.enabled ? rayBudget : 0) && gi.maxShadowRaysPerFrame === (gi.enabled ? rayBudget : 0), `${prefix} GI ray budget is inconsistent`);
@@ -67,6 +68,12 @@ function validateGiFrame(run, frame, prior, prefix) {
   ensure(gi.probeUpdatesSinceReset === gi.framesSinceReset * probesPerUpdate && gi.primaryRaysSubmitted === gi.submittedFrames * rayBudget,
     `${prefix} GI cumulative work counters are inconsistent`);
   ensure(gi.framesSinceReset <= gi.submittedFrames, `${prefix} GI reset age exceeds submitted work`);
+  if ('diffuseInvalidationRevision' in gi) {
+    ensure(gi.maxSampleAgeFrames === gi.updatePeriodFrames - 1
+      && gi.refreshFrontier === (gi.probeUpdatesSinceReset % 384), `${prefix} GI rolling refresh age/frontier is inconsistent`);
+    ensure(gi.enabled ? gi.diffuseInvalidationRevision >= 1 && gi.sampleFrameIndex === frame.frameId - 1
+      : gi.diffuseInvalidationRevision === null && gi.sampleFrameIndex === null, `${prefix} GI diffuse revision/sample provenance is inconsistent`);
+  }
   // Null means the GPU result has not been read. Never turn that absence into a measured zero.
   ensure(gi.traceFailures === null || gi.traceFailures === 0, `${prefix} records GI traversal failures`);
   if (gi.validProbeCount !== null) ensure(gi.validProbeCount <= Math.min(384, gi.probeUpdatesSinceReset), `${prefix} GI valid-probe count exceeds updated coverage`);
@@ -84,18 +91,22 @@ function validateGiFrame(run, frame, prior, prefix) {
   if (integrated) close(frame.reflections.objectOffset, phase >= 2 && phase < 6 ? 0.4 * Math.sin((phase - 2) * Math.PI / 2) : 0, `${prefix} integrated object motion`);
   if (gi.enabled) {
     ensure(gi.sourceFrameId === frame.frameId && gi.submittedFrames === frame.frameId && gi.framesSinceReset >= 1
-      && gi.cacheEpoch === gi.worldRevision, `${prefix} GI cache epoch or source frame is inconsistent`);
+      && gi.cacheEpoch === (rolling ? gi.diffuseInvalidationRevision : gi.worldRevision), `${prefix} GI cache epoch or source frame is inconsistent`);
   } else {
     ensure(gi.sourceFrameId === null && gi.submittedFrames === 0 && gi.framesSinceReset === 0 && gi.cacheEpoch === 0,
       `${prefix} disabled GI reports submitted cache work`);
   }
   if (prior) {
     const previous = prior.gi;
-    const changed = gi.doorOpen !== previous.doorOpen || gi.wallColor !== previous.wallColor || gi.lightIntensity !== previous.lightIntensity
-      || (integrated && frame.reflections.objectOffset !== prior.reflections.objectOffset);
+    const hardChanged = gi.doorOpen !== previous.doorOpen || gi.wallColor !== previous.wallColor || gi.lightIntensity !== previous.lightIntensity;
+    const changed = hardChanged || (integrated && frame.reflections.objectOffset !== prior.reflections.objectOffset);
     ensure(frame.frameId === prior.frameId + 1, `${prefix} GI capture skipped a submitted frame`);
     ensure(gi.worldRevision === previous.worldRevision + Number(changed), `${prefix} GI world revision does not match scene changes`);
-    if (gi.enabled) ensure(gi.framesSinceReset === (changed ? 1 : previous.framesSinceReset + 1), `${prefix} GI cache age did not reset or advance correctly`);
+    if (gi.enabled) {
+      const reset = rolling ? hardChanged : changed;
+      ensure(gi.framesSinceReset === (reset ? 1 : previous.framesSinceReset + 1), `${prefix} GI cache age did not reset or advance correctly`);
+      if (rolling) ensure(gi.diffuseInvalidationRevision === previous.diffuseInvalidationRevision + Number(hardChanged), `${prefix} GI diffuse invalidation does not match hard scene changes`);
+    }
   }
   // Median subdivision with <=4 triangles per leaf: 156 triangles produce 119 nodes.
   const traceBytes = integrated ? 1335 * 32 + 2204 * 64 + 13 * 48 + 6 * 32 + 48 : reflections ? 119 * 32 + 156 * 64 + 13 * 48 + 5 * 32 + 48 : 11392;

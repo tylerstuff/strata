@@ -91,6 +91,7 @@ struct ComposeFrame { inverseViewProjection: mat4x4f, eye: vec4f, settings: vec4
       case 2u: { color = vec3f(0.1, 0.3, 1.0); }
       case 3u: { color = vec3f(1.0, 0.6, 0.1); }
       case 4u: { color = vec3f(1.0, 0.0, 1.0); }
+      case 5u: { color = vec3f(0.0, 0.9, 1.0); }
       default: {}
     }
   }

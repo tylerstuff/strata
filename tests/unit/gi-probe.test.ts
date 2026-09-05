@@ -130,4 +130,45 @@ describe('bounded probe resources and submission state', () => {
     expect([...gpu.buffers, ...gpu.textures].every(resource => resource.destroy.mock.calls.length === 1)).toBe(true);
     expect(probeCacheLayout.grid.reduce((a, b) => a * b, 1)).toBe(384);
   });
+
+  it('covers every probe during continuous soft revisions without committing canceled windows', async () => {
+    const gpu = fixture(); const cache = await gpu.create(); const updates = new Uint32Array(384);
+    const config = () => new Uint32Array((cache.diagnostics.configBuffer as unknown as typeof gpu.buffers[number]).bytes.buffer);
+    for (let frame = 0; frame < 36; frame++) {
+      const input = { revision: frame + 1, invalidationRevision: 1, frameIndex: frame };
+      cache.encode(gpu.encoder, input);
+      if (frame === 15) {
+        const original = [...config().subarray(8, 12)]; cache.cancelFrame();
+        expect(cache.telemetry.sourceFrameId).toBe(15);
+        cache.encode(gpu.encoder, input); expect([...config().subarray(8, 12)]).toEqual(original);
+      }
+      expect([...config().subarray(8, 12)]).toEqual([(frame * 32) % 384, 32, 64, 1]);
+      expect(config()[19]).toBe(12);
+      for (let probe = 0; probe < 32; probe++) updates[(config()[8]! + probe) % 384]!++;
+      cache.submitted(frame + 1);
+      expect(cache.telemetry).toMatchObject({ worldRevision: frame + 1, diffuseInvalidationRevision: 1,
+        cacheEpoch: 1, framesSinceReset: frame + 1, maxSampleAgeFrames: 11, sampleFrameIndex: frame });
+      if (frame % 12 === 11) expect([...updates].every(count => count === (frame + 1) / 12)).toBe(true);
+    }
+    expect(cache.telemetry.refreshFrontier).toBe(0); cache.dispose();
+  });
+
+  it('retains hard invalidation across cancellation and bounds nondivisible refresh cycles', async () => {
+    const gpu = fixture(); const cache = await gpu.create({ probesPerUpdate: 31 });
+    const config = () => new Uint32Array((cache.diagnostics.configBuffer as unknown as typeof gpu.buffers[number]).bytes.buffer);
+    cache.encode(gpu.encoder, { revision: 1, invalidationRevision: 1, frameIndex: 100 }); cache.submitted(1);
+    cache.encode(gpu.encoder, { revision: 2, invalidationRevision: 2, frameIndex: 101 });
+    expect([...config().subarray(8, 12)]).toEqual([0, 31, 64, 2]); cache.cancelFrame();
+    expect(cache.telemetry).toMatchObject({ cacheEpoch: 1, diffuseInvalidationRevision: 1, refreshFrontier: 31 });
+    cache.encode(gpu.encoder, { revision: 3, invalidationRevision: 2, frameIndex: 101 }); cache.submitted(2);
+    expect(cache.telemetry).toMatchObject({ cacheEpoch: 2, diffuseInvalidationRevision: 2, framesSinceReset: 1, maxSampleAgeFrames: 12 });
+    expect(config()[19]).toBe(13);
+    cache.encode(gpu.encoder, { revision: 4, invalidationRevision: 2, frameIndex: 102, reset: true }); cache.submitted(3);
+    expect(cache.telemetry.cacheEpoch).toBe(3);
+    cache.encode(gpu.encoder, { revision: 5, invalidationRevision: 2, frameIndex: 0 }); cache.submitted(4);
+    expect(cache.telemetry).toMatchObject({ cacheEpoch: 4, framesSinceReset: 1, sampleFrameIndex: 0 });
+    for (const invalidationRevision of [-1, 0x100000000, NaN, null]) expect(() => cache.encode(gpu.encoder,
+      { revision: 6, frameIndex: 1, invalidationRevision } as unknown as Parameters<ProbeCache['encode']>[1])).toThrow('uint32');
+    cache.dispose();
+  });
 });

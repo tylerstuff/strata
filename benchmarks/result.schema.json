@@ -478,6 +478,11 @@
         "sourceFrameId": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
         "worldRevision": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "cacheEpoch": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "diffuseInvalidationRevision": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
+        "objectMotionRollingRefresh": { "type": "boolean" },
+        "refreshFrontier": { "type": "integer", "minimum": 0, "maximum": 383 },
+        "maxSampleAgeFrames": { "type": "integer", "minimum": 2, "maximum": 383 },
+        "sampleFrameIndex": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
         "enabled": { "type": "boolean" },
         "probeCount": { "const": 384 },
         "probesPerUpdate": { "type": "integer", "minimum": 1, "maximum": 128 },
@@ -502,6 +507,10 @@
         "cacheTextureBytes": { "type": "integer", "minimum": 0 },
         "composeBufferBytes": { "type": "integer", "minimum": 0 },
         "composeTextureBytes": { "type": "integer", "minimum": 0 }
+      },
+      "dependentRequired": {
+        "diffuseInvalidationRevision": ["refreshFrontier", "maxSampleAgeFrames", "sampleFrameIndex"],
+        "objectMotionRollingRefresh": ["diffuseInvalidationRevision", "refreshFrontier", "maxSampleAgeFrames", "sampleFrameIndex"]
       },
       "additionalProperties": {
         "anyOf": [{ "type": "number" }, { "type": "string" }, { "type": "boolean" }, { "type": "null" }]

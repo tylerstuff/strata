@@ -5,6 +5,7 @@ import { homedir, platform, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { build } from 'esbuild';
 import { createBenchmarkServer } from './benchmark-server.mjs';
 
 const repository = fileURLToPath(new URL('../', import.meta.url));
@@ -25,6 +26,8 @@ try {
   const poolBytes = (roots.size + maxDetailPages) * manifest.pageBytes;
   assert(poolBytes < manifest.pages.length * manifest.pageBytes, 'Fixture must exceed the streamed page pool');
   report.fixture = { source: manifest.source, pages: manifest.pages.length, rootPages: roots.size, poolBytes };
+  const shadowValidation = await build({ absWorkingDir: repository, entryPoints: ['tests/browser/geometry-shadow-validation.ts'],
+    bundle: true, format: 'esm', platform: 'browser', target: 'es2022', write: false });
   server = await createBenchmarkServer({ assetRoot: '', proceduralRoot: fixture });
   const args = ['--enable-unsafe-webgpu'];
   if (process.env.STRATA_TEST_SOFTWARE_GPU === '1') {
@@ -34,6 +37,7 @@ try {
   }
   browser = await chromium.launch({ channel: process.env.STRATA_TEST_BROWSER_CHANNEL ?? 'chromium', headless: process.env.STRATA_TEST_HEADED !== '1', args });
   const page = await browser.newPage({ viewport: { width: 1000, height: 800 }, deviceScaleFactor: 1 });
+  await page.route(`${server.url}/geometry-shadow-validation.js`, route => route.fulfill({ contentType: 'text/javascript', body: shadowValidation.outputFiles[0].text }));
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
@@ -200,6 +204,10 @@ try {
   assert.equal(disposed.active.gpuErrorCount, 0);
   for (const field of ['allocatedGpuBufferBytes', 'allocatedGpuTextureBytes', 'wasmMemoryBytes']) assert.equal(disposed.disposed[field], 0);
   report.results.lifecycle = { frames: lifecycle.length, ...disposed };
+  const shadowResult = await page.evaluate(async () => (await import('/geometry-shadow-validation.js')).validateResidentFullShadows('/procedural-assets/manifest.json'));
+  const { images, ...shadowMetrics } = shadowResult;
+  report.results.residentFullShadowReference = { ...shadowMetrics, images: Object.keys(images).map(name => `shadow-${name}.png`) };
+  for (const [name, dataUrl] of Object.entries(images)) await writeFile(join(directory, `shadow-${name}.png`), Buffer.from(dataUrl.split(',')[1], 'base64'));
   assert.deepEqual(errors, []);
   console.log(`Geometry shaders, complete coverage, streaming, resident modes, source labels, resize, temporal toggles and disposal passed. Local evidence: ${directory}`);
 } catch (error) {

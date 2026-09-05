@@ -1,5 +1,6 @@
 import { giTraceShader } from '../gi/trace-shaders.js';
 import { probeSamplingShader } from '../gi/probe-cache-shaders.js';
+import { reflectionSources } from './reflection-reference.js';
 
 const common = /* wgsl */ `
 struct ReflectionConfig {
@@ -7,12 +8,21 @@ struct ReflectionConfig {
   size: vec4u, frame: vec4u, window: vec4u, settings: vec4f, flags: vec4u, region: vec4u,
 };
 struct ReflectionSample { radiance: vec3f, source: u32, };
+const reflectionWorldMissSource: u32 = ${reflectionSources.worldMiss}u;
+fn reflectionAccumulateFresh(radiance: vec3f, source: u32, history: vec3f, hasHistory: bool, roughness: f32, historyWeight: f32) -> ReflectionSample {
+  if (source != 0u && source != 1u && source != reflectionWorldMissSource) { return ReflectionSample(vec3f(0.0), source); }
+  // The finite represented domain has no environment light. A completed miss is
+  // a valid zero sample, distinct from absent work and traversal exhaustion.
+  let current = select(radiance, vec3f(0.0), source == reflectionWorldMissSource);
+  if (hasHistory && roughness > 0.0) { return ReflectionSample(mix(current, history, historyWeight), 3u); }
+  return ReflectionSample(current, source);
+}
 fn reflectionWorld(uv: vec2f, depth: f32, config: ReflectionConfig) -> vec3f {
   let clip = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), depth, 1.0);
   let point = config.inverseViewProjection * clip; return point.xyz / point.w;
 }
 fn reflectionQualify(metadata: vec4u, previous: vec4f, surface: vec4f, depth: f32, normal: vec3f, roughness: f32, config: ReflectionConfig) -> bool {
-  return metadata.w != 0u && (metadata.x == 0u || metadata.x == 1u || metadata.x == 3u) && metadata.z == config.frame.y && metadata.y <= config.frame.x
+  return metadata.w != 0u && (metadata.x == 0u || metadata.x == 1u || metadata.x == 3u || metadata.x == reflectionWorldMissSource) && metadata.z == config.frame.y && metadata.y <= config.frame.x
     && config.frame.x - metadata.y <= u32(config.settings.w) && depth > 0.0 && previous.a > 0.0
     && abs(previous.a - depth) <= max(0.02, depth * 0.01) && dot(surface.xyz, normal) >= 0.98 && abs(surface.a - roughness) <= 0.005;
 }
@@ -52,6 +62,8 @@ fn reflectionDirection(view: vec3f, normal: vec3f, roughness: f32, random: vec2f
 
 /** Internal test hook: the exact estimator helper compiled by the production trace pipeline. */
 export const reflectionDirectionShader = common;
+/** Exact production accumulation and qualification helpers for small GPU regressions. */
+export const reflectionHistoryShader = common;
 
 export const reflectionTraceShader = common + giTraceShader({ group: 1 }) + probeSamplingShader({ group: 2 }) + /* wgsl */ `
 @group(0) @binding(0) var<uniform> reflectionConfig: ReflectionConfig;
@@ -91,7 +103,7 @@ export const reflectionTraceShader = common + giTraceShader({ group: 1 }) + prob
   let hit = giTraceBvh(ray); atomicAdd(&reflectionStats[1], 1u);
   var color = vec3f(0.0); var kind = 2u;
   if (hit.status == 2u) { kind = 4u; atomicAdd(&reflectionStats[5], 1u); }
-  else if (hit.status == 0u) { atomicAdd(&reflectionStats[4], 1u); }
+  else if (hit.status == 0u) { kind = reflectionWorldMissSource; atomicAdd(&reflectionStats[4], 1u); }
   else {
     atomicAdd(&reflectionStats[3], 1u); kind = 1u;
     let hitMaterial = giMaterials[hit.materialId]; color = hitMaterial.emission;
@@ -154,12 +166,11 @@ export const reflectionResolveShader = common + /* wgsl */ `
     } }
   }
   if (fresh) {
-    kind = rawMeta.x;
-    if (kind == 0u || kind == 1u) {
-      color = textureLoad(reflectionRaw, pixel, 0).rgb;
-      // Perfect mirrors keep current detail. Glossy samples accumulate only qualified surface history.
-      if (accepted > 0.0 && reflectionConfig.settings.x > 0.0) { color = mix(color, accumulated / accepted, reflectionConfig.settings.z); }
-    }
+    // Keep mixed hit/miss estimates explicitly labelled as history. Perfect
+    // mirrors still use only the current sample, including a completed miss.
+    let resolved = reflectionAccumulateFresh(textureLoad(reflectionRaw, pixel, 0).rgb, rawMeta.x,
+      accumulated / max(accepted, 1e-8), accepted > 0.0, reflectionConfig.settings.x, reflectionConfig.settings.z);
+    color = resolved.radiance; kind = resolved.source;
   } else if (accepted > 0.0) {
     color = accumulated / accepted; kind = 3u; freshFrame = oldest; atomicAdd(&reflectionStats[6], 1u);
   }
