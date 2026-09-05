@@ -101,7 +101,7 @@ try {
     }
     report.results.rendered = await page.evaluate(async () => (await import('/benchmarks/browser/gi-validation.js')).validateGiRenderedScene());
     assert.equal(report.results.rendered.failure, undefined, report.results.rendered.failure);
-    console.log('GI rendered validation: cold offscreen color transfer, direct-only baseline, door leakage, light reset, convergence and lifecycle passed.');
+    console.log('GI rendered validation: cold offscreen color transfer, direct-only baseline, door leakage, light reset, finite-window tail-relative stabilization and lifecycle passed; radiometric convergence was not tested.');
     if (process.env.STRATA_TEST_SOFTWARE_GPU !== '1') {
       report.images = [];
       for (const cameraMode of ['receiver', 'overview']) {
