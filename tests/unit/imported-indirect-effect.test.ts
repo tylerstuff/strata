@@ -127,6 +127,15 @@ describe('imported progressive indirect effect ownership and submission', () => 
     const h = gpu(), input = options();
     await expect(ImportedIndirectEffect.create(h.device, { ...input, source: { ...input.source, nodes: new Uint8Array(524288 * 32) } })).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' }); expect(h.buffers).toHaveLength(0);
   });
+  it('admits finite bright emission without reducing its raw estimator uniform', async () => {
+    const g = gpu(), input = options();
+    const effect = await ImportedIndirectEffect.create(g.device, { ...input, material: { ...input.material,
+      emissiveFactor: [1, 0.5, 0.00005], emissiveStrength: 40000 } });
+    encode(effect, g);
+    const data = g.buffers.find(buffer => buffer.label === 'Strata imported indirect frame')!.data;
+    expect([...new Float32Array(data.buffer).subarray(68, 71)]).toEqual([40000, 20000, 2]);
+    effect.dispose();
+  });
   it('cleans a partial initialization and an aborted pipeline wait without touching borrowed materials', async () => {
     const g = gpu(), create = g.raw.createBuffer.getMockImplementation()!; let count = 0;
     g.raw.createBuffer.mockImplementation(d => { if (++count === 3) throw Error('allocation failure'); return create(d); });

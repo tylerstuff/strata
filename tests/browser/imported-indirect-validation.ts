@@ -2,6 +2,8 @@ import { importedIndirectShader } from '../../packages/core/src/imported/importe
 import { ImportedIndirectEffect } from '../../packages/core/src/imported/imported-indirect-effect.js';
 import type { ImportedIndirectMaterial, ImportedIndirectSource } from '../../packages/core/src/imported/imported-indirect-types.js';
 import type { CameraFrame } from '../../packages/core/src/rendering/raster-math.js';
+import { presentationShader } from '../../packages/core/src/rendering/raster-shaders.js';
+import { importedHdrCompositionWitness as hdrWitness, isFiniteHalfRgb } from '../helpers/imported-hdr-composition-reference.js';
 import {
   createBlackEnclosureReferenceQuads, createIndirectReferenceQuads, directWallBounceReference,
   importedIndirectBarycentricWitness, importedIndirectFixture, wallCosineProbability,
@@ -230,6 +232,98 @@ async function readTexture(device: GPUDevice, source: GPUTexture, width: number,
     for (let y = 0; y < height; y++) for (let x = 0; x < width * 4; x++) output[y * width * 4 + x] = half(input[y * bytesPerRow / 2 + x]!);
     buffer.unmap(); return output;
   } finally { buffer.destroy(); }
+}
+
+/** Execute the unchanged production presentation entry on the actual composed
+ * texture. rgba32float readback avoids UNORM conversion hiding nonfinite output.
+ */
+async function presentComposition(c: Context): Promise<Float32Array<ArrayBuffer>> {
+  const device = c.resources.device, { width, height } = c;
+  const module = device.createShaderModule({ label: 'Unmodified bright-emissive presentation', code: presentationShader });
+  const pipeline = await bounded(device.createRenderPipelineAsync({ layout: 'auto', vertex: { module, entryPoint: 'vertexMain' },
+    fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba32float' }] } }), 'Bright-emissive presentation pipeline');
+  const data = new ArrayBuffer(16); new Uint32Array(data).set([0, 1]); new Float32Array(data).set([8, 2 ** hdrWitness.exposureEV], 2);
+  const uniform = c.resources.buffer(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, data);
+  // Only final-mode resolved is presented. Give other sampled bindings a
+  // distinct valid texture so accidentally reading direct fails the RGB oracle.
+  const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniform } },
+    ...[c.output, c.direct, c.direct, c.direct, c.direct].map((texture, index) => ({ binding: index + 1, resource: texture.createView() }))] });
+  const output = c.resources.texture('rgba32float', width, height, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC);
+  const bytesPerRow = Math.ceil(width * 16 / 256) * 256;
+  const readback = c.resources.buffer(bytesPerRow * height, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: output.createView(), clearValue: [-7, -7, -7, -7], loadOp: 'clear', storeOp: 'store' }] });
+  pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
+  encoder.copyTextureToBuffer({ texture: output }, { buffer: readback, bytesPerRow }, [width, height]); device.queue.submit([encoder.finish()]);
+  await bounded(readback.mapAsync(GPUMapMode.READ), 'Bright-emissive presentation readback');
+  const input = new Float32Array(readback.getMappedRange()), result = new Float32Array(width * height * 4);
+  for (let y = 0; y < height; y++) result.set(input.subarray(y * bytesPerRow / 4, y * bytesPerRow / 4 + width * 4), y * width * 4);
+  readback.unmap(); return result;
+}
+
+async function brightEmissiveComposition(device: GPUDevice, pipes: Pipelines) {
+  const width = 8, height = 8, count = width * height;
+  const quads = createBlackEnclosureReferenceQuads().map(quad => ({ ...quad, color: [1, 1, 1] as V3 }));
+  const frame = makeFrame(width, height, { light: false, emission: hdrWitness.emission });
+  new Uint32Array(frame)[40] = hdrWitness.samples;
+  const c = context(device, pipes, sourceQuads(quads), width, height, frame);
+  try {
+    const whiteEmission = textureBytes(c.resources, new Uint8Array([255, 255, 255, 255]), 1, 1, true), m = c.material;
+    const groups = [...c.groups];
+    groups[2] = device.createBindGroup({ layout: pipes.layouts[2]!, entries: [m.baseColorTexture, m.baseSampler,
+      m.metallicRoughnessTexture, m.metallicRoughnessSampler, whiteEmission.createView(), m.emissiveSampler].map((resource, binding) => ({ binding, resource })) });
+    const direct = new Uint16Array(count * 4);
+    for (let pixel = 0; pixel < count; pixel++) direct.set(hdrWitness.directHalfWords, pixel * 4);
+    device.queue.writeTexture({ texture: c.direct }, direct, { bytesPerRow: width * 8 }, [width, height]);
+    const trace = device.createCommandEncoder(); writeDepth(trace, c.depth, pipes.depth);
+    for (let sample = 0; sample < hdrWitness.samples; sample++) dispatch(trace, pipes.trace, groups, count / 64);
+    device.queue.submit([trace.finish()]);
+    const [beforeBytes, beforeCounts] = await Promise.all([readBuffer(device, c.states), readBuffer(device, c.counts)]);
+    const values = new Float32Array(beforeBytes), words = new Uint32Array(beforeBytes), counters = [...new Uint32Array(beforeCounts)];
+    require(counters.join() === [count * 2, count * 2, 0, 0].join(), 'Bright enclosure must complete every actual trace sample without failure.');
+    for (let pixel = 0; pixel < count; pixel++) {
+      require(words[pixel * 8 + 3] === 2 && words[pixel * 8 + 4] === 2 && words[pixel * 8 + 5] === 0, 'Bright sample count/attempts/status changed.');
+      hdrWitness.rawSum.forEach((value, channel) => near(values[pixel * 8 + channel]!, value, channel === 2 ? 1e-5 : 0.04, 'Unclipped actual two-sample sum'));
+    }
+    const compose = device.createCommandEncoder(); dispatch(compose, pipes.compose, groups, 1, 1); device.queue.submit([compose.finish()]);
+    const stored = await readTexture(device, c.output, width, height), presented = await presentComposition(c);
+    for (let pixel = 0; pixel < count; pixel++) {
+      require(isFiniteHalfRgb([...stored.subarray(pixel * 4, pixel * 4 + 3)]), 'Composed RGB exceeds finite half storage.');
+      hdrWitness.storedComposition.forEach((value, channel) => near(stored[pixel * 4 + channel]!, value, 0, 'Stored composition including unchanged lower-radiance channels'));
+      near(stored[pixel * 4 + 3]!, hdrWitness.alpha, 0, 'Composed direct alpha');
+      hdrWitness.presentedRgb.forEach((expected, channel) => near(presented[pixel * 4 + channel]!, expected, Math.max(2e-7, 2e-5 * expected), 'Independent negative-EV presentation'));
+      near(presented[pixel * 4 + 3]!, 1, 0, 'Actual presentation alpha');
+    }
+
+    // Negative control restores precisely the original unbounded expression.
+    // Record its requested value before the unchanged textureStore: overflow
+    // conversion may itself saturate on a device, so stored infinity is not the
+    // oracle. The passing production composition above is uninstrumented.
+    const guard = 'let storageColor = min(color, vec3f(65504.0));';
+    const store = 'textureStore(indirectOutput, pixel, vec4f(storageColor, direct.a));';
+    require(importedIndirectShader.split(guard).length === 2 && importedIndirectShader.split(store).length === 2, 'Expected exactly one composition guard/store for negative control.');
+    const originalExpression = importedIndirectShader.replace(guard, 'let storageColor = color;').replace(store,
+      `testResults[id.y * size.x + id.x].a = vec4f(storageColor, direct.a);\n  ${store}`);
+    const module = device.createShaderModule({ label: 'Original-expression pre-storage negative control', code: originalExpression + diagnosticsShader });
+    const negativePipeline = await bounded(device.createComputePipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts: [...pipes.layouts] }),
+      compute: { module, entryPoint: 'composeImportedIndirect' } }), 'Original-expression negative pipeline');
+    const negative = device.createCommandEncoder(); dispatch(negative, negativePipeline, groups, 1, 1); device.queue.submit([negative.finish()]);
+    const requested = new Float32Array(await readBuffer(device, c.queryResults));
+    for (let pixel = 0; pixel < count; pixel++) {
+      const rgb = [...requested.subarray(pixel * 32, pixel * 32 + 3)];
+      hdrWitness.unboundedComposition.forEach((value, channel) => near(rgb[channel]!, value, channel === 2 ? 1e-5 : 0.04, 'Original-expression requested composition'));
+      require(!isFiniteHalfRgb(rgb), 'Negative control must reject the original out-of-range storage request.');
+    }
+    const [afterBytes, afterCounts] = await Promise.all([readBuffer(device, c.states), readBuffer(device, c.counts)]);
+    require(new Uint32Array(afterBytes).every((word, index) => word === words[index]), 'Composition/presentation modified raw estimator bytes.');
+    require(new Uint32Array(afterCounts).every((word, index) => word === counters[index]), 'Composition/presentation modified diagnostics.');
+    return { name: 'bright-emissive-finite-composition', queryCount: count * 2, counters, rawSum: [...values.subarray(0, 3)], stored: [...stored.subarray(0, 4)],
+      presented: [...presented.subarray(0, 4)], expected: hdrWitness, originalExpressionRequested: [...requested.subarray(0, 4)],
+      originalExpressionRejected: true, estimatorAndCountersByteIdentical: true,
+      scope: 'Actual production trace/compose/presentation with synthetic finite direct HDR and explicit-point matrices. No upstream raster-overflow or public-camera claim.',
+      tolerances: { rawHighRadianceAbsolute: 0.04, rawLowRadianceAbsolute: 1e-5, storedHalf: 0, presentationAbsolute: 2e-7, presentationRelative: 2e-5 },
+      negativeControl: 'Original-expression variant captures the out-of-range request before storage conversion; it does not assume device overflow becomes infinity.' };
+  } finally { c.resources.dispose(); }
 }
 
 /** Independent axis-aligned plane/rectangle classifier; no BVH, triangle
@@ -480,11 +574,12 @@ export async function validateImportedIndirect() {
     ] satisfies BatchOptions[]) batches.push(await radiometricBatch(device, pipes, options));
     const open = batches.find(batch => batch.name === 'offscreen-colored-wall')!, aperture = batches.find(batch => batch.name === 'aperture')!, closed = batches.find(batch => batch.name === 'closed-opening')!;
     require(open.mean[0]! > aperture.mean[0]! && aperture.mean[0]! > 0 && closed.mean.every(value => value === 0), 'Open/aperture/closed source visibility did not change indirect energy.');
+    const brightComposition = await brightEmissiveComposition(device, pipes);
     const lifecycle = await effectLifecycle(device, pipes); await bounded(device.queue.onSubmittedWorkDone(), 'Final diagnostic fence');
     for (let i = 0; i < 3; i++) { const error = await bounded(device.popErrorScope(), 'Diagnostic error scope'); if (error) errors.push(error.message); }
     require(errors.length === 0, errors.join('\n'));
     return { status: 'passed', performanceEvidence: false, adapter: { vendor: adapter.info.vendor, architecture: adapter.info.architecture, device: adapter.info.device, description: adapter.info.description, isFallbackAdapter: adapter.info.isFallbackAdapter },
-      trace, environment, batches, lifecycle, errors,
+      trace, environment, batches, brightComposition, lifecycle, errors,
       tolerances: { sameRayLinearRadiance: 5e-5, composedHalfFloat: 0.002, materialSrgb: 0.0003, emissionSrgb: 0.003, geometryPoint: 3e-6, unitDirection: 2e-6 },
       distributionSanity: { frozenBeforeGpu: true, interpretation: 'Broad deterministic non-vacuity bands, not IID confidence bounds.', meanDirectionAbsoluteBand: 0.03, wallHitProbabilityAbsoluteBand: 0.02 },
       limitations: ['Generated static one-material OPAQUE geometry only. No imported assets, performance, all-scene, or visual-quality claim.',

@@ -217,6 +217,9 @@ fn indirectFiniteNonnegative(value: vec3f) -> bool {
     if (state.status == 2u) { color = vec3f(1.0, 0.0, 1.0); }
     if (state.status == 3u) { color = vec3f(1.0, 0.25, 0.0); }
   }
-  textureStore(indirectOutput, pixel, vec4f(color, direct.a));
+  // Saturate only presentation storage. Raw sums/counters retain the estimator;
+  // exposure is applied later and cannot recover radiance clipped here.
+  let storageColor = min(color, vec3f(65504.0));
+  textureStore(indirectOutput, pixel, vec4f(storageColor, direct.a));
 }
 `;

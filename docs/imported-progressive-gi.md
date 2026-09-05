@@ -74,6 +74,15 @@ and passing generated fixtures do not clear this gallery promotion hold.
 
 `prepare()` and `compose()` encode work; the owner must call `submitted()` only after successful queue submission, or `cancelFrame()` on failure. Camera, resolution, lighting, environment and option changes reset accumulation. Enabling after a pause also resets it. A failed frame forces a reset before reuse. Composing adds only accumulated indirect radiance to the current direct HDR, preserving direct-light and texture detail.
 
+The composed `rgba16float` presentation texture saturates each finite RGB channel
+at 65,504. This storage limit applies after direct plus indirect addition; the
+float32 raw estimator, sample counts and failure counters are unchanged. Lower
+radiance and direct alpha are preserved. Exposure is applied after this storage
+step, so negative exposure cannot recover clipped radiance. This is a composition
+boundary for finite inputs, not a general HDR overflow fix: upstream direct raster
+attachments can already overflow when combining strong emission and lighting,
+and this step does not promise to repair earlier nonfinite values.
+
 The first preview uses full-resolution per-pixel accumulation with bounded batches; it does not upsample lighting across surface boundaries. Defaults are 262,144 pixels, 4,096 scheduled pixel updates per frame, 64 samples per pixel and 4,096 node visits per query. These are workload bounds, not timing guarantees. The integration can explicitly choose a 640×360 or 320×180 preview. It must preflight `maxPixels` before activation; an oversized resize rejects before changing resources. CPU progress describes submitted scheduling, while GPU readback reports attempted, completed, exhausted and invalid samples. Frame count is not a convergence measurement.
 
 The shader-free `imported-indirect-options` module exports `normalizeImportedIndirectOptions()` and `validateImportedIndirectSize(device.limits, width, height, normalizedOptions)`. Call these before CPU preparation or material allocation. The effect's `validateSize()` delegates to the same check, so activation and later resizes share one set of limits.
@@ -83,5 +92,14 @@ Each pixel's accumulator occupies 32 bytes, the composed HDR target 8 bytes, and
 ## Validation boundary
 
 Generated validation covers original source IDs and barycentrics, small triangles and grazing rays, visibility budgets, an offscreen colored rectangle with an independent form-factor reference, blocked openings and secondary-light occlusion, visible versus bounced environment, emission/color-space interpretation, and effect lifecycle. Explicit-point shader fixtures are distinguished from tests with valid camera matrices. Deterministic sampled-ray agreement is reported separately from a distribution's analytic mean; a fixed hash sequence is not assumed to be IID.
+
+The generated bright-emissive composition case is prepared in
+`npm run test:imported-indirect`: a closed white enclosure has a constant analytic
+bounce, two real trace samples retain a raw sum above 65,504, and the unchanged
+production composition and exposure shaders are checked against finite expected
+values. A diagnostic original-expression variant records its requested 80,000
+red value before texture conversion, so the negative control does not depend on
+whether a device converts overflow to infinity or saturates it. This case requires
+a separate GPU run; CPU checks alone do not establish its execution result.
 
 Actual-house acceptance needs a fixed interior camera, verified source/texture identities, zero unexplained invalid or exhausted paths and a clear blocked/offscreen transport witness. Those assets, BVHs and captures remain external. Generated tests and a small reference scene do not establish gallery-wide quality, 60 FPS or superiority over another renderer.
