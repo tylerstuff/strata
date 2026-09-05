@@ -149,7 +149,11 @@ Default operation/cleanup deadlines are 30 seconds/five seconds; startup overrid
 are bounded to 300 seconds. Unsettled dependencies fault and close admission; a
 cleanup deadline is not proof that every OS resource closed. Shutdown tracks pending
 request/publication settlement separately from `PreviewSession.dispose()`, which
-awaits driver cleanup alone. The final response drain shares the configured cleanup
+awaits driver cleanup alone. It also awaits `PreviewSession.whenIdle()` for actual
+operation settlement after early cancellation, including pre-publication artifact
+writes and their cleanup, and applies the same ownership rule to late-created
+sessions. A disposed observation is not a substitute for this wait. The final
+response drain shares the configured cleanup
 deadline starting at shutdown; expiry stops the transport and records uncertain
 delivery/outcomes without implying rollback.
 
@@ -164,7 +168,7 @@ filesystem changes by another process.
 
 ## Validation boundary
 
-`npm run check:preview` passed for this implementation checkpoint: 319 CPU tests,
+`npm run check:preview` passed for this implementation checkpoint: 325 CPU tests,
 strict type/declaration checks, the package build, and both isolated packed CPU
 consumers. These tests use the existing session/driver seams and real temporary
 project/output directories. They cover framing, byte limits/backpressure, monotonic IDs, discovery,
@@ -173,7 +177,10 @@ publication truth, disposal/EOF/output failure and packed consumer operation.
 The connection consumer installs Core, authoring and preview archives with scripts
 disabled, checks installed declarations, drives the installed CLI without a valid
 browser load, and uses a real `PreviewSession` with a delayed fake driver for
-cancellation and native PNG/receipt publication. Rust/browser sentinels and an
+cancellation and native PNG/receipt publication. Real pre-publication write/sync,
+file-close and cleanup holds verify that driver disposal cannot finish connection
+shutdown early. Deadline, late-created-session and disposal-failure cases retain
+actual settlement or report uncertainty. Rust/browser sentinels and an
 empty browser-install location keep this a CPU workflow. Fixtures are generated in
 temporary directories and removed afterward.
 

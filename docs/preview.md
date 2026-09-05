@@ -130,9 +130,15 @@ cleanup attempt for driver-owned resources and remains safe to call repeatedly.
 Cleanup can reject with `PREVIEW_DISPOSE_FAILED`, including errors and any
 unresolved resources; a cleanup deadline is not proof that every resource closed.
 
+`whenIdle()` waits for actual mutation and artifact-operation settlement, including
+after disposal or a gate fault. An early rejected caller or a disposed observation
+does not establish that settlement. The wait itself has no timeout and does not
+dispose the driver or report operation success; a host that needs complete shutdown
+must await both `dispose()` and `whenIdle()` within its own cleanup deadline.
+
 After `npm run build` produces Core's distribution, `npm run check:preview`
-builds authoring, typechecks/tests/builds preview and runs an isolated packed CPU
-consumer with Rust and browser command guards. The suites cover
+builds authoring, typechecks/tests/builds preview and runs isolated packed CPU
+consumers with Rust and browser command guards. The suites cover
 supersession, deep snapshots, historical/current commit disagreement, readiness,
 stale tokens, explicit frame evidence, disposal, cancellation through publication,
 short writes, output collisions, and cleanup failure. This command does not run

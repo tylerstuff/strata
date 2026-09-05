@@ -40,6 +40,11 @@ expiry faults the session and starts driver teardown. `dispose()` is idempotent;
 bounded cleanup can reject with `PREVIEW_DISPOSE_FAILED` and identify unresolved
 resources.
 
+`whenIdle()` waits for actual mutation/artifact settlement even after disposal or
+fault, independently of an early rejected caller. It has no timeout and does not
+dispose the driver or assert successful work. Hosts that need shutdown settlement
+await both `dispose()` and `whenIdle()` under their own cleanup deadline.
+
 This package is separate from browser runtime bundles and requires Node.js
 22.13+. It has no consumer install/build hooks and requires no Rust tooling.
 Use an installed Chrome browser with `--browser chrome`, or install Playwright

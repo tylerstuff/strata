@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { link, mkdir, readFile, readdir, symlink } from 'node:fs/promises';
+import { link, mkdir, open, readFile, readdir, symlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -94,6 +94,7 @@ function png(width, height) {
 class CpuDriver {
   width = 2; height = 2; generation = 0; frameId = 0; lastSubmittedFrameId = null;
   status = 'ready'; commit = null; scene = null; disposeCalls = 0; fenceCalls = 0; nextLoad = null;
+  disposed = deferred();
   prepareLoad(input) { return prepareAuthoredPreviewLoad(input); }
   async observe() {
     return structuredClone({ status: this.status, commit: this.commit, width: this.width, height: this.height,
@@ -123,13 +124,33 @@ class CpuDriver {
   async resize(width, height, signal) { signal.throwIfAborted(); this.width = width; this.height = height; }
   async waitForIdle(signal) { signal.throwIfAborted(); this.fenceCalls++; }
   async screenshot(signal) { signal.throwIfAborted(); return png(this.width, this.height); }
-  async dispose() { this.disposeCalls++; this.status = 'disposed'; }
+  async dispose() { this.disposeCalls++; this.status = 'disposed'; this.disposed.resolve(); }
 }
 
 const driver = new CpuDriver();
-let publicationHold = null, factoryCalls = 0;
+let publicationHold = null, precommitHold = null, factoryCalls = 0;
 const session = new PreviewSession(driver, { defaultTimeoutMs: 3000, cleanupTimeoutMs: 2000,
   publish: options => publishCapture(options, {
+    openFile: async path => {
+      const hold = precommitHold;
+      if (hold) assert.ok(path.endsWith('/canceled-precommit/image.png'));
+      const handle = await open(path, 'wx', 0o600);
+      if (!hold) return handle;
+      precommitHold = null; hold.path = path;
+      return {
+        writeFile: data => handle.writeFile(data),
+        sync: async () => {
+          hold.syncEntered.resolve();
+          await hold.releaseSync.promise;
+          await handle.sync(); hold.synced = true;
+        },
+        close: async () => {
+          hold.closeEntered.resolve();
+          await hold.releaseClose.promise;
+          await handle.close(); hold.closed = true;
+        },
+      };
+    },
     publishReceipt: async (temporary, target) => {
       const hold = publicationHold;
       if (hold) { publicationHold = null; hold.target = target; hold.entered.resolve(); await hold.release.promise; }
@@ -270,12 +291,47 @@ try {
   await verifyPublication(editedCapture, replacement, 3, 2);
   assert.deepEqual(await readFile(scenePath), editedBytes, 'Connection operations must not write scene files');
   assert.deepEqual((await readdir(outputRoot)).sort(), ['edited', 'first', 'publication-wins']);
-  assert.equal(ok(await call('dispose')).disposed, true);
+
+  // Hold real artifact I/O before the commit barrier. Caller cancellation may
+  // reject promptly, but neither driver disposal nor that rejection settles it.
+  const precommit = { syncEntered: deferred(), releaseSync: deferred(), closeEntered: deferred(), releaseClose: deferred(),
+    path: null, synced: false, closed: false };
+  precommitHold = precommit;
+  const canceledCapture = send('capture', { ...tokens(replacement), captureId: 'canceled-precommit' });
+  await bounded(precommit.syncEntered.promise, 'precommit image sync');
+  assert.deepEqual(await readFile(precommit.path), png(3, 2));
+  assert.equal(ok(await call('cancel', { requestId: canceledCapture.id })).cancellationRequested, true);
+  rejected(await canceledCapture.promise, 'PREVIEW_ABORTED');
+  let idleSettled = false, disposeSettled = false;
+  const idle = session.whenIdle();
+  void idle.then(() => { idleSettled = true; }, () => { idleSettled = true; });
+  const disposing = send('dispose');
+  void disposing.promise.then(() => { disposeSettled = true; }, () => { disposeSettled = true; });
+  await bounded(driver.disposed.promise, 'driver disposal during held artifact I/O');
+  await delay(0);
+  assert.equal(driver.disposeCalls, 1);
+  assert.equal(idleSettled, false, 'Public whenIdle must retain canceled precommit I/O');
+  assert.equal(disposeSettled, false, 'Dispose must not report settlement merely because the driver disposed');
+  assert.deepEqual(await readdir(join(outputRoot, 'canceled-precommit')), ['image.png']);
+  precommit.releaseSync.resolve();
+  await bounded(precommit.closeEntered.promise, 'precommit image close');
+  await delay(0);
+  assert.equal(precommit.synced, true); assert.equal(precommit.closed, false);
+  assert.equal(idleSettled, false, 'Public whenIdle must also retain the owned file close');
+  assert.equal(disposeSettled, false, 'Dispose must wait through owned file close and cleanup');
+  precommit.releaseClose.resolve();
+  await bounded(idle, 'canceled artifact cleanup settlement');
+  assert.equal(precommit.closed, true);
+  await assert.rejects(readdir(join(outputRoot, 'canceled-precommit')), { code: 'ENOENT' });
+  assert.equal(ok(await disposing.promise).disposed, true);
+  assert.ok(responseOrder.indexOf(canceledCapture.id) < responseOrder.indexOf(disposing.id));
+  assert.deepEqual((await readdir(outputRoot)).sort(), ['edited', 'first', 'publication-wins']);
   await bounded(transport, 'disposed transport drain');
   assert.equal(connection.closing, true); assert.equal(driver.disposeCalls, 1);
   assert.equal(waiting.size, 0); assert.equal(carry, '');
   await connection.close(); assert.equal(driver.disposeCalls, 1);
-  console.log('Connection consumer: installed CLI/help/errors/EOF, rooted shared authoring input, lazy initialization, real session capture/resize/reload, delayed cancellation ownership and native publication truth passed with CPU fakes');
+  await bounded(session.whenIdle(), 'already disposed session settlement');
+  console.log('Connection consumer: installed CLI/help/errors/EOF, rooted shared authoring input, lazy initialization, real session capture/resize/reload, delayed cancellation ownership, precommit I/O shutdown settlement and native publication truth passed with CPU fakes');
 } finally {
   for (const item of deferreds) item.resolve();
   await connection.close().catch(() => {});

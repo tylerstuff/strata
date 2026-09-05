@@ -54,6 +54,7 @@ class Session implements PreviewConnectionSession {
   }
   async resize(width: number, height: number) { return { ...structuredClone(ready), width, height, frameId: 2, viewRevision: 'view-2' }; }
   async dispose() { this.disposed++; this.state = 'disposed'; await this.onDispose?.(); }
+  async whenIdle() { /* This double owns no work beyond its public operation promises. */ }
 }
 function publication(root: string): CapturePublication { return { imagePath: join(root, 'capture/image.png'), receiptPath: join(root, 'capture/receipt.json'), receipt: { ...ready, presentedFrameId: null }, cleanupWarnings: [] }; }
 

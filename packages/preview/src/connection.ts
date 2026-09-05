@@ -34,6 +34,8 @@ export interface PreviewConnectionSession {
   observe(): Promise<PreviewConnectionObservation>;
   resize(width: number, height: number, options?: OperationOptions): Promise<PreviewReadyReceipt<unknown>>;
   capture(request: CaptureRequest, options?: OperationOptions): Promise<CapturePublication>;
+  /** Actual mutation/artifact settlement, including after disposal/fault; no deadline. */
+  whenIdle(): Promise<void>;
   dispose(): Promise<void>;
 }
 
@@ -226,7 +228,7 @@ class LocalPreviewConnection implements PreviewConnectionHandler {
           if (this.#closing || signal.aborted) {
             // This candidate is never adopted, but its cleanup still belongs to
             // this process, including rejection after shutdown has already begun.
-            this.#lateSessionCleanup = Promise.resolve().then(() => session.dispose()).catch(cause => {
+            this.#lateSessionCleanup = this.#disposeSession(session).catch(cause => {
               const error = connectionFailure('CONNECTION_DISPOSE_FAILED', 'initialize', 'A late-created session could not be disposed.', {
                 unresolvedResources: ['late-created-session'], errors: [connectionErrorResponse(null, cause)],
               });
@@ -358,13 +360,25 @@ class LocalPreviewConnection implements PreviewConnectionHandler {
     void this.close().catch(() => {});
   }
 
+  async #disposeSession(session: PreviewConnectionSession): Promise<void> {
+    // dispose() owns driver teardown, while whenIdle() retains pre-publication
+    // artifact I/O after an early canceled caller result. Neither replaces the
+    // connection's request/publication tracking or its absolute cleanup deadline.
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => session.dispose()),
+      Promise.resolve().then(() => session.whenIdle()),
+    ]);
+    const errors = results.flatMap(result => result.status === 'rejected' ? [connectionErrorResponse(null, result.reason)] : []);
+    if (errors.length) throw connectionFailure('CONNECTION_DISPOSE_FAILED', 'dispose', 'Owned session teardown or settlement failed.', { errors });
+  }
+
   close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     this.#closing = true;
     this.#removeSignal?.();
     for (const work of this.#work.values()) this.#abort(work, 'CONNECTION_CLOSED');
     this.#closePromise = Promise.resolve().then(async () => {
-      const cleanup = this.#session ? Promise.resolve().then(() => this.#session!.dispose()) : Promise.resolve();
+      const cleanup = this.#session ? this.#disposeSession(this.#session) : Promise.resolve();
       const results = await bounded(Promise.allSettled([cleanup, ...this.#tasks, ...(this.#lateSessionCleanup ? [this.#lateSessionCleanup] : [])]), this.#cleanupMs, 'dispose');
       const errors = [...this.#cleanupErrors, ...results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])];
       if (errors.length) throw connectionFailure('CONNECTION_DISPOSE_FAILED', 'dispose', 'Owned session cleanup failed.', { errors: errors.map(error => connectionErrorResponse(null, error)) });

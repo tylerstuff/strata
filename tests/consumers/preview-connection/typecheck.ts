@@ -22,8 +22,12 @@ async function workflow(projectRoot: string, outputRoot: string, ready: PreviewR
   const dependencies: PreviewConnectionDependencies = {
     createSession: async startup => {
       const signal: AbortSignal | undefined = startup.signal;
-      const session: PreviewConnectionSession = new PreviewSession(driver);
+      const actual = new PreviewSession(driver);
+      const idle: Promise<void> = actual.whenIdle();
+      const session: PreviewConnectionSession = actual;
       const observation: PreviewConnectionObservation = await session.observe();
+      await idle;
+      await session.whenIdle();
       void signal; void observation;
       return session;
     },
