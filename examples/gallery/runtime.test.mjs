@@ -71,6 +71,13 @@ function asset(sourceUrl, clips = []) {
       encodedBytes: 0, geometryBytes: 0, skinnedMeshInstances: 0, animationClips: clips.length },
   };
 }
+function progressiveAsset(sourceUrl) {
+  const value = asset(sourceUrl);
+  value.materials = [{ alphaMode: 'OPAQUE', unlit: false }, { alphaMode: 'MASK', unlit: true }];
+  value.primitives = [{ material: 0 }, { material: 0 }];
+  value.stats.materials = 2;
+  return value;
+}
 
 function assertFrameFits(frame, bounds) {
   const { eye, target, verticalFov } = frame.options.imported.camera;
@@ -108,6 +115,11 @@ class FakeEngine {
   scene = null;
   sceneIdentity = { sceneGeneration: 0, renderer: 'clear', sceneId: null, sourceRevision: null };
   sceneFailures = [];
+  indirect = null;
+  indirectKey = null;
+  activeFences = 0;
+  maximumActiveFences = 0;
+  counterValues = { attempted: 17, completed: 13, exhausted: 3, invalid: 1 };
   constructor(canvas) { this.canvas = canvas; }
   hold(queue) {
     const entry = { entered: deferred(), done: deferred() };
@@ -125,25 +137,44 @@ class FakeEngine {
     // Deliberately resolve even after an abort: host guards must reject late work.
     this.scene = options.asset;
     this.sceneIdentity = { sceneGeneration, renderer: 'imported', sceneId: null, sourceRevision: null };
+    this.indirectKey = null;
+    this.indirect = options.indirect ? { mode: 'progressive-diffuse', temporal: false, rasterAmbient: 'disabled', rasterEnvironment: 'disabled',
+      progress: { revision: 0, submittedFrames: 0, batchCursor: 0, width: this.canvas.width, height: this.canvas.height, pendingReset: true, pendingFrame: false,
+        enabled: true, normalMode: 'geometric', textureLod: 0, limits: { maxPixels: options.indirect.maxPixels, pixelBatch: 4096, maxSamples: 64, maxVisits: 4096, seed: 1337 } },
+      sampleCounters: null, estimatedPeakCpuBytes: 12345, preparedTraceGpuBytes: 6789 } : null;
     if (failure?.stage === 'after') throw new globalThis[hookKey].SceneCommitError(this.sceneIdentity, failure.error);
     return this.sceneIdentity;
   }
   render(options) {
     assert.equal(this.state, 'ready', 'Host must not submit after disposal/loss');
+    if (this.indirect) {
+      assert.equal(options.temporal, false);
+      const key = JSON.stringify(options.imported);
+      if (options.cameraCut || key !== this.indirectKey) {
+        this.indirect.progress.revision++; this.indirect.progress.submittedFrames = 0;
+      }
+      this.indirectKey = key;
+      Object.assign(this.indirect.progress, { submittedFrames: this.indirect.progress.submittedFrames + 1,
+        width: this.canvas.width, height: this.canvas.height, pendingReset: false, enabled: options.imported.indirect.enabled });
+    }
     const frameId = this.frames.length + 1;
     this.frames.push({ frameId, scene: this.sceneIdentity, sourceUrl: this.scene?.sourceUrl ?? null, options: structuredClone(options), width: this.canvas.width, height: this.canvas.height });
-    return { frameId, scene: this.sceneIdentity, cpuSubmissionMs: 0.1, drawCalls: 1, dispatchCalls: 0, triangles: 12,
+    return { frameId, scene: this.sceneIdentity, ...(this.indirect ? { imported: { indirect: structuredClone(this.indirect) } } : {}), cpuSubmissionMs: 0.1, drawCalls: 1, dispatchCalls: 0, triangles: 12,
       uploadBytes: 0, allocatedGpuBufferBytes: 0, allocatedGpuTextureBytes: 0, wasmMemoryBytes: 0 };
   }
   async waitForIdle() {
     this.fenceCalls++;
-    const hold = this.fenceQueue.shift();
-    if (hold) { hold.entered.resolve(); await hold.done.promise; }
+    this.activeFences++; this.maximumActiveFences = Math.max(this.maximumActiveFences, this.activeFences);
+    try {
+      const hold = this.fenceQueue.shift();
+      if (hold) { hold.entered.resolve(); await hold.done.promise; }
+      if (this.indirect) this.indirect.sampleCounters = { ...structuredClone(this.indirect.progress), ...this.counterValues };
+    } finally { this.activeFences--; }
   }
   async flushGpuTimings() { this.flushCalls++; }
   drainGpuTimings() { return this.gpuSamples.splice(0); }
   getTelemetry() { return { submittedFrames: this.frames.length, gpuErrorCount: this.gpuErrorCount, lastGpuError: this.lastGpuError,
-    scene: { identity: this.sceneIdentity }, source: 'CPU fake engine' }; }
+    scene: { identity: this.sceneIdentity }, ...(this.indirect ? { imported: { indirect: this.indirect } } : {}), source: 'CPU fake engine' }; }
   resize(width, height) {
     assert.equal(this.state, 'ready');
     this.resizeCalls.push([width, height]); this.canvas.width = width; this.canvas.height = height;
@@ -295,7 +326,7 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
       await runtime.setTemporal(temporal);
       const changed = runtime.getState();
       assert.equal(changed.viewRevision, revision + 1);
-      assert.deepEqual(changed.settings, { ...original.settings, temporal });
+      assert.deepEqual(changed.settings, { ...original.settings, temporal, temporalRequested: temporal });
       assert.equal(engine.frames.at(-1).options.temporal, temporal);
       assert.equal(engine.frames.at(-1).options.cameraCut, true);
       assert.deepEqual(engine.frames.at(-1).options.imported, original.settings.effective);
@@ -542,6 +573,241 @@ describe('Gallery runtime — CPU orchestration only; no browser/GPU rendering p
     const state = runtime.getState();
     assert.equal(state.phase, 'error'); assert.equal(state.settings.textureCap, 2048);
     assert.deepEqual(state.sceneCommit, state.frame.scene); assert.deepEqual(state.sceneCommit, engine.sceneIdentity);
+  });
+
+  test('progressive mode preserves the loaded view, uses matching GI on/off baselines, and survives texture recreation', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setViewport(640, 360);
+    await runtime.setOrbit({ azimuth: 1.2, distance: 8, target: [1, 2, 3] });
+    await runtime.setEnvironment({ preset: 'sky', intensity: 2, rotationRadians: 1 }); runtime.setLive(true);
+    const before = runtime.getState(), loaded = engine.scene, resizes = engine.resizeCalls.length;
+    assert.equal(before.settings.sceneMode, 'ordinary'); assert.equal(before.progressive.eligibility.eligible, true);
+    await runtime.setSceneMode('progressive');
+    const active = runtime.getState();
+    assert.equal(engine.scene, loaded); assert.equal(engine.resizeCalls.length, resizes); assert.equal(loadCalls.length, 1);
+    assert.deepEqual(engine.sceneCalls.at(-1).indirect, { maxPixels: 262144 });
+    assert.equal(active.settings.temporal, false); assert.equal(active.settings.temporalRequested, true);
+    assert.equal(active.live, true); assert.deepEqual(active.settings.orbit, before.settings.orbit);
+    assert.deepEqual(active.settings.animation, before.settings.animation);
+    assert.deepEqual(active.settings.effective.lighting.ambient, [0, 0, 0]);
+    assert.deepEqual(active.settings.effective.lighting.environment, before.settings.effective.lighting.environment);
+    assert.equal(active.progressive.telemetry.rasterEnvironment, 'disabled');
+    assert.equal(active.progressive.telemetry.rasterAmbient, 'disabled');
+    await runtime.setIndirectEnabled(false);
+    const off = runtime.getState();
+    assert.deepEqual(off.settings.effective, { ...active.settings.effective, indirect: { enabled: false } });
+    assert.equal(engine.frames.at(-1).options.temporal, false);
+    await runtime.setTextureCap(2048);
+    assert.deepEqual(engine.sceneCalls.at(-1).indirect, { maxPixels: 262144 });
+    assert.deepEqual(engine.frames.at(-1).options.imported, off.settings.effective);
+    assert.equal(runtime.getState().settings.sceneMode, 'progressive');
+    runtime.resize(320, 180);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(runtime.getState().settings.orbit, before.settings.orbit, 'Mode and texture recreation retain manual camera mode');
+    await runtime.setSceneMode('ordinary');
+    const ordinary = runtime.getState();
+    assert.equal(engine.sceneCalls.at(-1).indirect, undefined);
+    assert.equal(ordinary.settings.temporal, true); assert.equal(ordinary.settings.indirectEnabled, false);
+    assert.equal(ordinary.settings.effective.indirect, undefined);
+    assert.deepEqual(ordinary.settings.effective.lighting, before.settings.effective.lighting);
+    assert.equal(ordinary.progressive.telemetry, null); assert.equal(ordinary.live, true);
+  });
+
+  test('progressive activation and resize admission reject oversized physical viewports without implicit resizing', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setViewport(1024, 768);
+    const before = runtime.getState(), scenes = engine.sceneCalls.length;
+    assert.ok(before.progressive.eligibility.reasons.some(reason => reason.includes('Current viewport')));
+    await assert.rejects(runtime.setSceneMode('progressive'), /640×360 or 320×180/);
+    assert.deepEqual(runtime.getState(), before); assert.equal(engine.sceneCalls.length, scenes);
+    await runtime.setViewport(640, 360);
+    const creation = engine.holdScene(); const activation = runtime.setSceneMode('progressive');
+    await creation.entered.promise;
+    assert.throws(() => runtime.resize(1024, 768), /640×360 or 320×180/);
+    assert.deepEqual([canvas.width, canvas.height], [640, 360]);
+    creation.done.resolve(); await activation;
+    const active = runtime.getState();
+    assert.throws(() => runtime.resize(1024, 768), /pixel budget/);
+    await assert.rejects(runtime.setViewport(1024, 768), /pixel budget/);
+    assert.deepEqual(runtime.getState(), active);
+    await runtime.setSceneMode('ordinary');
+    const fence = engine.holdFence(), changing = runtime.setLightingPreset('daylight');
+    await fence.entered.promise; runtime.resize(1024, 768);
+    assert.ok(runtime.getState().progressive.eligibility.reasons.some(reason => reason.includes('Pending viewport')));
+    fence.done.resolve(); await changing;
+  });
+
+  test('progressive eligibility inspects used source materials and rejects incompatible controls before mutation', async () => {
+    for (const alter of [value => { value.rig = {}; }, value => { value.clips = [{ id: 'walk', name: 'Walk', duration: 1 }]; },
+      value => { value.primitives[0].deformation = {}; }, value => { value.primitives[1].material = 1; },
+      value => { value.materials[0].unlit = true; }, value => { value.materials[0].alphaMode = 'MASK'; }]) {
+      loadHook = async url => { const value = progressiveAsset(url); alter(value); return value; };
+      await runtime.selectModel(model()); await runtime.setShading('relit');
+      const before = runtime.getState(), scenes = engine.sceneCalls.length;
+      assert.equal(before.progressive.eligibility.eligible, false);
+      await assert.rejects(runtime.setSceneMode('progressive'));
+      assert.deepEqual(runtime.getState(), before); assert.equal(engine.sceneCalls.length, scenes);
+    }
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setScenePreset('ground');
+    await assert.rejects(runtime.setSceneMode('progressive'), /model-only/);
+    await runtime.setScenePreset('model-only'); await runtime.setSceneMode('progressive');
+    const active = runtime.getState();
+    for (const action of [() => runtime.setScenePreset('ground'), () => runtime.setTemporal(true),
+      () => runtime.setAnimation({ playing: true }), () => runtime.setAnimation({ timeSeconds: 1 }),
+      () => runtime.setAnimation({ clipId: 'unknown' }), () => runtime.setIndirectEnabled('true'), () => runtime.setSceneMode('automatic')]) {
+      await assert.rejects(action()); assert.deepEqual(runtime.getState(), active);
+    }
+  });
+
+  test('progressive capture batches accumulate stationary submissions and expose fenced revision-tagged counters', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive');
+    const starting = runtime.getState().progressive.telemetry.progress;
+    const first = await runtime.captureState(2), second = await runtime.captureState(3);
+    assert.equal(first.state.progressive.telemetry.progress.revision, starting.revision);
+    assert.equal(second.state.progressive.telemetry.progress.revision, starting.revision);
+    assert.equal(second.state.progressive.telemetry.progress.submittedFrames, starting.submittedFrames + 5);
+    assert.ok(engine.frames.slice(-5).every(frame => frame.options.cameraCut === false && frame.options.temporal === false));
+    const counters = second.state.progressive.telemetry.sampleCounters;
+    assert.equal(counters.revision, starting.revision);
+    for (const [key, value] of Object.entries(engine.counterValues)) assert.equal(counters[key], value, 'Counters come from the fake GPU readback, never from frame count');
+    assert.equal(counters.submittedFrames, starting.submittedFrames + 5);
+    assert.ok(second.state.frame.imported.indirect.sampleCounters.submittedFrames < counters.submittedFrames,
+      'Current counters come from post-fence telemetry rather than the submitted frame snapshot');
+    engine.indirect.sampleCounters.revision--;
+    assert.equal(runtime.getState().progressive.telemetry.sampleCounters, null);
+    engine.indirect.sampleCounters.revision++;
+    engine.sceneIdentity = { ...engine.sceneIdentity, sceneGeneration: engine.sceneIdentity.sceneGeneration + 1 };
+    assert.equal(runtime.getState().progressive.telemetry, null, 'A reused accumulation revision cannot attach candidate counters to the old host scene');
+  });
+
+  test('progressive live counters and an overlapping setting serialize fences and publish only current revision counters', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive'); runtime.setLive(true);
+    const live = engine.holdFence(); tick(1000); await live.entered.promise;
+    const submitted = engine.frames.length, fences = engine.fenceCalls;
+    assert.equal(runtime.getState().progressive.countersPending, true);
+    tick(1016); assert.equal(engine.frames.length, submitted); assert.equal(engine.fenceCalls, fences);
+    const changed = runtime.setEnvironment({ preset: 'sky' });
+    assert.equal(engine.frames.length, submitted, 'Settings wait for the in-flight counter readback before submission');
+    const setting = engine.holdFence(); live.done.resolve(); await setting.entered.promise;
+    assert.equal(engine.maximumActiveFences, 1);
+    assert.equal(engine.frames.length, submitted + 1);
+    assert.equal(runtime.getState().progressive.telemetry.sampleCounters, null, 'Previous revision counters remain unavailable until the new fence finishes');
+    setting.done.resolve(); await changed;
+    const state = runtime.getState();
+    assert.equal(state.progressive.countersPending, false);
+    assert.equal(state.progressive.telemetry.sampleCounters.revision, state.progressive.telemetry.progress.revision);
+    assert.equal(raf.size, 1); assert.equal(state.live, true);
+  });
+
+  test('progressive live readback completion after disposal causes no late callback, submission or schedule', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive'); runtime.setLive(true);
+    const fence = engine.holdFence(); tick(1000); await fence.entered.promise;
+    let changes = 0; onChanged = () => { changes++; };
+    const frames = engine.frames.length;
+    runtime.dispose(); const disposedChanges = changes;
+    fence.done.resolve(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(changes, disposedChanges); assert.equal(engine.frames.length, frames);
+    assert.equal(raf.size, 0); assert.equal(runtime.getState().phase, 'disposed');
+  });
+
+  test('a progressive model selection waiting on failed live counters cannot restore an independently faulted host', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive'); runtime.setLive(true);
+    const fence = engine.holdFence(); tick(1000); await fence.entered.promise;
+    const frames = engine.frames.length, loads = loadCalls.length;
+    const pending = runtime.selectModel(model('next')), rejected = assert.rejects(pending, /counter readback failed/);
+    fence.done.reject(new Error('counter readback failed')); await rejected;
+    assert.equal(engine.state, 'ready'); assert.equal(engine.gpuErrorCount, 0);
+    assert.equal(runtime.getState().phase, 'error'); assert.equal(runtime.getState().live, false);
+    assert.match(runtime.getState().error.message, /counter readback failed/);
+    assert.equal(engine.frames.length, frames); assert.equal(loadCalls.length, loads); assert.equal(raf.size, 0);
+  });
+
+  test('progressive scene replacement retains a healthy pre-commit view and truthfully adopts post-commit failure', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); runtime.setLive(true);
+    const before = runtime.getState();
+    engine.sceneFailures.push({ stage: 'before', error: new Error('BVH admission failed') });
+    await assert.rejects(runtime.setSceneMode('progressive'), /BVH admission failed/);
+    const retained = runtime.getState();
+    assert.equal(retained.phase, 'ready'); assert.equal(retained.live, true);
+    assert.deepEqual(retained.settings, before.settings); assert.deepEqual(retained.sceneCommit, before.sceneCommit);
+    engine.sceneFailures.push({ stage: 'after', error: new Error('retirement failed') });
+    await assert.rejects(runtime.setSceneMode('progressive'), error => error.commitOccurred === true);
+    const committed = runtime.getState();
+    assert.equal(committed.phase, 'error'); assert.equal(committed.settings.sceneMode, 'progressive');
+    assert.equal(committed.settings.temporal, false); assert.equal(committed.settings.temporalRequested, true);
+    assert.deepEqual(committed.sceneCommit, engine.sceneIdentity); assert.deepEqual(committed.frame.scene, before.sceneCommit);
+  });
+
+  test('scripted progressive selection rejection restores the previous ready scene after fencing its queued resize', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive'); await runtime.setIndirectEnabled(false);
+    await runtime.selectModel(model('next'));
+    assert.ok(engine.sceneCalls.at(-1).indirect); assert.equal(runtime.getState().settings.indirectEnabled, false);
+    runtime.setLive(true);
+    const before = runtime.getState();
+    await assert.rejects(runtime.selectModel({ ...model('unavailable'), entryUrl: null, unavailableReason: 'not installed' }), /not installed/);
+    assert.deepEqual(runtime.getState(), before, 'Unavailable catalog metadata rejects before changing a ready progressive scene');
+    const scenes = engine.sceneCalls.length;
+    const source = deferred(); loadHook = () => source.promise;
+    const pending = runtime.selectModel(model('ineligible')), rejected = assert.rejects(pending, /lit and OPAQUE/);
+    let settled = false; pending.then(() => { settled = true; }, () => { settled = true; });
+    runtime.resize(320, 180);
+    const fence = engine.holdFence(), ineligible = progressiveAsset(model('ineligible').entryUrl);
+    ineligible.materials[0].unlit = true; source.resolve(ineligible);
+    await fence.entered.promise;
+    assert.equal(settled, false); assertFrameFits(engine.frames.at(-1), engine.scene.bounds);
+    assert.deepEqual(engine.frames.at(-1).scene, before.sceneCommit);
+    fence.done.resolve(); await rejected;
+    assert.equal(engine.sceneCalls.length, scenes);
+    const restored = runtime.getState();
+    assert.equal(restored.phase, 'ready'); assert.equal(restored.live, true);
+    assert.equal(restored.modelId, before.modelId); assert.equal(restored.requestedModelId, before.requestedModelId);
+    assert.equal(restored.settings.sceneMode, 'progressive'); assert.deepEqual(restored.sceneCommit, before.sceneCommit);
+    assert.deepEqual(restored.settings.textureDecision, before.settings.textureDecision);
+    assert.deepEqual(restored.viewport, { width: 320, height: 180 });
+    await runtime.setSceneMode('ordinary');
+    assert.equal(runtime.getState().phase, 'ready'); assert.equal(runtime.getState().settings.sceneMode, 'ordinary');
+  });
+
+  test('a progressive selection recovery fence cannot overwrite or submit after a newer model selection', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model()); await runtime.setSceneMode('progressive');
+    loadHook = async url => { const value = progressiveAsset(url); if (url.includes('ineligible')) value.materials[0].unlit = true; return value; };
+    const fence = engine.holdFence();
+    const pending = runtime.selectModel(model('ineligible')), rejected = assert.rejects(pending, /lit and OPAQUE/);
+    runtime.resize(320, 180); await fence.entered.promise;
+    await runtime.selectModel(model('newest'));
+    const newest = runtime.getState(), frames = engine.frames.length;
+    fence.done.resolve(); await rejected;
+    assert.deepEqual(runtime.getState(), newest); assert.equal(engine.frames.length, frames);
+    assert.equal(newest.phase, 'ready'); assert.equal(newest.modelId, 'newest');
+  });
+
+  test('superseding rejected progressive selections retain the last ready scene and older cleanup cannot clear its recovery snapshot', async () => {
+    loadHook = async url => progressiveAsset(url);
+    await runtime.selectModel(model('ready')); await runtime.setSceneMode('progressive'); runtime.setLive(true);
+    const before = runtime.getState(), scenes = engine.sceneCalls.length;
+    const olderSource = deferred(), newerSource = deferred();
+    loadHook = url => url.includes('/older/') ? olderSource.promise : newerSource.promise;
+    const older = runtime.selectModel(model('older')), olderRejected = assert.rejects(older, { name: 'AbortError' });
+    const newer = runtime.selectModel(model('ineligible')), newerRejected = assert.rejects(newer, /lit and OPAQUE/);
+    olderSource.resolve(progressiveAsset(model('older').entryUrl)); await olderRejected;
+    assert.equal(runtime.getState().phase, 'loading');
+    const ineligible = progressiveAsset(model('ineligible').entryUrl); ineligible.materials[0].unlit = true;
+    newerSource.resolve(ineligible); await newerRejected;
+    const restored = runtime.getState();
+    assert.equal(restored.phase, 'ready'); assert.equal(restored.live, true); assert.equal(raf.size, 1);
+    assert.equal(restored.modelId, before.modelId); assert.equal(restored.requestedModelId, before.requestedModelId);
+    assert.deepEqual(restored.sceneCommit, before.sceneCommit); assert.deepEqual(restored.settings, before.settings);
+    assert.equal(engine.sceneCalls.length, scenes);
+    await runtime.setSceneMode('ordinary');
+    assert.equal(runtime.getState().phase, 'ready'); assert.equal(runtime.getState().settings.sceneMode, 'ordinary');
   });
 
   test('a superseded loader resolving late cannot commit, submit or relabel the newer model', async () => {

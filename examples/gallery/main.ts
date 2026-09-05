@@ -1,7 +1,8 @@
 import { loadGalleryCatalog, orderedGalleryAssets, type GalleryAsset, type GalleryCatalog } from './catalog.js';
-import { GalleryRuntime, debugViews, lightingPresets, scenePresets, type DebugView, type GalleryAnimation, type GalleryEnvironment, type GalleryShading, type GalleryTextureCap, type LightingPreset, type ScenePreset } from './runtime.js';
+import { GalleryRuntime, debugViews, lightingPresets, scenePresets, type DebugView, type GalleryAnimation, type GalleryEnvironment, type GallerySceneMode, type GalleryShading, type GalleryTextureCap, type LightingPreset, type ScenePreset } from './runtime.js';
 import type { GalleryOrbit } from './orbit.js';
 import { fitViewportSize, watchDisplayDensity } from './viewport.js';
+import { describeProgressiveCounters } from './progressive-status.js';
 
 function element<T extends HTMLElement>(id: string): T {
   const value = document.getElementById(id);
@@ -20,6 +21,8 @@ const environmentSelect = element<HTMLSelectElement>('environment-preset');
 const environmentIntensity = element<HTMLInputElement>('environment-intensity');
 const environmentRotation = element<HTMLInputElement>('environment-rotation');
 const textureSelect = element<HTMLSelectElement>('texture-cap');
+const progressiveButton = element<HTMLButtonElement>('progressive-mode');
+const indirectToggle = element<HTMLInputElement>('indirect-enabled');
 const clipSelect = element<HTMLSelectElement>('animation-clip');
 const timeline = element<HTMLInputElement>('animation-time');
 const loopToggle = element<HTMLInputElement>('animation-loop');
@@ -104,10 +107,11 @@ function update() {
   fitMaximumDimension = state.engineInfo?.maxTextureDimension2D ?? fitMaximumDimension;
   const selected = assets.find(asset => asset.id === state.requestedModelId) ?? null;
   const ready = state.phase === 'ready' && state.busy === null;
+  const progressive = state.settings.sceneMode === 'progressive';
   const known = state.asset !== null && state.modelId === selected?.id ? state.asset : null;
   element('model-title').textContent = selected?.title ?? 'Model gallery';
   element('model-subtitle').textContent = selected ? `${selected.category} · Local glTF` : 'Select a local model to begin.';
-  element('connection-status').textContent = ({ initializing: 'Starting Strata', empty: 'Strata ready', loading: 'Loading model', ready: state.live ? 'Live view' : 'Ready · paused', unsupported: 'Unsupported', error: 'Needs attention', disposed: 'Disposed' } satisfies Record<typeof state.phase, string>)[state.phase];
+  element('connection-status').textContent = ({ initializing: 'Starting Strata', empty: 'Strata ready', loading: 'Loading model', ready: progressive ? state.live ? state.settings.indirectEnabled ? 'Accumulating preview' : 'Direct reference · live' : 'Preview · paused' : state.live ? 'Live view' : 'Ready · paused', unsupported: 'Unsupported', error: 'Needs attention', disposed: 'Disposed' } satisfies Record<typeof state.phase, string>)[state.phase];
   const overlay = element('stage-status');
   overlay.hidden = state.phase === 'ready';
   overlay.textContent = state.phase === 'loading' ? 'Loading model and textures into Strata…' : state.phase === 'initializing' ? 'Starting the WebGPU runtime…' : state.phase === 'empty' ? 'Choose a model from your collection.' : state.phase === 'disposed' ? 'Gallery disposed.' : 'The requested model is not ready.';
@@ -119,13 +123,19 @@ function update() {
   sceneSelect.value = state.settings.scenePreset;
   lightSelect.value = state.settings.lightingPreset;
   debugSelect.value = state.settings.debugView;
-  temporalToggle.disabled = !ready;
+  sceneSelect.disabled = !ready || progressive;
+  temporalToggle.disabled = !ready || progressive;
   temporalToggle.checked = state.settings.temporal;
+  for (const option of resolutionSelect.options) {
+    const [width, height] = option.value.split('x').map(Number);
+    option.disabled = progressive && (option.value === 'fit' || !width || !height || width * height > state.progressive.maxPixels);
+  }
   for (const control of [shadingSelect, environmentSelect, textureSelect]) control.disabled = !ready;
   shadingSelect.value = state.settings.shading;
   environmentSelect.value = state.settings.environment.preset;
   textureSelect.value = String(state.settings.textureCap);
   const environment = state.settings.environment;
+  element('environment-label').textContent = progressive ? 'Incident environment' : 'Distant environment';
   element('environment-controls').hidden = environment.preset === 'off';
   environmentIntensity.disabled = !ready || environment.preset === 'off';
   environmentRotation.disabled = !ready || environment.preset === 'off';
@@ -134,13 +144,34 @@ function update() {
   if (document.activeElement !== environmentRotation) environmentRotation.value = String(Number((environment.rotationRadians * 180 / Math.PI).toFixed(2)));
   element('quality-status').textContent = [
     state.settings.shading === 'relit' ? 'Unlit materials use a matte interpretation; source PBR materials retain their settings.' : 'Source-authored materials. Unlit materials ignore lighting.',
-    environment.preset === 'off' ? 'Environment off.' : environment.intensity === 0 ? 'Environment intensity is zero.' : 'The distant environment adds illumination without scene occlusion.',
+    environment.preset === 'off' ? 'Environment off.' : environment.intensity === 0 ? 'Environment intensity is zero.' : progressive ? state.settings.indirectEnabled ? 'The incident environment supplies visibility-tested diffuse transport.' : 'The incident environment is retained but inactive in this direct reference.' : 'The distant environment adds illumination without scene occlusion.',
   ].join(' ');
-  liveButton.textContent = state.live ? 'Pause live view' : 'Resume live view';
+  progressiveButton.disabled = !ready || (!progressive && (!fixedViewport || !state.progressive.eligibility.eligible));
+  progressiveButton.textContent = progressive ? 'Return to ordinary rendering' : 'Start progressive preview';
+  progressiveButton.setAttribute('aria-pressed', String(progressive));
+  indirectToggle.disabled = !ready || !progressive;
+  indirectToggle.checked = state.settings.indirectEnabled;
+  element('progressive-mode-label').textContent = progressive ? state.settings.indirectEnabled ? '· indirect included' : '· direct reference' : '· off';
+  element('progressive-guidance').textContent = progressive
+    ? `${state.viewport.width} × ${state.viewport.height} physical px. Both comparisons disable temporal AA, raster ambient and unoccluded environment lighting. ${state.settings.indirectEnabled ? 'Use Accumulate preview while stationary. Camera or light changes restart accumulation.' : 'The direct reference does not accumulate indirect samples. Re-enable indirect lighting to restart accumulation.'} Return to ordinary rendering to select another model or restore AA.`
+    : [
+      `Choose an explicit small render size, such as 640 × 360 or 320 × 180; maximum ${state.progressive.maxPixels.toLocaleString()} physical pixels. Fit and full HD are never reduced automatically.`,
+      ...state.progressive.eligibility.reasons,
+      ...(!fixedViewport ? ['Choose a fixed render size before starting the preview.'] : []),
+    ].join(' ');
+  element('progressive-diagnostics').hidden = !progressive;
+  const counterView = describeProgressiveCounters(state.progressive.telemetry, {
+    engineEpoch: state.engineEpoch, sceneGeneration: state.sceneCommit?.sceneGeneration ?? null, countersPending: state.progressive.countersPending,
+  });
+  for (const name of ['attempted', 'completed', 'exhausted', 'invalid'] as const) element(`progressive-${name}`).textContent = counterView.counts[name]?.toLocaleString() ?? '—';
+  element('progressive-counter-identity').textContent = counterView.identity;
+  element('progressive-counter-status').textContent = counterView.message;
+  liveButton.textContent = progressive ? state.settings.indirectEnabled ? state.live ? 'Pause accumulation' : 'Accumulate preview' : state.live ? 'Pause direct reference' : 'Resume direct reference' : state.live ? 'Pause live view' : 'Resume live view';
   liveButton.setAttribute('aria-pressed', String(state.live));
   for (const button of modelList.querySelectorAll<HTMLButtonElement>('button[data-model-id]')) {
     button.setAttribute('aria-pressed', String(button.dataset.modelId === state.requestedModelId));
-    button.disabled = state.phase === 'initializing' || state.phase === 'disposed' || state.busy !== null;
+    button.disabled = state.phase === 'initializing' || state.phase === 'disposed' || state.busy !== null || (ready && progressive);
+    button.title = ready && progressive ? 'Return to ordinary rendering before selecting another model.' : '';
   }
   if (shownModel !== selected?.id) {
     shownModel = selected?.id ?? null;
@@ -184,7 +215,9 @@ function update() {
   limitations.replaceChildren();
   const notes = new Set([
     'Texture caps are preflighted against the shared Core budget. Model details report the requested and effective caps; source images remain unchanged.',
-    'Lighting combines a directional light, ambient fill and optional distant environment illumination. Ambient and environment have no scene visibility, GI, local reflections or interior occlusion.',
+    progressive
+      ? 'Static progressive preview uses geometric normals and source textures at LOD zero for bounded diffuse transport. Both indirect-on and direct-reference views disable temporal AA, raster ambient and unoccluded environment lighting. No specular bounces or extra diffuse surface bounces.'
+      : 'Ordinary lighting combines a directional light, ambient fill and optional distant environment illumination. Ambient and environment have no scene visibility, GI, local reflections or interior occlusion.',
     ...(state.settings.scenePreset === 'ground' && (known?.clips.length ?? 0) > 0 ? ['Ground stays at the rest-pose level; animated poses can cross it. Use Model only to inspect the full pose.'] : []),
     ...(selected?.features.usedExtensions.includes('KHR_materials_unlit') ? [state.settings.shading === 'authored' ? 'Includes authored unlit materials, whose color ignores scene lighting. Relight unlit explicitly interprets them as matte materials.' : 'Source unlit materials are explicitly relit as matte dielectrics with geometric normals; this is an interpretation, not recovered source material.'] : []),
     ...(selected?.notes ?? []), ...(known?.warnings ?? []), ...(known ? state.frame?.imported?.warnings ?? [] : []), ...(catalog?.diagnostics ?? []),
@@ -199,18 +232,18 @@ function update() {
   }
   const animation = state.settings.animation;
   const activeClip = clips.find(clip => clip.id === animation.clipId);
-  clipSelect.disabled = !ready || clips.length === 0;
+  clipSelect.disabled = !ready || progressive || clips.length === 0;
   clipSelect.value = animation.clipId ?? '';
-  playButton.disabled = !ready || !activeClip;
+  playButton.disabled = !ready || progressive || !activeClip;
   playButton.textContent = animation.playing ? 'Pause animation' : 'Play animation';
   playButton.setAttribute('aria-pressed', String(animation.playing));
-  timeline.disabled = !ready || !activeClip;
+  timeline.disabled = !ready || progressive || !activeClip;
   timeline.max = String(activeClip?.duration ?? 0);
   if (!scrubbing) timeline.value = String(animation.timeSeconds);
   element<HTMLOutputElement>('animation-time-label').value = `${(scrubbing ? Number(timeline.value) : animation.timeSeconds).toFixed(2)} / ${(activeClip?.duration ?? 0).toFixed(2)} s`;
-  loopToggle.disabled = !ready || !activeClip;
+  loopToggle.disabled = !ready || progressive || !activeClip;
   loopToggle.checked = animation.loop;
-  element('animation-status').textContent = known ? clips.length ? `${clips.length} runtime-supported clips. Authored motion; camera fit uses rest pose. Looping returns to the clip start.` : 'The runtime exposes no playable clips for this model.' : 'Animation support is reported by the runtime.';
+  element('animation-status').textContent = progressive ? 'Progressive diffuse preview supports static geometry only. Animation and ground are unavailable in this mode.' : known ? clips.length ? `${clips.length} runtime-supported clips. Authored motion; camera fit uses rest pose. Looping returns to the clip start.` : 'The runtime exposes no playable clips for this model.' : 'Animation support is reported by the runtime.';
 
   const metrics = state.measurements;
   element('metric-cpu').textContent = milliseconds(metrics.cpuSubmissionMs);
@@ -294,8 +327,11 @@ environmentIntensity.addEventListener('change', () => run(() => runtime.setEnvir
 environmentRotation.addEventListener('change', () => run(() => runtime.setEnvironment({ rotationRadians: environmentRotation.valueAsNumber * Math.PI / 180 })), { signal: events.signal });
 for (const input of [environmentIntensity, environmentRotation]) input.addEventListener('blur', update, { signal: events.signal });
 textureSelect.addEventListener('change', () => run(() => runtime.setTextureCap(Number(textureSelect.value) as GalleryTextureCap)), { signal: events.signal });
+progressiveButton.addEventListener('click', () => run(() => setSceneMode(runtime.getState().settings.sceneMode === 'progressive' ? 'ordinary' : 'progressive')), { signal: events.signal });
+indirectToggle.addEventListener('change', () => run(() => runtime.setIndirectEnabled(indirectToggle.checked)), { signal: events.signal });
 resolutionSelect.addEventListener('change', () => run(async () => {
   if (resolutionSelect.value === 'fit') {
+    if (runtime.getState().settings.sceneMode === 'progressive') throw new Error('Return to ordinary rendering before choosing Fit viewport. The progressive preview requires an explicit bounded render size.');
     fixedViewport = false;
     element('viewport-wrap').removeAttribute('style');
     const size = fittedViewport();
@@ -383,6 +419,11 @@ async function setViewport(width: number, height: number) {
   } catch (error) { fixedViewport = previous; throw error; }
 }
 
+async function setSceneMode(mode: GallerySceneMode) {
+  if (mode === 'progressive' && !fixedViewport) throw new Error('Choose an explicit fixed render size, such as 640 × 360 or 320 × 180, before starting the progressive preview.');
+  await runtime.setSceneMode(mode);
+}
+
 const api = {
   getState: () => runtime.getState(),
   getDisplay,
@@ -395,6 +436,8 @@ const api = {
   setShading: (value: GalleryShading) => runtime.setShading(value),
   setEnvironment: (value: Partial<GalleryEnvironment>) => runtime.setEnvironment(value),
   setTextureCap: (value: GalleryTextureCap) => runtime.setTextureCap(value),
+  setSceneMode,
+  setIndirectEnabled: (enabled: boolean) => runtime.setIndirectEnabled(enabled),
   setOrbit: (orbit: Partial<GalleryOrbit>) => runtime.setOrbit(orbit),
   resetCamera: () => runtime.resetCamera(),
   setAnimation: (animation: Partial<GalleryAnimation>) => runtime.setAnimation(animation),
