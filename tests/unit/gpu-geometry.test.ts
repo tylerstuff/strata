@@ -10,6 +10,7 @@ function setup() {
   const cache = {
     gpuBufferBytes: 131_072, initialUploadBytes: 65_536, telemetry: {}, buffer: {},
     getSlot: vi.fn((id: number) => slots[id]!), dispose: vi.fn(), setDemand: vi.fn(),
+    whenDisposedAndSettled: vi.fn(async () => undefined),
     update: vi.fn(() => ({ uploadBytes: 0, uploaded: [] as { pageId: number; slot: number }[], evicted: [] as { pageId: number; slot: number }[] })),
   };
   vi.spyOn(GeometryPageCache, 'create').mockResolvedValue(cache as unknown as GeometryPageCache);

@@ -19,6 +19,24 @@ const uniformBytes = 160;
 const argumentBytes = 64;
 const feedbackCapacity = 3;
 
+/** Tracks original asynchronous lifetimes independently of mutable runtime slots.
+ * Ending ownership does not cancel work, and transferred ownership has a new waiter. */
+class OwnedAsyncSettlement {
+  private ended = false;
+  private readonly pending = new Set<Promise<unknown>>();
+  private resolve!: () => void;
+  readonly promise = new Promise<void>(resolve => { this.resolve = resolve; });
+
+  track(operation: Promise<unknown>): void {
+    if (this.pending.has(operation)) return;
+    this.pending.add(operation);
+    const finished = (): void => { this.pending.delete(operation); this.check(); };
+    void operation.then(finished, finished);
+  }
+  end(): void { this.ended = true; this.check(); }
+  private check(): void { if (this.ended && this.pending.size === 0) this.resolve(); }
+}
+
 /** Scalar preflight only. The caller owns the already parsed manifest and its JS objects.
  * The work-list reservation uses fullTriangles, a conservative bound on the packer's
  * min(fullTriangles, capacityPages * maxPageTriangles); it is not physical GPU usage. */
@@ -101,6 +119,7 @@ export class GpuGeometry implements RasterGeometryProvider {
   private readonly argumentReset = new Uint32Array(argumentBytes / 4);
   private readonly uniformData = new ArrayBuffer(uniformBytes);
   private disposed = false;
+  private readonly disposalSettlement = new OwnedAsyncSettlement();
   private residencyDirty = false;
   private droppedFeedback = 0;
   private latest: GeometryTelemetry = {
@@ -237,17 +256,21 @@ export class GpuGeometry implements RasterGeometryProvider {
     const buffers: GPUBuffer[] = [];
     let allocatedBytes = 0; let metadataOffset = 0; let selectionOffset = 0; let residencyOffset = 0;
     let triangleCapacity = 0;
+    const disposalSettlement = new OwnedAsyncSettlement();
     const unsubscribe = budget.subscribe(() => { if (status === 'pending') changes.notify(); });
     const detach = (): void => { unsubscribe(); options.signal?.removeEventListener('abort', onAbort); };
     const cleanup = (): void => {
       detach();
-      if (result) { result.dispose(); result = undefined; }
+      if (result) {
+        result.dispose(); disposalSettlement.track(result.whenDisposedAndSettled()); result = undefined;
+      }
       else {
-        cache?.dispose(); rendering?.dispose();
+        if (cache) { cache.dispose(); disposalSettlement.track(cache.whenDisposedAndSettled()); }
+        rendering?.dispose();
         for (const buffer of buffers) buffer.destroy();
       }
       // The cache handle retains canceled request/staging ownership until settlement.
-      cacheHandle?.dispose();
+      if (cacheHandle) { cacheHandle.dispose(); disposalSettlement.track(cacheHandle.whenDisposedAndSettled()); }
       // Pipeline compilation has no cancellation API. Keep this initializer's
       // reservations/storage until every started compilation operation settles.
       if (!pipelinesPending) {
@@ -256,6 +279,7 @@ export class GpuGeometry implements RasterGeometryProvider {
       }
       rendering = undefined; cache = undefined; resources = undefined; pipelines = undefined; feedback = [];
       buffers.length = 0;
+      disposalSettlement.end();
     };
     const fail = (cause: unknown): void => {
       if (status !== 'pending' && status !== 'ready') return;
@@ -290,7 +314,7 @@ export class GpuGeometry implements RasterGeometryProvider {
       ownLease = leases[0]!; transientLease = leases[2]!;
       try { cacheHandle = GeometryPageCache.begin(device, manifest, manifestUrl, options, budget, leases[1]!); }
       catch (cause) { leases[1]!.release(); throw cause; }
-      void watchCache(cacheHandle).catch(fail);
+      disposalSettlement.track(watchCache(cacheHandle).catch(fail));
       checkAbort();
       rendering = new TerrainRendering(device);
       metadata = buildGeometryMetadata(manifest, cachePlan.capacityPages);
@@ -307,7 +331,7 @@ export class GpuGeometry implements RasterGeometryProvider {
       const settlePipelines = (): void => {
         if (!pending.length) return;
         pipelinesPending = true;
-        void Promise.allSettled(pending).then(values => {
+        disposalSettlement.track(Promise.allSettled(pending).then(values => {
           pipelinesPending = false;
           if (status !== 'pending') { cleanup(); changes.notify(); return; }
           if (options.signal?.aborted) { onAbort(); return; }
@@ -315,7 +339,7 @@ export class GpuGeometry implements RasterGeometryProvider {
           if (rejected?.status === 'rejected') { fail(rejected.reason); return; }
           pipelines = values.map(value => (value as PromiseFulfilledResult<GPUComputePipeline>).value) as unknown as readonly [GPUComputePipeline, GPUComputePipeline];
           changes.notify();
-        });
+        }));
       };
       try {
         const observe = (promise: Promise<GPUComputePipeline>): Promise<GPUComputePipeline> => promise.catch(cause => { fail(cause); throw cause; });
@@ -390,6 +414,7 @@ export class GpuGeometry implements RasterGeometryProvider {
         return { status, uploadBytes: frame.writtenBytes - before };
       },
       waitForChange: (revision: number) => status !== 'pending' ? Promise.resolve() : changes.wait(revision),
+      whenDisposedAndSettled: () => disposalSettlement.promise,
       takeReady() {
         if (status !== 'ready') throw new StrataError('INVALID_OPTIONS', 'Geometry initialization is not ready or was already taken.');
         const value = result!; result = undefined; status = 'taken'; detach();
@@ -397,6 +422,9 @@ export class GpuGeometry implements RasterGeometryProvider {
         ownLease = undefined; rendering = undefined; cache = undefined; cacheHandle = undefined; resources = undefined;
         residencyWords = undefined; lightMatrix = undefined; pipelines = undefined; feedback = [];
         buffers.length = 0;
+        // This handle has relinquished ownership. Provider disposal has its own
+        // settlement promise and must be awaited by the new owner on retirement.
+        disposalSettlement.end();
         changes.notify(); return value;
       },
       dispose() {
@@ -514,7 +542,8 @@ export class GpuGeometry implements RasterGeometryProvider {
         slot.busy = false; slot.pending = null;
       }
     };
-    const pending = complete(); if (slot.busy) slot.pending = pending;
+    const pending = complete(); this.disposalSettlement.track(pending);
+    if (slot.busy) slot.pending = pending;
   }
 
   cancelFrame(): void {
@@ -533,12 +562,18 @@ export class GpuGeometry implements RasterGeometryProvider {
     } finally { clearTimeout(timer); }
   }
 
+  /** Resolves after actual disposal and all cache/feedback operations settle.
+   * Unlike flushFeedback(), disposal never bypasses this lifetime barrier. */
+  whenDisposedAndSettled(): Promise<void> { return this.disposalSettlement.promise; }
+
   dispose(): void {
     if (this.disposed) return;
     this.cancelFrame(); this.disposed = true; this.cache.dispose(); this.rendering.dispose();
+    this.disposalSettlement.track(this.cache.whenDisposedAndSettled());
     for (const slot of this.feedback) { if (slot.busy) this.droppedFeedback++; slot.busy = false; }
     for (const buffer of this.resources.buffers) buffer.destroy();
     this.initializationLease?.release();
     this.rasterBindings = undefined; this.shadowBindings = undefined;
+    this.disposalSettlement.end();
   }
 }
