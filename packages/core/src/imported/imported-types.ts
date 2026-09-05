@@ -63,8 +63,8 @@ export interface ImportedNode {
   readonly translation: ImportedVec3;
   readonly rotation: ImportedVec4;
   readonly scale: ImportedVec3;
-  /** Column-major local matrix for non-animated matrix-authored nodes. */
-  readonly matrix?: Float32Array<ArrayBuffer>;
+  /** Column-major local matrix for non-animated matrix-authored nodes. Loader JSON matrices retain binary64 precision until pose normalization. */
+  readonly matrix?: Float32Array<ArrayBuffer> | Float64Array<ArrayBuffer>;
 }
 export interface ImportedSkin {
   readonly joints: readonly number[];

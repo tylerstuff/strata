@@ -78,7 +78,7 @@ function preflightPose(asset: ImportedAsset): void {
   for (const node of nodes) {
     if (!node || !Array.isArray(node.translation) || !Array.isArray(node.rotation) || !Array.isArray(node.scale)
       || node.translation.length !== 3 || node.rotation.length !== 4 || node.scale.length !== 3
-      || (node.matrix !== undefined && (!(node.matrix instanceof Float32Array) || node.matrix.length !== 16))) invalid('invalid node data.');
+      || (node.matrix !== undefined && (!(node.matrix instanceof Float32Array || node.matrix instanceof Float64Array) || node.matrix.length !== 16))) invalid('invalid node data.');
     bytes += 10 * 8 + (node.matrix?.byteLength ?? 0);
   }
   for (const skin of skins) {

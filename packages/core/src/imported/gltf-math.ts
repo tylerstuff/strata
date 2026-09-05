@@ -7,6 +7,39 @@ export function multiplyGltfMatrices(a: ArrayLike<number>, b: ArrayLike<number>)
   for (let column = 0; column < 4; column++) for (let row = 0; row < 4; row++) for (let k = 0; k < 4; k++) result[column * 4 + row]! += a[k * 4 + row]! * b[column * 4 + k]!;
   if (!result.every(Number.isFinite)) gltfError('Hierarchy transform overflow.'); return result;
 }
+const gamma4 = 4 * Number.EPSILON / 2 / (1 - 4 * Number.EPSILON / 2);
+// Inflate nonnegative bound arithmetic and allow underflow. Bounds start at the
+// computed local matrices; this does not certify quaternion/TRS authoring error.
+const roundError = (products: number, propagated: number): number =>
+  (gamma4 * products + propagated + 8 * Number.MIN_VALUE) * (1 + 16 * Number.EPSILON);
+export function multiplyGltfMatrixError(a: ArrayLike<number>, b: ArrayLike<number>,
+  aError?: ArrayLike<number>, bError?: ArrayLike<number>): Float64Array<ArrayBuffer> {
+  const result = new Float64Array(16);
+  for (let column = 0; column < 4; column++) for (let row = 0; row < 4; row++) {
+    let products = 0, propagated = 0;
+    for (let k = 0; k < 4; k++) {
+      const ai = k * 4 + row, bi = column * 4 + k;
+      const ae = aError?.[ai] ?? 0, be = bError?.[bi] ?? 0;
+      products += Math.abs(a[ai]! * b[bi]!);
+      propagated += Math.abs(a[ai]!) * be + ae * (Math.abs(b[bi]!) + be);
+    }
+    result[column * 4 + row] = roundError(products, propagated);
+  }
+  return result;
+}
+export function gltfPositionError(matrix: ArrayLike<number>, error: ArrayLike<number> | undefined,
+  x: number, y: number, z: number): [number, number, number] {
+  const point = [x,y,z,1], result: [number,number,number] = [0,0,0];
+  for (let row = 0; row < 3; row++) {
+    let products = 0, propagated = 0;
+    for (let column = 0; column < 4; column++) {
+      products += Math.abs(matrix[column * 4 + row]! * point[column]!);
+      propagated += (error?.[column * 4 + row] ?? 0) * Math.abs(point[column]!);
+    }
+    result[row] = roundError(products, propagated);
+  }
+  return result;
+}
 export function nodeMatrix(node: GltfObject): Float64Array<ArrayBuffer> {
   if (node.matrix !== undefined) {
     if (node.translation !== undefined || node.rotation !== undefined || node.scale !== undefined) gltfError('A node cannot mix matrix and TRS.');

@@ -31,6 +31,37 @@ The host owns scheduling and play/pause. Clip time is explicit and independent o
 
 The loader centers the complete rest-pose asset in X/Z, places its bottom at Y=0, and scales its largest extent to two units. It reports original and normalized bounds plus the exact scale/translation. This placement applies once to static and animated geometry. It preserves authored root motion: travel clips can leave a camera fitted to rest bounds, and looping can jump from the final position to the initial position. The renderer does not silently remove that motion or follow it with the camera. Conservative current-pose joint bounds fit the shadow volume and camera far plane. The optional ground is a finite six-unit square; a traveling model can leave it.
 
+World positions remain binary64 until the complete asset's bounds and normalization
+are known. Normalization subtracts the source center before scaling and stores the
+result in the unchanged 64-byte float32 vertex records; reported normalized bounds
+enclose those stored positions. Generated world normals and tangents use the
+preserved positions. Matrix-authored nodes retain binary64 JSON matrices through
+pose evaluation; manually prepared assets may still supply Float32Array matrices.
+This prevents unit triangles translated by ±1e9 from collapsing during import.
+
+Rest-pose preparation rejects poorly conditioned transforms with `UNSUPPORTED_LIMIT`
+instead of silently returning collapsed geometry. Starting from the computed local
+matrices, it propagates absolute binary64 rounding allowances through hierarchy
+products, inverse binds, skin blending and affine position evaluation. For maximum
+position allowance `E` and observed largest extent `L`, it requires `L > 2E` and
+`8E/(L-2E)` plus normalization arithmetic allowance at most `2γ64(float32)` (about
+7.63e-6 normalized units). The normalization allowance also covers cancellation in
+the retained pose's scale/translation representation. This depends on asset scale
+and conditioning, rather than a maximum world coordinate. Recenter/rescale rejected
+source hierarchies. The allowance treats already-computed local matrices as its
+reference; it is not a proof of quaternion construction, bit-identical CPU/GPU
+positions, stable normals for arbitrarily thin triangles, or all future animation
+poses. General large-world scene support is a separate engine feature.
+
+`maxSourceBytes` admits the extra precision data before allocation: 24 temporary
+bytes per output vertex (including deindexed flat faces), 128 bytes per authored
+JSON matrix, 128 bytes per hierarchy-product or skin-palette error matrix, and
+256 bytes of reusable blend scratch per skinned primitive. Existing source,
+accessor and tangent-scratch accounting also applies. Position/error scratch is
+not returned or uploaded; matrix nodes reuse their parsed binary64 matrices.
+Cancellation checkpoints remain in vertex, index, normalization and attribute
+generation loops. These are payload admission limits, not process-RSS guarantees.
+
 For an explicit camera-framing action, the optional importer also exports
 `measureImportedPoseBounds(asset, animation, { signal? })`. It returns a promise
 with `bounds`, `unpaddedBounds`, per-axis `padding`, the resolved `animation`
@@ -66,9 +97,11 @@ contributions (four per skinned vertex, including zero weights), and 1 MiB of
 cumulative deduplication allocations. Each primitive allocates one bit per
 accessor vertex; shared-buffer instances have separate visited sets. Pose
 preflight also limits primitives and nodes to 4,096 each, skins to 1,024, total
-skin joints to 32,768, clips to 256, channels to 4,096 and copied source pose
-arrays to 8 MiB. These bound the synchronous evaluator stage; its JS object and
-allocation overhead are not a process-memory estimate. Cancellation is checked
+skin joints to 32,768, clips to 256, channels to 4,096 and accounted node
+transform, matrix and animation-array bytes to 8 MiB. The byte budget excludes
+copied skin joint-index lists, which are bounded separately by the joint-count
+limit. These bound the synchronous evaluator stage; its JS object and allocation
+overhead are not a process-memory estimate. Cancellation is checked
 before/after evaluation and at task yields after approximately 4,096 index or
 joint-contribution work units. `SCENE_LOAD_ABORTED` reports cancellation,
 `UNSUPPORTED_LIMIT` reports budget or unsafe float32-magnitude rejection, and

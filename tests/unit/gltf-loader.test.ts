@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadGltf, gltfImageDimensions } from '../../packages/core/src/imported/gltf-loader.js';
+import { createImportedPoseEvaluator } from '../../packages/core/src/imported/imported-animation.js';
+import { measureImportedPoseBounds } from '../../packages/core/src/imported/imported-pose-bounds.js';
 import type { GltfObject } from '../../packages/core/src/imported/gltf-accessor.js';
 
 // All bytes here are generated test data. No model or texture from the external collection is copied.
@@ -57,6 +59,147 @@ function translationClip(f: Fixture, node = 0): void {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('generated glTF rest geometry and materials', () => {
+  it.each([1e9, -1e9])('preserves a unit triangle translated by %s before normalization', async offset => {
+    const f = new Fixture(); f.triangle(); f.document.nodes = [{ mesh: 0, translation: [offset, 0, 0] }];
+    const asset = await f.load(), data = asset.primitives[0]!.vertices;
+    expect(asset.sourceBounds).toEqual({ min: [offset, 0, 0], max: [offset + 1, 1, 0] });
+    expectVector(data.subarray(0, 3), [-1, 0, 0]);
+    expectVector(data.subarray(16, 19), [1, 0, 0]);
+    expectVector(data.subarray(32, 35), [-1, 2, 0]);
+  });
+  it.each([1e9, -1e9])('generates nondegenerate normals and UV tangents before rounding translated positions (%s)', async offset => {
+    const f = new Fixture(); f.triangle(false); f.document.nodes = [{ mesh: 0, translation: [offset, -offset, offset] }];
+    const data = (await f.load()).primitives[0]!.vertices;
+    expectVector(data.subarray(0, 3), [-1, 0, 0]);
+    expectVector(data.subarray(16, 19), [1, 0, 0]);
+    expectVector(data.subarray(32, 35), [-1, 2, 0]);
+    for (let at = 0; at < data.length; at += 16) {
+      expectVector(data.subarray(at + 3, at + 6), [0, 0, 1]);
+      expectVector(data.subarray(at + 8, at + 12), [1, 0, 0, 1]);
+    }
+  });
+  for (const offset of [1e9, -1e9]) for (const matrix of [false, true]) for (const xScale of [2, -2]) {
+    it(`keeps ${matrix ? 'matrix' : 'TRS'} hierarchy rest/retained poses aligned at ${offset} with scale ${xScale},3,4`, async () => {
+      const f = new Fixture(); f.triangle(false);
+      const origin = [offset + .25, -offset - .5, offset + .75];
+      f.document.nodes = [matrix
+        ? { children: [1], matrix: [1,0,0,0, 0,1,0,0, 0,0,1,0, ...origin,1] }
+        : { children: [1], translation: origin },
+      { children: [2], translation: [.5,-.25,1.25], scale: [xScale,3,4] }, { mesh: 0 }];
+      translationClip(f, 2);
+      const asset = await f.load(), primitive = asset.primitives[0]!, local = primitive.deformation!.vertices;
+      const anchor = [origin[0]! + .5, origin[1]! - .25, origin[2]! + 1.25];
+      expect(asset.sourceBounds).toEqual({ min: [anchor[0]! + Math.min(0,xScale), anchor[1], anchor[2]],
+        max: [anchor[0]! + Math.max(0,xScale), anchor[1]! + 3, anchor[2]] });
+      if (matrix) {
+        expect(asset.rig!.nodes[0]!.matrix).toBeInstanceOf(Float64Array);
+        expect(asset.rig!.nodes[0]!.matrix![12]).toBe(origin[0]);
+      }
+      const evaluator = createImportedPoseEvaluator(asset), rest = evaluator.evaluate({ clipId: null, timeSeconds: 0, loop: false });
+      const transform = rest.nodeMatrices.subarray(32,48);
+      for (let vertex = 0; vertex < 3; vertex++) {
+        const at = vertex * 16;
+        const expected = [xScale * (vertex === 1 ? .5 : -.5) * 2/3, vertex === 2 ? 2 : 0, 0];
+        expectVector(primitive.vertices.subarray(at,at+3), expected, 5);
+        const posed = [0,1,2].map(axis => transform[axis]! * local[at]! + transform[4+axis]! * local[at+1]!
+          + transform[8+axis]! * local[at+2]! + transform[12+axis]!);
+        expectVector(posed, expected, 5);
+        expectVector(primitive.vertices.subarray(at+3,at+6), [0,0,1]);
+        expectVector(primitive.vertices.subarray(at+8,at+12), [Math.sign(xScale),0,0,Math.sign(xScale)]);
+      }
+      const measured = await measureImportedPoseBounds(asset, { clipId: null, timeSeconds: 0, loop: false });
+      expectVector(measured.unpaddedBounds.min, [-2/3,0,0], 5);
+      expectVector(measured.unpaddedBounds.max, [2/3,2,0], 5);
+      const animated = evaluator.evaluate({ clipId: 'animation-0', timeSeconds: .5, loop: false });
+      expect(animated.timeSeconds).toBe(.5);
+      expectVector(animated.nodeMatrices.subarray(44,47), [-xScale/6,0,0], 5);
+    });
+  }
+  it('charges exactly 24 temporary position bytes per expanded vertex before allocating scratch', async () => {
+    const f = new Fixture(), primitive = f.triangle();
+    (primitive.attributes as GltfObject).TANGENT = f.add(new Float32Array([1,0,0,1,1,0,0,1,1,0,0,1]), 'VEC4');
+    f.document.nodes = [{ mesh: 0, translation: [1e9,0,0] }]; f.serve();
+    const widths: Record<string, number> = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 };
+    const beforeScratch = new TextEncoder().encode(JSON.stringify(f.json())).byteLength + f.length
+      + f.accessors.reduce((bytes, accessor) => bytes + (accessor.count as number) * widths[accessor.type as string]! * 8, 0);
+    const allocations: number[] = [], original = Float64Array;
+    vi.stubGlobal('Float64Array', new Proxy(original, { construct(target, args) {
+      if (typeof args[0] === 'number') allocations.push(args[0]);
+      return Reflect.construct(target, args, target);
+    } }));
+    await expect(loadGltf('https://fixture.test/path/scene.gltf', { maxSourceBytes: beforeScratch + 72 - 1 })).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
+    expect(allocations.filter(count => count === 9)).toHaveLength(2); // POSITION/NORMAL decode only.
+    allocations.length = 0;
+    const asset = await loadGltf('https://fixture.test/path/scene.gltf', { maxSourceBytes: beforeScratch + 72 });
+    expect(allocations.filter(count => count === 9)).toHaveLength(3);
+    expect(asset.stats.geometryBytes).toBe(204); // Temporary precision does not enlarge GPU records.
+  });
+  it('rejects precision lost inside a cancelling hierarchy, including with missing normals', async () => {
+    for (const normal of [false,true]) for (const offset of [1e20,-1e20]) {
+      const f = new Fixture(); f.triangle(normal);
+      f.document.nodes = [{ children: [1], translation: [offset,0,0] }, { children: [2], translation: [1,0,0] },
+        { mesh: 0, translation: [-offset,0,0] }];
+      await expect(f.load()).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT', message: expect.stringContaining('precision allowance') });
+    }
+  });
+  it('rejects binary64 position collapse and unsafe normalization instead of returning finite-looking degenerate geometry', async () => {
+    for (const offset of [1e20,-1e20,1e308,-1e308]) {
+      const f = new Fixture(); f.triangle(); f.document.nodes = [{ mesh: 0, translation: [offset,0,0] }];
+      await expect(f.load()).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT', message: expect.stringContaining('precision allowance') });
+    }
+  });
+  it('uses asset scale rather than a blanket source translation limit', async () => {
+    const f = new Fixture(); f.triangle(); f.document.nodes = [{ mesh: 0, translation: [1e12,0,0], scale: [1e6,1e6,1e6] }];
+    const asset = await f.load(), data = asset.primitives[0]!.vertices;
+    expectVector(data.subarray(0,3), [-1,0,0]); expectVector(data.subarray(16,19), [1,0,0]);
+    expectVector(data.subarray(32,35), [-1,2,0]);
+  });
+  it('keeps a translated matrix-joint skin aligned with normalized baked rest positions', async () => {
+    const f = new Fixture(), primitive = f.triangle(), attributes = primitive.attributes as GltfObject;
+    attributes.JOINTS_0 = f.add(new Uint16Array(12), 'VEC4');
+    attributes.WEIGHTS_0 = f.add(new Float32Array([1,0,0,0,1,0,0,0,1,0,0,0]), 'VEC4');
+    const offset = 1e8 + .25;
+    f.document.nodes = [{ mesh: 0, skin: 0, translation: [999,999,999] },
+      { matrix: [2,0,0,0,0,3,0,0,0,0,4,0,offset,offset,offset,1] }];
+    f.document.scenes = [{ nodes: [0,1] }]; f.document.skins = [{ joints: [1] }];
+    const asset = await f.load(), mesh = asset.primitives[0]!, pose = createImportedPoseEvaluator(asset).evaluate();
+    expect(asset.rig!.nodes[1]!.matrix![12]).toBe(offset);
+    const matrix = pose.skinMatrices[0]!;
+    for (let vertex = 0; vertex < 3; vertex++) {
+      const at = vertex*16, source = mesh.deformation!.vertices;
+      const expected = [vertex === 1 ? 2/3 : -2/3, vertex === 2 ? 2 : 0, 0];
+      expectVector(mesh.vertices.subarray(at,at+3), expected, 5);
+      expectVector([0,1,2].map(axis => matrix[axis]! * source[at]! + matrix[axis+4]! * source[at+1]!
+        + matrix[axis+8]! * source[at+2]! + matrix[axis+12]!), expected, 5);
+    }
+  });
+  it('admits the hierarchy error sidecar before allocating its 128 bytes', async () => {
+    const f = new Fixture(); f.triangle(); f.document.nodes = [{ children: [1] }, { mesh: 0 }]; f.serve();
+    const encoded = new TextEncoder().encode(JSON.stringify(f.json())).byteLength + f.length;
+    const allocations: number[] = [], original = Float64Array;
+    vi.stubGlobal('Float64Array', new Proxy(original, { construct(target, args) {
+      if (typeof args[0] === 'number') allocations.push(args[0]);
+      return Reflect.construct(target, args, target);
+    } }));
+    await expect(loadGltf('https://fixture.test/path/scene.gltf', { maxSourceBytes: encoded + 127 })).rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
+    expect(allocations.filter(count => count === 16)).toHaveLength(1); // Existing world product, no error sidecar.
+  });
+  it('keeps cancellation checkpoints during the new precise-position transform pass', async () => {
+    const f = new Fixture(), primitive = f.triangle(), attributes = primitive.attributes as GltfObject, count = 5001;
+    const positions = new Float32Array(count*3), normals = new Float32Array(count*3);
+    positions.set([0,0,0,1,0,0,0,1,0]);
+    for (let vertex = 0; vertex < count; vertex++) normals[vertex*3+2] = 1;
+    attributes.POSITION = f.add(positions, 'VEC3'); attributes.NORMAL = f.add(normals, 'VEC3'); delete attributes.TEXCOORD_0;
+    f.serve();
+    const controller = new AbortController(), original = Float64Array; let allocations = 0;
+    vi.stubGlobal('Float64Array', new Proxy(original, { construct(target, args) {
+      if (args[0] === count*3 && ++allocations === 3) setTimeout(() => controller.abort('precise-pass'), 0);
+      return Reflect.construct(target, args, target);
+    } }));
+    await expect(loadGltf('https://fixture.test/path/scene.gltf', { signal: controller.signal })).rejects.toMatchObject({ code: 'SCENE_LOAD_ABORTED', cause: 'precise-pass' });
+    expect(allocations).toBe(3); expect(positions.byteLength).toBe(count*12);
+    expect([...positions.subarray(0,9)]).toEqual([0,0,0,1,0,0,0,1,0]);
+  });
   it('normalizes the selected scene and decodes normalized color/UV, MASK and unlit material texture semantics', async () => {
     const f = new Fixture(); const p = f.triangle(); const a = p.attributes as GltfObject;
     a.COLOR_0 = f.add(new Uint8Array([255, 128, 0, 64, 0, 255, 0, 255, 0, 0, 255, 255]), 'VEC4', true);

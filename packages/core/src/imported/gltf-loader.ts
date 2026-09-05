@@ -1,7 +1,7 @@
 import { StrataError } from '../errors.js';
 import { abort, checkpoint, GltfAccessors, gltfError, indexed, integer, list, object, scalar, vector } from './gltf-accessor.js';
 import type { GltfAccessor, GltfObject } from './gltf-accessor.js';
-import { affine, identityMatrix, multiplyGltfMatrices, nodeMatrix, normalMatrix, transformDirection, unit } from './gltf-math.js';
+import { affine, gltfPositionError, identityMatrix, multiplyGltfMatrices, multiplyGltfMatrixError, nodeMatrix, normalMatrix, transformDirection, unit } from './gltf-math.js';
 import type { ImportedAnimationClip, ImportedAsset, ImportedImage, ImportedMaterial, ImportedNode, ImportedPrimitive, ImportedSampler, ImportedSkin,
   ImportedTexture, ImportedVec3, ImportedVec4, LoadGltfOptions } from './imported-types.js';
 
@@ -140,15 +140,20 @@ function materialData(document: GltfObject): ImportedMaterial[] {
   });
 }
 
-async function hierarchy(document: GltfObject, signal?: AbortSignal) {
+async function hierarchy(document: GltfObject, reserve: (bytes: number) => void, signal?: AbortSignal) {
   const source = list(document.nodes ?? [], 'nodes', maximumItems).map((value, index) => object(value, `nodes[${index}]`));
   const parents = new Int32Array(source.length).fill(-1); const children = source.map(node => list(node.children ?? [], 'node.children', maximumItems).map(value => integer(value, 'node.child', 0, source.length - 1)));
   children.forEach((values, parent) => values.forEach(child => { if (parents[child] !== -1 || child === parent) gltfError('Node hierarchy contains repeated parents or self-reference.'); parents[child] = parent; }));
-  const local = source.map(nodeMatrix); const worlds: Float64Array<ArrayBuffer>[] = [];
+  const local = source.map(node => { if (node.matrix !== undefined) reserve(128); return nodeMatrix(node); });
+  const worlds: Float64Array<ArrayBuffer>[] = [];
+  const errors: (Float64Array<ArrayBuffer> | undefined)[] = [];
   const queue = Array.from(parents).flatMap((parent, index) => parent < 0 ? [index] : []);
   for (let index = 0; index < queue.length; index++) {
     if (index % 4096 === 0) await checkpoint(index, signal);
-    const node = queue[index]!; worlds[node] = parents[node]! < 0 ? local[node]! : multiplyGltfMatrices(worlds[parents[node]!]!, local[node]!); queue.push(...children[node]!);
+    const node = queue[index]!, parent = parents[node]!;
+    worlds[node] = parent < 0 ? local[node]! : multiplyGltfMatrices(worlds[parent]!, local[node]!);
+    if (parent >= 0) { reserve(128); errors[node] = multiplyGltfMatrixError(worlds[parent]!, local[node]!, errors[parent]); }
+    queue.push(...children[node]!);
   }
   if (queue.length !== source.length) gltfError('Node hierarchy has a cycle.');
   const scenes = list(document.scenes ?? [], 'scenes', maximumItems);
@@ -163,9 +168,11 @@ async function hierarchy(document: GltfObject, signal?: AbortSignal) {
     translation: vector(node.translation ?? [0, 0, 0], 3, 'node.translation') as unknown as ImportedVec3,
     rotation: vector(node.rotation ?? [0, 0, 0, 1], 4, 'node.rotation') as unknown as ImportedVec4,
     scale: vector(node.scale ?? [1, 1, 1], 3, 'node.scale') as unknown as ImportedVec3,
-    ...(node.matrix === undefined ? {} : { matrix: new Float32Array(local[index]!) }),
+    // Keep JSON matrix precision through retained-pose normalization as well as
+    // the baked path. This reuses the already allocated local matrix.
+    ...(node.matrix === undefined ? {} : { matrix: local[index]! }),
   }));
-  return { source, nodes, worlds, active };
+  return { source, nodes, worlds, errors, active };
 }
 
 async function animationData(document: GltfObject, accessors: GltfAccessors, nodes: readonly ImportedNode[], reserve: (bytes: number) => void, signal?: AbortSignal): Promise<ImportedAnimationClip[]> {
@@ -222,7 +229,7 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
       else { if (typeof buffer.uri !== 'string') gltfError('buffer.uri must be a string.'); data = await budget.fetch(new URL(buffer.uri, url)); }
       if (data.byteLength < length) gltfError('Resource is shorter than its declared buffer.'); buffers.push(data.subarray(0, length));
     }
-    const accessors = new GltfAccessors(doc, buffers, budget.reserve, options.signal); const graph = await hierarchy(doc, options.signal);
+    const accessors = new GltfAccessors(doc, buffers, budget.reserve, options.signal); const graph = await hierarchy(doc, budget.reserve, options.signal);
     const materials = materialData(doc); const images: ImportedImage[] = [];
     for (const [index, value] of list(doc.images ?? [], 'images', 256).entries()) {
       const image = object(value, 'image'); let bytes: Uint8Array<ArrayBuffer>;
@@ -232,21 +239,26 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
       if (image.mimeType !== undefined && image.mimeType !== dimensions.mimeType) gltfError('Image MIME disagrees with encoded content.');
       images.push({ name: text(image.name, `image-${index}`), bytes, ...dimensions });
     }
-    const skins: ImportedSkin[] = []; const skinMatrices: Float64Array<ArrayBuffer>[][] = [];
+    const skins: ImportedSkin[] = []; const skinMatrices: Float64Array<ArrayBuffer>[][] = [], skinErrors: Float64Array<ArrayBuffer>[][] = [];
     for (const value of list(doc.skins ?? [], 'skins', maximumItems)) {
       const skin = object(value, 'skin'); const joints = list(skin.joints, 'skin.joints', 1024).map(value => integer(value, 'skin.joint', 0, graph.nodes.length - 1));
       if (!joints.length || new Set(joints).size !== joints.length) gltfError('Skin joints must be nonempty and unique.');
       const source = skin.inverseBindMatrices === undefined ? undefined : await accessors.read(skin.inverseBindMatrices);
       if (source && (source.type !== 'MAT4' || source.componentType !== 5126 || source.count < joints.length)) gltfError('Invalid inverse bind matrices.');
-      reserve(joints.length * 64); const inverseBindMatrices = new Float32Array(joints.length * 16); const matrices = [];
+      reserve(joints.length * 64); budget.reserve(joints.length * 128);
+      const inverseBindMatrices = new Float32Array(joints.length * 16); const matrices = [], errors = [];
       for (let joint = 0; joint < joints.length; joint++) {
         const inverse = source ? source.values.subarray(joint * 16, joint * 16 + 16) : identityMatrix(); affine(inverse);
         inverseBindMatrices.set(inverse, joint * 16); matrices.push(multiplyGltfMatrices(graph.worlds[joints[joint]!]!, inverse));
+        errors.push(multiplyGltfMatrixError(graph.worlds[joints[joint]!]!, inverse, graph.errors[joints[joint]!]));
       }
-      skins.push({ joints, inverseBindMatrices }); skinMatrices.push(matrices);
+      skins.push({ joints, inverseBindMatrices }); skinMatrices.push(matrices); skinErrors.push(errors);
     }
     const clips = await animationData(doc, accessors, graph.nodes, reserve, options.signal); const retain = clips.length > 0 || skins.length > 0;
     const meshes = list(doc.meshes ?? [], 'meshes', maximumItems); const primitives: ImportedPrimitive[] = []; const warnings = new Set<string>();
+    const worldPositions: Float64Array<ArrayBuffer>[] = [];
+    const missingAttributes: { normal: boolean; tangent: boolean }[] = [];
+    let positionError = 0;
     let meshInstances = 0; let skinnedMeshInstances = 0; let vertices = 0; let triangles = 0;
     for (const node of graph.active) {
       abort(options.signal); const source = graph.source[node]!; if (source.mesh === undefined) continue;
@@ -281,8 +293,16 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
         const indexCount = indexData?.count ?? position.count; if (indexCount % 3) gltfError('Triangle index count is not divisible by three.');
         const count = normal ? position.count : indexCount;
         reserve(count * 64 + indexCount * 4 + (retain ? count * 64 + (skin === undefined ? 0 : count * 32) : 0));
+        // Transformed positions must not enter a float32 buffer until the whole
+        // asset has been centered/scaled. Charge the temporary 24 bytes/vertex
+        // before allocating it, including expanded flat-shaded vertices.
+        budget.reserve(count * 3 * 8);
+        const precisePositions = new Float64Array(count * 3);
         const local = new Float32Array(count * 16); const baked = new Float32Array(count * 16); const indices = new Uint32Array(indexCount);
         const retainedJoints = skin === undefined ? undefined : new Uint32Array(count * 4); const retainedWeights = skin === undefined ? undefined : new Float32Array(count * 4);
+        // Reuse the skin blend's two bounded matrices rather than allocating per vertex.
+        if (skin !== undefined) budget.reserve(256);
+        const blended = skin === undefined ? undefined : new Float64Array(16), blendError = skin === undefined ? undefined : new Float64Array(16);
         const sourceIndex = (index: number): number => {
           const value = indexData?.values[index] ?? index; if (!Number.isInteger(value) || value < 0 || value >= position.count) gltfError('Vertex index exceeds POSITION count.'); return value;
         };
@@ -300,8 +320,9 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
           local.set(tangent?.values.subarray(sourceVertex * 4, sourceVertex * 4 + 4) ?? [1, 0, 0, 1], at + 8);
           local.set([1, 1, 1, 1], at + 12); if (color) local.set(color.values.subarray(sourceVertex * color.components, sourceVertex * color.components + color.components), at + 12);
           let matrix = graph.worlds[node]!;
+          let matrixError = graph.errors[node];
           if (skin !== undefined) {
-            matrix = new Float64Array(16); let sum = 0;
+            matrix = blended!; matrix.fill(0); matrixError = blendError!; matrixError.fill(0); let sum = 0;
             for (let influence = 0; influence < 4; influence++) {
               const weight = weights!.values[sourceVertex * 4 + influence]!; const joint = joints!.values[sourceVertex * 4 + influence]!;
               if (weight < 0 || weight > 1 || !Number.isInteger(joint) || joint < 0 || joint >= skins[skin]!.joints.length) gltfError('Skin weight/joint index is invalid.'); sum += weight;
@@ -310,12 +331,20 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
             for (let influence = 0; influence < 4; influence++) {
               const weight = weights!.values[sourceVertex * 4 + influence]! / sum; const joint = joints!.values[sourceVertex * 4 + influence]!;
               retainedJoints![vertex * 4 + influence] = joint; retainedWeights![vertex * 4 + influence] = weight;
-              const transform = skinMatrices[skin]![joint]!; for (let component = 0; component < 16; component++) matrix[component]! += weight * transform[component]!;
+              const transform = skinMatrices[skin]![joint]!, error = skinErrors[skin]![joint]!;
+              for (let component = 0; component < 16; component++) {
+                matrix[component]! += weight * transform[component]!;
+                // Eight roundings allow weight normalization, multiplication and
+                // four-term blending; inflate the bound's own accumulation.
+                matrixError[component]! += (Math.abs(weight) * error[component]! + 8 * Number.EPSILON * Math.abs(weight * transform[component]!) + 8 * Number.MIN_VALUE) * (1 + 16 * Number.EPSILON);
+              }
             }
           }
           const nMatrix = rigidNormal ?? normalMatrix(matrix); signs[vertex] = nMatrix.sign;
           const p = transformDirection(matrix, local[at]!, local[at + 1]!, local[at + 2]!);
-          baked.set(local.subarray(at, at + 16), at); baked.set([p[0] + matrix[12]!, p[1] + matrix[13]!, p[2] + matrix[14]!], at);
+          baked.set(local.subarray(at, at + 16), at);
+          precisePositions.set([p[0] + matrix[12]!, p[1] + matrix[13]!, p[2] + matrix[14]!], vertex * 3);
+          positionError = Math.max(positionError, ...gltfPositionError(matrix, matrixError, local[at]!, local[at + 1]!, local[at + 2]!));
           if (normal) {
             const n = unit(...transformDirection(nMatrix.matrix, local[at + 3]!, local[at + 4]!, local[at + 5]!)); baked.set(n, at + 3);
             if (tangent) {
@@ -333,33 +362,58 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
           if (signs[a] !== signs[b] || signs[a] !== signs[c]) throw new StrataError('UNSUPPORTED_FEATURE', 'Mixed skin handedness within a triangle is unsupported.');
           if (signs[a]! < 0) { indices[index + 1] = c; indices[index + 2] = b; }
         }
-        if (!normal) { await generateNormals(baked, indices, options.signal); warnings.add('Missing normals use deindexed flat faces.'); }
-        if (!tangent) { budget.reserve(count * 6 * 8 * 2); await generateTangents(local, indices, options.signal); await generateTangents(baked, indices, options.signal); if (materials[material]!.normalTexture) warnings.add('Missing tangents use UV-derived tangents; exact MikkTSpace parity is not guaranteed.'); }
+        if (!normal) warnings.add('Missing normals use deindexed flat faces.');
+        if (!tangent) { budget.reserve(count * 6 * 8 * 2); await generateTangents(local, indices, options.signal); if (materials[material]!.normalTexture) warnings.add('Missing tangents use UV-derived tangents; exact MikkTSpace parity is not guaranteed.'); }
         if (!baked.every(Number.isFinite) || !local.every(Number.isFinite)) gltfError('Flattened geometry exceeds finite float32.');
         vertices += count; triangles += indexCount / 3;
         primitives.push({ name: text(mesh.name, `node-${node}`) + `/primitive-${index}`, vertices: baked, indices, material,
           ...(retain ? { deformation: { node, vertices: local, ...(skin === undefined ? {} : { skin, joints: retainedJoints!, weights: retainedWeights! }) } } : {}) });
+        worldPositions.push(precisePositions);
+        missingAttributes.push({ normal: !normal, tangent: !tangent });
         if (primitives.length > maximumItems) gltfError('Too many mesh primitive instances.');
       }
     }
     if (!primitives.length) gltfError('Selected scene contains no renderable triangles.');
     const min = [Infinity, Infinity, Infinity]; const max = [-Infinity, -Infinity, -Infinity];
-    for (const primitive of primitives) for (let vertex = 0; vertex < primitive.vertices.length / 16; vertex++) {
+    for (const positions of worldPositions) for (let vertex = 0; vertex < positions.length / 3; vertex++) {
       if (vertex % 4096 === 0) await checkpoint(vertex, options.signal);
       for (let axis = 0; axis < 3; axis++) {
-        min[axis] = Math.min(min[axis]!, primitive.vertices[vertex * 16 + axis]!); max[axis] = Math.max(max[axis]!, primitive.vertices[vertex * 16 + axis]!);
+        min[axis] = Math.min(min[axis]!, positions[vertex * 3 + axis]!); max[axis] = Math.max(max[axis]!, positions[vertex * 3 + axis]!);
       }
     }
     const extent = Math.max(...max.map((value, axis) => value - min[axis]!)); if (!Number.isFinite(extent) || extent <= 1e-12) gltfError('Scene has degenerate or non-finite bounds.');
-    const scale = 2 / extent; const translation: ImportedVec3 = [-(min[0]! + max[0]!) * scale / 2, -min[1]! * scale, -(min[2]! + max[2]!) * scale / 2];
-    for (const primitive of primitives) for (let vertex = 0; vertex < primitive.vertices.length / 16; vertex++) {
+    const scale = 2 / extent;
+    const center: ImportedVec3 = [min[0]! / 2 + max[0]! / 2, min[1]!, min[2]! / 2 + max[2]! / 2];
+    const translation = center.map(value => -value * scale) as unknown as ImportedVec3;
+    // Bound rest-pose affine cancellation relative to this asset's normalized
+    // size, including hierarchy errors even if large ancestor offsets cancel.
+    // Two 64-operation f32 error budgets are an admission allowance, not a claim
+    // of exact GPU parity or arbitrary large-world/animation precision.
+    const u32 = 2 ** -24, precisionAllowance = 2 * 64 * u32 / (1 - 64 * u32);
+    const normalizationError = 8 * Number.EPSILON * Math.max(...min.map(Math.abs), ...max.map(Math.abs)) * scale;
+    if (!Number.isFinite(scale) || !translation.every(Number.isFinite) || !Number.isFinite(positionError)
+      || extent <= 2 * positionError || 8 * positionError / (extent - 2 * positionError) + normalizationError > precisionAllowance) {
+      throw new StrataError('UNSUPPORTED_LIMIT', 'glTF rest transforms cannot preserve the normalized position precision allowance. Recenter or rescale the source hierarchy.');
+    }
+    const normalizedMin = [Infinity,Infinity,Infinity], normalizedMax = [-Infinity,-Infinity,-Infinity];
+    for (const [index, primitive] of primitives.entries()) for (let vertex = 0; vertex < primitive.vertices.length / 16; vertex++) {
       if (vertex % 4096 === 0) await checkpoint(vertex, options.signal);
-      for (let axis = 0; axis < 3; axis++) primitive.vertices[vertex * 16 + axis] = primitive.vertices[vertex * 16 + axis]! * scale + translation[axis]!;
+      for (let axis = 0; axis < 3; axis++) {
+        const value = Math.fround((worldPositions[index]![vertex * 3 + axis]! - center[axis]!) * scale);
+        if (!Number.isFinite(value)) throw new StrataError('UNSUPPORTED_LIMIT', 'glTF normalized positions exceed finite float32.');
+        primitive.vertices[vertex * 16 + axis] = value;
+        normalizedMin[axis] = Math.min(normalizedMin[axis]!, value); normalizedMax[axis] = Math.max(normalizedMax[axis]!, value);
+      }
+    }
+    for (const [index, primitive] of primitives.entries()) {
+      if (missingAttributes[index]!.normal) await generateNormals(primitive.vertices, primitive.indices, options.signal, worldPositions[index]);
+      if (missingAttributes[index]!.tangent) await generateTangents(primitive.vertices, primitive.indices, options.signal, worldPositions[index]);
+      if (!primitive.vertices.every(Number.isFinite)) gltfError('Normalized geometry exceeds finite float32.');
     }
     abort(options.signal);
     return { version: 1, sourceUrl: url.href, primitives, materials, images,
       sourceBounds: { min: min as unknown as ImportedVec3, max: max as unknown as ImportedVec3 },
-      bounds: { min: min.map((value, axis) => value * scale + translation[axis]!) as unknown as ImportedVec3, max: max.map((value, axis) => value * scale + translation[axis]!) as unknown as ImportedVec3 },
+      bounds: { min: normalizedMin as unknown as ImportedVec3, max: normalizedMax as unknown as ImportedVec3 },
       normalization: { scale, translation }, maxTextureDimension, warnings: [...warnings], clips,
       ...(retain ? { rig: { nodes: graph.nodes, skins } } : {}),
       stats: { meshInstances, primitives: primitives.length, vertices, triangles, materials: materials.length, images: images.length, encodedBytes: budget.encoded,
@@ -370,25 +424,29 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
   }
 }
 
-async function generateNormals(vertices: Float32Array<ArrayBuffer>, indices: Uint32Array<ArrayBuffer>, signal?: AbortSignal): Promise<void> {
+async function generateNormals(vertices: Float32Array<ArrayBuffer>, indices: Uint32Array<ArrayBuffer>, signal?: AbortSignal, positions?: Float64Array<ArrayBuffer>): Promise<void> {
   for (let index = 0; index < indices.length; index += 3) {
     if (index % 12288 === 0) await checkpoint(index / 3, signal);
     const a = indices[index]! * 16, b = indices[index + 1]! * 16, c = indices[index + 2]! * 16;
-    const u = [vertices[b]! - vertices[a]!, vertices[b + 1]! - vertices[a + 1]!, vertices[b + 2]! - vertices[a + 2]!];
-    const v = [vertices[c]! - vertices[a]!, vertices[c + 1]! - vertices[a + 1]!, vertices[c + 2]! - vertices[a + 2]!];
+    const source = positions ?? vertices, stride = positions ? 3 : 16;
+    const pa = a / 16 * stride, pb = b / 16 * stride, pc = c / 16 * stride;
+    const u = [source[pb]! - source[pa]!, source[pb + 1]! - source[pa + 1]!, source[pb + 2]! - source[pa + 2]!];
+    const v = [source[pc]! - source[pa]!, source[pc + 1]! - source[pa + 1]!, source[pc + 2]! - source[pa + 2]!];
     const n = unit(u[1]! * v[2]! - u[2]! * v[1]!, u[2]! * v[0]! - u[0]! * v[2]!, u[0]! * v[1]! - u[1]! * v[0]!);
     for (const at of [a, b, c]) vertices.set(n, at + 3);
   }
 }
-async function generateTangents(vertices: Float32Array<ArrayBuffer>, indices: Uint32Array<ArrayBuffer>, signal?: AbortSignal): Promise<void> {
+async function generateTangents(vertices: Float32Array<ArrayBuffer>, indices: Uint32Array<ArrayBuffer>, signal?: AbortSignal, positions?: Float64Array<ArrayBuffer>): Promise<void> {
   const sum = new Float64Array(vertices.length / 16 * 6);
   for (let index = 0; index < indices.length; index += 3) {
     if (index % 12288 === 0) await checkpoint(index / 3, signal);
     const ids = [indices[index]!, indices[index + 1]!, indices[index + 2]!]; const [a, b, c] = ids.map(value => value * 16) as [number, number, number];
     const du1 = vertices[b + 6]! - vertices[a + 6]!, dv1 = vertices[b + 7]! - vertices[a + 7]!, du2 = vertices[c + 6]! - vertices[a + 6]!, dv2 = vertices[c + 7]! - vertices[a + 7]!;
     const determinant = du1 * dv2 - du2 * dv1; if (Math.abs(determinant) < 1e-12) continue;
+    const source = positions ?? vertices, stride = positions ? 3 : 16;
+    const pa = ids[0]! * stride, pb = ids[1]! * stride, pc = ids[2]! * stride;
     for (let axis = 0; axis < 3; axis++) {
-      const p = vertices[b + axis]! - vertices[a + axis]!, q = vertices[c + axis]! - vertices[a + axis]!;
+      const p = source[pb + axis]! - source[pa + axis]!, q = source[pc + axis]! - source[pa + axis]!;
       for (const id of ids) { sum[id * 6 + axis]! += (p * dv2 - q * dv1) / determinant; sum[id * 6 + axis + 3]! += (q * du1 - p * du2) / determinant; }
     }
   }
