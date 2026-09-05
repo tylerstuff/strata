@@ -137,6 +137,7 @@ function update() {
   const notes = new Set([
     'Textures are capped at 2048 px for this gallery. Importer warnings report resizing and unsupported content.',
     'Lighting uses one directional light and ambient fill with material AO only. Imported GI and reflections are unavailable.',
+    ...(state.settings.scenePreset === 'ground' && (known?.clips.length ?? 0) > 0 ? ['Ground stays at the rest-pose level; animated poses can cross it. Use Model only to inspect the full pose.'] : []),
     ...(selected?.features.usedExtensions.includes('KHR_materials_unlit') ? ['Includes authored unlit materials. Their color may remain unchanged when scene lighting changes; ground and shadows can still respond.'] : []),
     ...(selected?.notes ?? []), ...(known?.warnings ?? []), ...(known ? state.frame?.imported?.warnings ?? [] : []), ...(catalog?.diagnostics ?? []),
   ]);

@@ -27,7 +27,9 @@ the optional `@strata-engine/core/gltf` entry separately from the runtime facade
 
 The gallery offers whole-model selection, orbit and reset, model-only or ground
 presentation, explicit scene lighting, and only the debug views supported by the
-imported renderer. Lighting presets use a directional light and ambient fill with
+imported renderer. Model only is the default. The optional ground stays at the
+rest-pose level; animated poses can cross it. Use Model only to inspect the full
+pose. Lighting presets use a directional light and ambient fill with
 material AO only. That fill is not global illumination or image-based
 lighting. Imported GI/reflections, virtual geometry and world streaming are
 outside this gallery's scope.

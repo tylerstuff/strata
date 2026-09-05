@@ -47,7 +47,7 @@ export class GalleryRuntime {
   #asset: PreparedAsset | null = null;
   #sceneCommit: unknown = null;
   #viewRevision = 0;
-  #scenePreset: ScenePreset = 'ground';
+  #scenePreset: ScenePreset = 'model-only';
   #lightingPreset: LightingPreset = 'studio';
   #debugView: DebugView = 'final';
   #orbit: GalleryOrbit = normalizeOrbit(initialOrbit, limits);
