@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assertMeasuredControlCode, assertMeasuredModuleGraph, assertTraceCorrectnessReceipt, assertTraceSource, buildTracePerformancePackages,
+import { assertBenchmarkAppGraph, assertMeasuredControlCode, assertMeasuredModuleGraph, assertTraceCorrectnessReceipt, assertTraceSource, buildTracePerformanceApp, buildTracePerformancePackages,
   frozenTraceRoute, loadTracePerformanceManifest, parseTracePerformanceArguments, traceCanonicalReceipt,
   TRACE_CAPTURE_TIMES, TRACE_GPU_DEADLINE_MS, TRACE_PERFORMANCE_OPTIONS, TRACE_PERFORMANCE_RUNS, verifyTraceFile } from './trace-performance-bundles.mjs';
 import { newExternalDirectory, proofHash } from './test-trace-updates.mjs';
@@ -158,6 +158,29 @@ test('actual production package builds differ only in the control source, keepin
     const code = (await Promise.all(bundle.files.filter(item => item.name.endsWith('.js')).map(item => readFile(join(directory, item.name), 'utf8')))).join('\n');
     assert(!code.includes('traceGiBruteForce(')); assert(!code.includes('conservativeFullNodeReference('));
     assert(!code.includes('tests/helpers/full-trace-updater.ts'));
+  }
+});
+test('actual benchmark app keeps only its original scenario closure and imports Engine externally', async t => {
+  const directory = await temp(t);
+  const app = await buildTracePerformanceApp(directory);
+  for (const item of [...app.files, app.graph]) await verifyTraceFile(join(directory, item.name), item);
+  const graph = JSON.parse(await readFile(join(directory, app.graph.name), 'utf8'));
+  assert.deepEqual(assertBenchmarkAppGraph(graph), app.moduleContract);
+  assert.equal(app.moduleContract.scanned.length, 11); assert.equal(app.moduleContract.emitted.length, 5);
+  assert.deepEqual(app.moduleContract.emitted.filter(path => path.startsWith('packages/')), ['packages/core/src/integrated/integrated-scene.ts']);
+  const scriptPath = Object.keys(graph.outputs).find(path => path.endsWith('.js'));
+  for (const mutate of [
+    g => { g.inputs['packages/core/src/engine.ts'] = { bytes: 1, imports: [] }; },
+    g => { g.inputs['tests/helpers/full-trace-updater.ts'] = { bytes: 1, imports: [] }; },
+    g => { g.inputs['benchmarks/src/unreviewed.ts'] = { bytes: 1, imports: [] }; },
+    g => { g.outputs[scriptPath].inputs['packages/core/src/errors.ts'] = { bytesInOutput: 1 }; },
+    g => { g.outputs[scriptPath].inputs['packages/core/src/gi/trace-updates.ts'] = { bytesInOutput: 1 }; },
+    g => { g.outputs[scriptPath].inputs['packages/core/src/integrated/integrated-renderer.ts'] = { bytesInOutput: 1 }; },
+    g => { g.outputs[scriptPath].imports = []; },
+    g => { g.outputs[scriptPath].imports[0].external = false; },
+    g => { g.outputs[scriptPath].imports[0].path = '@strata-engine/core/unreviewed'; },
+  ]) {
+    const changed = structuredClone(graph); mutate(changed); assert.throws(() => assertBenchmarkAppGraph(changed));
   }
 });
 

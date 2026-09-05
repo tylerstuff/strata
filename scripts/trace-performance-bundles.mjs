@@ -38,6 +38,19 @@ const canonical = Object.freeze({
 const packageFlags = Object.freeze({ entryPoints: ['packages/core/src/index.ts', 'packages/core/src/worker.ts', 'packages/core/src/gltf.ts'],
   bundle: true, splitting: true, chunkNames: '[name]-[hash]', format: 'esm', platform: 'browser', target: 'es2022', sourcemap: true, legalComments: 'none' });
 const appFlags = Object.freeze({ entryPoints: ['benchmarks/src/main.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2022', external: ['@strata-engine/core'], sourcemap: true });
+// The original app reexports integratedScenario from the pure scene module.
+// esbuild scans its scene/math dependencies, but emits only the scenario module;
+// Engine, renderers, workers and maintenance implementations remain external.
+const appScannedInputs = Object.freeze([
+  'benchmarks/src/main.ts', 'benchmarks/src/metrics.ts', 'benchmarks/src/ui-controls.ts', 'benchmarks/src/integrated-scenario.ts',
+  'packages/core/src/integrated/integrated-scene.ts', 'packages/core/src/errors.ts', 'packages/core/src/gi/scene-data.ts',
+  'packages/core/src/reflections/reflection-scene.ts', 'packages/core/src/rendering/scene-data.ts',
+  'packages/core/src/rendering/raster-math.ts', 'packages/core/src/gi/room-geometry.ts',
+].sort());
+const appEmittedInputs = Object.freeze([
+  'benchmarks/src/main.ts', 'benchmarks/src/metrics.ts', 'benchmarks/src/ui-controls.ts', 'benchmarks/src/integrated-scenario.ts',
+  'packages/core/src/integrated/integrated-scene.ts',
+].sort());
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
 const within = (root, path) => { const p = relative(root, path); return p === '' || (!isAbsolute(p) && p !== '..' && !p.startsWith(`..${sep}`)); };
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -151,6 +164,41 @@ export async function buildTracePerformancePackages(directory, wasm) {
   return bundles;
 }
 
+export function assertBenchmarkAppGraph(metafile) {
+  assert.deepEqual(Object.keys(metafile.inputs).sort(), appScannedInputs, 'Benchmark application scanned an unexpected runtime/harness dependency.');
+  for (const [path, input] of Object.entries(metafile.inputs)) for (const imported of input.imports) {
+    if (imported.external) {
+      assert.equal(path, 'benchmarks/src/main.ts');
+      assert.deepEqual(imported, { path: '@strata-engine/core', kind: 'import-statement', external: true });
+    } else assert(appScannedInputs.includes(imported.path), 'Benchmark application has an unexpected internal import.');
+  }
+  const outputs = Object.entries(metafile.outputs).filter(([path]) => path.endsWith('.js'));
+  assert.equal(outputs.length, 1, 'The original benchmark app must remain one ESM entry.');
+  const entry = outputs[0][1];
+  assert.equal(entry.entryPoint, 'benchmarks/src/main.ts');
+  assert.deepEqual(entry.imports, [{ path: '@strata-engine/core', kind: 'import-statement', external: true }], 'Engine must remain a real external package import.');
+  assert.deepEqual(Object.keys(entry.inputs).sort(), appEmittedInputs, 'Benchmark app emitted runtime/harness code beyond the original scenario closure.');
+  assert(Object.values(entry.inputs).every(input => input.bytesInOutput > 0));
+  return { scanned: appScannedInputs, emitted: appEmittedInputs, externalPackage: '@strata-engine/core' };
+}
+/** Same application bytes for both arms, using the unchanged production app build flags. */
+export async function buildTracePerformanceApp(directory) {
+  const appDirectory = resolve(directory, 'app'); await mkdir(appDirectory);
+  const builtApp = await build({ ...appFlags, absWorkingDir: TRACE_REPOSITORY, outfile: resolve(appDirectory, 'app.js'), write: false, metafile: true, logLevel: 'silent' });
+  const moduleContract = assertBenchmarkAppGraph(builtApp.metafile);
+  const app = { flags: appFlags, moduleContract, files: [], graph: null };
+  for (const file of builtApp.outputFiles) {
+    await writeFile(file.path, file.contents, { flag: 'wx' });
+    app.files.push({ name: relative(directory, file.path), url: `/benchmarks/browser/${relative(appDirectory, file.path)}`, bytes: file.contents.byteLength, sha256: proofHash(file.contents) });
+  }
+  const html = await readFile(resolve(TRACE_REPOSITORY, 'benchmarks/browser/index.html'));
+  await writeFile(resolve(appDirectory, 'index.html'), html, { flag: 'wx' });
+  app.files.push({ name: 'app/index.html', url: '/', bytes: html.byteLength, sha256: proofHash(html) });
+  await writeFile(resolve(appDirectory, 'metafile.json'), json(builtApp.metafile), { flag: 'wx' });
+  app.graph = await fileRecord(resolve(appDirectory, 'metafile.json'), 'app/metafile.json');
+  return app;
+}
+
 export async function prepareTracePerformance({ commit, assetRoot, output }) {
   const before = await traceSourceState(); assertTraceSource(before, commit);
   const assets = await assetsAt(assetRoot);
@@ -164,19 +212,7 @@ export async function prepareTracePerformance({ commit, assetRoot, output }) {
   assert.equal(wasmInputs[0].sha256, wasmInputs[1].sha256, 'Built package WASM differs from the release compiler output; run npm run build first.');
   const wasm = await readFile(resolve(TRACE_REPOSITORY, wasmPaths[0]));
   const bundles = await buildTracePerformancePackages(directory, wasm);
-  const appDirectory = resolve(directory, 'app'); await mkdir(appDirectory);
-  const builtApp = await build({ ...appFlags, absWorkingDir: TRACE_REPOSITORY, outfile: resolve(appDirectory, 'app.js'), write: false, metafile: true, logLevel: 'silent' });
-  assert(Object.keys(builtApp.metafile.inputs).every(p => p.startsWith('benchmarks/src/')), 'Application bundled runtime/harness code instead of importing the package.');
-  const app = { flags: appFlags, files: [], graph: null };
-  for (const file of builtApp.outputFiles) {
-    await writeFile(file.path, file.contents, { flag: 'wx' });
-    app.files.push({ name: relative(directory, file.path), url: `/benchmarks/browser/${relative(appDirectory, file.path)}`, bytes: file.contents.byteLength, sha256: proofHash(file.contents) });
-  }
-  const html = await readFile(resolve(TRACE_REPOSITORY, 'benchmarks/browser/index.html'));
-  await writeFile(resolve(appDirectory, 'index.html'), html, { flag: 'wx' });
-  app.files.push({ name: 'app/index.html', url: '/', bytes: html.byteLength, sha256: proofHash(html) });
-  await writeFile(resolve(appDirectory, 'metafile.json'), json(builtApp.metafile), { flag: 'wx' });
-  app.graph = await fileRecord(resolve(appDirectory, 'metafile.json'), 'app/metafile.json');
+  const app = await buildTracePerformanceApp(directory);
   assert.deepEqual(await traceSourceState(), before, 'Source changed during preparation.');
   assert.deepEqual(await sourceFiles(), inputs, 'Source bytes changed during preparation.');
   assert.deepEqual(await assetsAt(assets.root), assets, 'Source assets changed during preparation.');
@@ -215,6 +251,7 @@ export async function assertTracePerformanceFrozen(frozen) {
     assert(safeName(item.name)); const path = await realpath(resolve(directory, item.name)); assert(within(directory, path)); await verifyTraceFile(path, item);
   }
   for (const [arm, bundle] of Object.entries(manifest.bundles)) assertMeasuredModuleGraph(bundle.modules, bundle.substitutions, arm);
+  assert.deepEqual(assertBenchmarkAppGraph(JSON.parse(await readFile(resolve(directory, manifest.app.graph.name), 'utf8'))), manifest.app.moduleContract);
   assert.deepEqual(await assetsAt(manifest.assets.root), manifest.assets, 'Canonical source assets changed.');
   return { at: new Date().toISOString(), source: 'unchanged', assets: 'unchanged', artifacts: 'unchanged', manifestSha256: frozen.manifestSha256 };
 }
