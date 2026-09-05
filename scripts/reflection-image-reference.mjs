@@ -49,13 +49,21 @@ export function ggxBrdf(view, light, roughness, f0) {
   const fresnel = f0 + (1 - f0) * (1 - vh) ** 5;
   return fresnel * distribution * g1(nv) * g1(nl) / (4 * nv * nl);
 }
-function primaryPoint(camera, inverse, x, y) {
-  const far = multiply(inverse, [(x + .5) / 320 * 2 - 1, 1 - (y + .5) / 180 * 2, 1, 1]);
+export function referencePrimaryPoint(camera, inverse, x, y, width = 320, height = 180) {
+  const far = multiply(inverse, [(x + .5) / width * 2 - 1, 1 - (y + .5) / height * 2, 1, 1]);
   const ray = normalize(far.slice(0, 3).map((value, axis) => value / far[3] - camera.eye[axis]));
   const distance = (.01 - camera.eye[1]) / ray[1];
   return { distance, ray, point: camera.eye.map((value, axis) => value + distance * ray[axis]) };
 }
-export function buildImageReference(scene, camera, roughness, subdivisions) {
+export function buildImageReference(scene, camera, roughness, subdivisions, samples = {}) {
+  const { width = 320, height = 180, pixels = witnesses() } = samples;
+  if (!Number.isSafeInteger(width) || width < 1 || width > 4096 || !Number.isSafeInteger(height) || height < 1 || height > 4096
+    || !Number.isSafeInteger(subdivisions) || subdivisions < 1 || subdivisions > 1024
+    || !Array.isArray(pixels) || pixels.length < 1 || pixels.length > 16384
+    || Array.from(pixels).some(pixel => !Array.isArray(pixel) || pixel.length !== 2 || !Number.isInteger(pixel[0]) || !Number.isInteger(pixel[1])
+      || pixel[0] < 0 || pixel[0] >= width || pixel[1] < 0 || pixel[1] >= height)) {
+    throw new Error('Invalid bounded reference pixel corpus, viewport or quadrature subdivisions.');
+  }
   const emitter = scene.boxes.find(box => box.id === scene.objectBoxId);
   const reflector = scene.boxes.find(box => box.id === scene.reflectorBoxId);
   if (!emitter || !reflector || emitter.yaw !== 0 || roughness <= 0) throw new Error('Oracle requires the fixed axis-aligned emissive-box fixture and glossy roughness.');
@@ -72,8 +80,8 @@ export function buildImageReference(scene, camera, roughness, subdivisions) {
   const f0 = Math.round(scene.materials[reflector.materialId].albedo[0] * 255) / 255;
   const inverse = inverseMatrix(camera.viewProjection); const sourceBounds = aabb(emitter);
   const values = []; const mask = []; let quadratureRays = 0; let occludedRays = 0; let candidateBoxes = 0;
-  for (const [x, y] of witnesses()) {
-    const { point, ray, distance } = primaryPoint(camera, inverse, x, y);
+  for (const [x, y] of pixels) {
+    const { point, ray, distance } = referencePrimaryPoint(camera, inverse, x, y, width, height);
     const visible = distance > 0 && point[0] > -2 && point[0] < -1 && point[2] > -1 && point[2] < 1
       && !scene.boxes.some(box => box.id !== reflector.id && intersectBox(camera.eye, ray, box, .05, distance - 1e-5) !== null);
     mask.push(Number(visible)); if (!visible) { values.push(0, 0, 0); continue; }
