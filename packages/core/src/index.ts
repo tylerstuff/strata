@@ -13,3 +13,5 @@ export type {
   BoxSceneDescriptor, AuthoredBox, BoxVec3, BoxQuaternion,
   ImportedAsset, ImportedSceneOptions, ImportedControls, ImportedTelemetry, ImportedBounds, ImportedAnimationClip, ImportedEnvironment,
 } from './types.js';
+
+export type { ImportedIndirectOptions, ImportedIndirectTraceOptions, ImportedIndirectDenoise, ImportedIndirectProgress, ImportedIndirectReadback, ImportedSpatialDiagnostics } from './imported/imported-indirect-types.js';
