@@ -6,23 +6,32 @@ session factory, one-shot capture CLI, orchestration and local capture publicati
 It supports opaque procedural root boxes with explicit perspective camera and
 directional direct PBR or a base-color diagnostic. Imported assets, parents,
 textures, animation, shadows, temporal accumulation, GI and reflections are
-unsupported. The initial real CLI smoke verifies basic capture transport; the
-packed revision/pixel checks provide the broader integration gate. CPU fake-driver
-checks alone do not prove rendering, browser compatibility, precision or performance.
+unsupported. The packed browser workflow checks revision-bound pixels and
+receipts across 14 submitted frames and seven captures. Its
+[prior run passed](https://github.com/tylerstuff/strata/issues/8#issuecomment-5550219762)
+against external Core checkpoint `b17b8ac`; the final browser check after rebasing
+onto merged Core `8ec74f1` is pending. CPU fake-driver checks alone do not prove
+rendering, browser compatibility, precision or performance.
 
 ## Start a preview
 
-After building the workspace and optional preview package, use an installed
-Chrome browser or separately install Playwright Chromium. Runtime consumers
-receive precompiled WASM and never need Rust. The optional Node preview tool owns
-its browser, loopback server and scheduling; it installs no animation loop.
+From a fresh checkout, contributors need Node.js 22.13+ and rustup. Build from the
+repository root in this order: Core must produce its distribution, declarations,
+worker and WASM before preview compiles. `build:preview` also builds authoring.
 
 ```sh
+npm ci
+npm run build
 npm run build:preview
-node packages/preview/dist/bin.js capture --scene scene.json --view view.json --output captures --browser chrome
 ```
 
-`view.json` is explicit, for example:
+Use an installed Chrome browser or separately install Playwright Chromium.
+Consumers installing the built archives receive precompiled WASM and never need
+Rust. The optional Node preview tool owns its browser, loopback server and
+scheduling; it installs no animation loop.
+
+Choose a [versioned authoring document](authoring.md) as `scene.json` and save an
+explicit `view.json`, for example:
 
 ```json
 {
@@ -37,6 +46,12 @@ node packages/preview/dist/bin.js capture --scene scene.json --view view.json --
   "timeSeconds": 0,
   "temporal": false
 }
+```
+
+Then capture with the built CLI:
+
+```sh
+node packages/preview/dist/bin.js capture --scene scene.json --view view.json --output captures --browser chrome
 ```
 
 The API `createPreviewSession({ width, height, channel })` returns a reusable
@@ -113,11 +128,46 @@ Cleanup can reject with `PREVIEW_DISPOSE_FAILED`, including errors and any
 unresolved resources; a cleanup deadline is not proof that every resource closed.
 
 After `npm run build` produces Core's distribution, `npm run check:preview`
-builds authoring, typechecks/tests/builds preview and runs
-an isolated packed CPU consumer with Rust command guards. The suites cover
+builds authoring, typechecks/tests/builds preview and runs an isolated packed CPU
+consumer with Rust and browser command guards. The suites cover
 supersession, deep snapshots, historical/current commit disagreement, readiness,
 stale tokens, explicit frame evidence, disposal, cancellation through publication,
-short writes, output collisions, and cleanup failure. Browser/GPU execution must
-be scheduled with the coordinating task. Captures/results remain external to the
-repository under the [benchmark policy](benchmark.md); no external benchmark
-assets are required for this slice.
+short writes, output collisions, and cleanup failure. This command does not run
+the browser correctness workflow.
+
+Once built, `npm run test:preview:browser` runs
+[`scripts/test-preview-browser.mjs`](../scripts/test-preview-browser.mjs) and the
+[installed consumer workflow](../tests/consumers/preview/browser-workflow.mjs).
+It packs Core, authoring and preview, installs their archives in an isolated
+temporary consumer with install scripts disabled, and checks the precompiled
+WASM, package boundaries and Core-only browser bridge. Rust commands are guarded;
+the test does not build Rust or download a browser. It uses two sequential browser
+sessions: the reusable API submits 12 frames and publishes six captures, then the
+installed CLI submits two frames and publishes one capture.
+
+The browser assertions cover:
+
+- Detached load inputs and authoring edits that visibly move a red box and change
+  it to green, then change the material to blue in the lit `final` view.
+- A new commit generation for the same source revision with identical pixels,
+  rejection of stale source/load/view tokens, and preservation of the ready scene
+  when an unused external asset descriptor is rejected without submitting a frame.
+- Resize from 512 × 512 to 640 × 360, decoded PNG regions and dimensions, canonical
+  receipt/image hashes, matching scene/view/frame identities, frame-tagged GPU
+  samples or an unavailable reason, and zero reported GPU errors.
+- Repeated API disposal before the separate CLI browser starts, rejection of
+  post-disposal loads, and one clean canonical JSON result from the installed CLI.
+
+These are bounded correctness checks for procedural boxes, not a numeric PBR
+reference, cross-device determinism guarantee, broad precision test or performance
+result. The earlier 14-frame/seven-capture PASS used external Core `b17b8ac`;
+validation of the final integrated baseline on merged Core `8ec74f1` remains
+pending. Run the final check without `STRATA_PREVIEW_CORE_ARCHIVE` so it consumes
+the built workspace Core. When testing an external checkpoint, the harness records
+its archive identity separately from the worktree source identity.
+
+Browser/GPU execution must be scheduled with the coordinating task. The harness
+retains captures, receipts, source/archive hashes, consumed archives and reports
+under `~/Downloads/Strata-Preview-Checks/`, outside the repository, following the
+[benchmark policy](benchmark.md). No external benchmark assets are required for
+this slice.

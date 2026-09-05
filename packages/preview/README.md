@@ -24,8 +24,8 @@ request counter. Device/driver failure permanently invalidates the session.
 
 API output roots must already exist; the CLI creates its output root. Each capture
 reserves a new child directory, writes and verifies `image.png`, then atomically
-publishes `receipt.json` last
-without overwriting an existing capture. PNG verification checks the header,
+publishes `receipt.json` last without overwriting an existing capture. PNG
+verification checks the header,
 dimensions and exact written bytes; it does not decode pixels or prove visual
 correctness. The receipt records an unobserved compositor frame ID (`null`).
 Cancellation before publication rejects; cancellation during publication waits
@@ -50,6 +50,19 @@ downloads a browser automatically. No package has been published.
 strata-preview capture --scene scene.json --view view.json --output captures --browser chrome
 ```
 
+From a fresh repository checkout, contributors need Node.js 22.13+ and rustup.
+Build Core before the optional package so its declarations, worker and WASM are
+available; `build:preview` also builds authoring:
+
+```sh
+npm ci
+npm run build
+npm run build:preview
+```
+
+Run the repository CLI with `node packages/preview/dist/bin.js` in place of
+`strata-preview`, supplying authoring scene and view JSON files.
+
 `view.json` supplies `camera`, `light` and `background`. Optional `debugView`
 defaults to `final`; `timeSeconds` defaults to zero; `temporal` may only be false.
 The CLI returns one JSON result and closes its engine, worker, browser and server.
@@ -72,3 +85,15 @@ try {
   await session.dispose();
 }
 ```
+
+After the Core build, `npm run check:preview` runs the preview CPU suites and an
+isolated packed CPU consumer. Separately scheduled `npm run test:preview:browser`
+installs the built Core/authoring/preview archives and exercises 14 submitted
+frames and seven captures across sequential API and installed-CLI sessions. It
+checks visible transform/material edits, input snapshots, same-source commit
+generations, stale tokens, resize, PNG pixels and receipt identities, zero reported
+GPU errors, disposal and CLI output. This is procedural-box correctness evidence,
+not a performance or cross-device determinism claim. The prior workflow passed
+against external Core checkpoint `b17b8ac`; the final browser check after rebasing
+onto merged Core `8ec74f1` remains pending. Captures and reports stay outside the
+repository.
