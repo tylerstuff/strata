@@ -132,7 +132,7 @@ export async function validateImportedRendering() {
     cases.push({ name: 'uv-image-orientation', ...uv });
 
     const unlitMaterial = material({ ...textured, unlit: true, metallicFactor: 1, roughnessFactor: 1, occlusionTexture: texture(0),
-      normalTexture: texture(1), emissiveFactor: [8, 4, 2], emissiveStrength: 8 });
+      normalTexture: texture(1), emissiveFactor: [1, 0.5, 0.25], emissiveStrength: 64 });
     const unlitAsset = asset([quad(0, 0, 1, 0, 2, color)], [unlitMaterial], [base, normal]);
     const unlitDark = await render(unlitAsset); const unlitBright = await render(unlitAsset, { ...controls,
       lighting: { directionToLight: [0, 0, 1], color: [1, 0.5, 0.25], intensity: 8, ambient: [1, 1, 1] } });
