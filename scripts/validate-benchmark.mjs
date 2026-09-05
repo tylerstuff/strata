@@ -61,6 +61,9 @@ export function validateBenchmarkReport(report) {
     if (run.runner) ensure(run.runner.captureValidation?.passed === true, `${prefix} failed screenshot validation`);
     const gpuValues = frames.flatMap(frame => frame.gpuMs === null ? [] : [frame.gpuMs]);
     ensure(profiling.capturedGpuSamples === gpuValues.length, `${prefix} GPU sample count is inconsistent`);
+    if (profiling.timedFrameCount !== undefined) ensure(profiling.timedFrameCount === gpuValues.length, `${prefix} timed frame count is inconsistent`);
+    if (profiling.capturedPassSampleCount !== undefined) ensure(profiling.capturedPassSampleCount === Object.values(run.gpuPasses).reduce((sum, pass) => sum + pass.sampleCount, 0), `${prefix} pass sample count is inconsistent`);
+    const namedPasses = new Map();
     if (!profiling.gpuTimestampAvailable) {
       ensure(gpuValues.length === 0 && Object.keys(run.gpuPasses).length === 0, `${prefix} claims GPU measurements without available timestamps`);
     }
@@ -69,6 +72,21 @@ export function validateBenchmarkReport(report) {
       const frame = frames[frameIndex];
       ensure(frame.frameIntervalMs > 0, `${prefix} contains an empty frame interval`);
       ensure(frame.drawCalls > 0 && frame.triangles > 0, `${prefix} contains a frame without procedural geometry`);
+      if (frame.gpuPasses !== undefined) {
+        const entries = Object.entries(frame.gpuPasses);
+        if (frame.gpuMs === null) ensure(entries.length === 0, `${prefix} has named timings for an untimed frame`);
+        else {
+          ensure(entries.length > 0, `${prefix} has no named timings for a timed frame`);
+          close(frame.gpuMs, entries.reduce((sum, [, value]) => sum + value, 0), `${prefix} frame pass sum`);
+          const expected = run.workload.renderer === 'raster' ? ['shadow', 'raster', 'presentation', ...(run.workload.temporal ? ['temporal'] : [])] : ['procedural'];
+          ensure(entries.length === expected.length && expected.every(name => Object.hasOwn(frame.gpuPasses, name)), `${prefix} contains incomplete frame pass timings`);
+        }
+        for (const [name, value] of entries) {
+          const values = namedPasses.get(name) ?? [];
+          values.push(value);
+          namedPasses.set(name, values);
+        }
+      }
       if (frameIndex > 0) {
         const prior = frames[frameIndex - 1];
         ensure(frame.frameId > prior.frameId, `${prefix} frame IDs are not strictly increasing`);
@@ -92,6 +110,12 @@ export function validateBenchmarkReport(report) {
     ensure(summary.maxTrackedGpuTextureBytes === frames.reduce((maximum, frame) => Math.max(maximum, frame.allocatedGpuTextureBytes), 0), `${prefix} texture allocation maximum is inconsistent`);
     close(Object.values(run.gpuPasses).reduce((sum, pass) => sum + pass.totalMs, 0), gpuValues.reduce((sum, value) => sum + value, 0), `${prefix} GPU pass totals`);
     ensure(Object.values(run.gpuPasses).reduce((sum, pass) => sum + pass.sampleCount, 0) >= gpuValues.length, `${prefix} has fewer pass samples than timed frames`);
+    for (const [name, values] of namedPasses) {
+      const pass = run.gpuPasses[name];
+      ensure(pass && pass.sampleCount === values.length, `${prefix} named pass coverage differs from frames`);
+      distribution(pass, values, `${prefix}.gpuPasses.${name}`);
+      close(pass.totalMs, values.reduce((sum, value) => sum + value, 0), `${prefix} named pass total`);
+    }
   }
   return report;
 }

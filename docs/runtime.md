@@ -1,6 +1,6 @@
 # Runtime foundation
 
-The package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, clear or procedural diffuse scene rendering, CPU/GPU telemetry, physical-pixel resizing, and disposal. PBR, indirect lighting, game systems and the editor remain planned. The final graphics performance target is unverified.
+The package implements WebGPU device/canvas initialization, an isolated Rust/WASM worker, clear, procedural diffuse or PBR scene rendering, CPU/GPU telemetry, physical-pixel resizing, and disposal. Indirect lighting, virtual geometry, game systems and the editor remain planned. See [the raster guide](raster.md) for textured PBR, shadows and temporal controls. The final graphics performance target is unverified.
 
 ## Build and run
 

@@ -3,9 +3,12 @@ import { createEngine, type Engine } from '../../packages/core/src/index.js';
 import { initializeCpuRuntime } from '../../packages/core/src/internal/cpu-runtime.js';
 import { GpuProfiler } from '../../packages/core/src/profiling/gpu-profiler.js';
 import { SceneRenderer } from '../../packages/core/src/rendering/scene-renderer.js';
+import { RasterRenderer } from '../../packages/core/src/rendering/raster-renderer.js';
+import type { RasterControls } from '../../packages/core/src/rendering/raster-types.js';
 
 vi.mock('../../packages/core/src/internal/cpu-runtime.js', () => ({ initializeCpuRuntime: vi.fn() }));
 vi.mock('../../packages/core/src/rendering/scene-renderer.js', () => ({ SceneRenderer: { create: vi.fn() } }));
+vi.mock('../../packages/core/src/rendering/raster-renderer.js', () => ({ RasterRenderer: { create: vi.fn() } }));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -25,11 +28,16 @@ function fixture() {
   const queries: Array<{ destroy: ReturnType<typeof vi.fn> }> = [];
   function buffer(descriptor: GPUBufferDescriptor) {
     const mapping = deferred<void>();
-    const data = new BigUint64Array([1_000_000n, 3_500_000n]);
+    const data = new BigUint64Array(descriptor.size / 8);
+    for (let index = 0; index < data.length; index += 2) {
+      data[index] = 1_000_000n;
+      data[index + 1] = 3_500_000n;
+    }
     return {
       descriptor, mapping, data,
       mapAsync: vi.fn(() => mapping.promise),
-      getMappedRange: vi.fn(() => data.buffer), unmap: vi.fn(), destroy: vi.fn(),
+      getMappedRange: vi.fn((offset = 0, size = descriptor.size) => data.buffer.slice(offset, offset + size)),
+      unmap: vi.fn(), destroy: vi.fn(),
     };
   }
   const encoder = {
@@ -44,7 +52,7 @@ function fixture() {
     createBuffer: vi.fn((descriptor: GPUBufferDescriptor) => {
       const value = buffer(descriptor); buffers.push(value); return value;
     }),
-    createQuerySet: vi.fn(() => { const value = { destroy: vi.fn() }; queries.push(value); return value; }),
+    createQuerySet: vi.fn((_descriptor: GPUQuerySetDescriptor) => { const value = { destroy: vi.fn() }; queries.push(value); return value; }),
     createCommandEncoder: vi.fn(() => encoder), queue: { submit: vi.fn() },
   };
   const adapter = {
@@ -82,7 +90,7 @@ describe('bounded GPU timestamps', () => {
     ]);
     expect(profiler.pendingSamples).toBe(0);
     expect(profiler.droppedSamples).toBe(1);
-    expect(profiler.allocatedBufferBytes).toBe(64);
+    expect(profiler.allocatedBufferBytes).toBe(256);
     profiler.dispose();
   });
 
@@ -161,6 +169,80 @@ describe('bounded GPU timestamps', () => {
       vi.useRealTimers();
     }
   });
+
+  it('resolves all named passes with one copy/map and preserves zero durations without an overlapping total', async () => {
+    const f = fixture();
+    const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
+    const slot = profiler.begin(7, ['shadow', 'raster', 'temporal', 'presentation'])!;
+    f.buffers[1]!.data.set([1_000_000n, 2_000_000n, 3_000_000n, 5_000_000n, 6_000_000n, 6_000_000n, 7_000_000n, 7_500_000n]);
+    expect(slot.timestamps.temporal).toMatchObject({ beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 });
+    expect(slot.timestamps.presentation).toMatchObject({ beginningOfPassWriteIndex: 6, endOfPassWriteIndex: 7 });
+    profiler.resolve(f.encoder as unknown as GPUCommandEncoder, slot);
+    profiler.submitted(slot);
+    expect(profiler.pendingSamples).toBe(4);
+    expect(f.encoder.resolveQuerySet).toHaveBeenCalledWith(f.queries[0], 0, 8, f.buffers[0], 0);
+    expect(f.encoder.copyBufferToBuffer).toHaveBeenCalledWith(f.buffers[0], 0, f.buffers[1], 0, 64);
+    expect(f.buffers[1]!.mapAsync).toHaveBeenCalledExactlyOnceWith(1, 0, 64);
+    f.buffers[1]!.mapping.resolve();
+    await profiler.flush();
+    expect(profiler.drain()).toEqual([
+      { frameId: 7, pass: 'shadow', gpuMs: 1 },
+      { frameId: 7, pass: 'raster', gpuMs: 2 },
+      { frameId: 7, pass: 'temporal', gpuMs: 0 },
+      { frameId: 7, pass: 'presentation', gpuMs: 0.5 },
+    ]);
+    const withoutTemporal = profiler.begin(8, ['shadow', 'raster', 'presentation'])!;
+    expect(withoutTemporal.timestamps.temporal).toBeUndefined();
+    expect(withoutTemporal.timestamps.presentation).toMatchObject({ beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 });
+    profiler.cancel(withoutTemporal);
+    expect(profiler.droppedSamples).toBe(3);
+    profiler.dispose();
+  });
+
+  it('drops complete frame groups on queue pressure and invalid timestamp pairs', async () => {
+    const f = fixture();
+    const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1, 5);
+    profiler.submitted(profiler.begin(1, ['shadow', 'raster', 'temporal', 'presentation'])!);
+    f.buffers[1]!.mapping.resolve();
+    await profiler.flush();
+    profiler.submitted(profiler.begin(2, ['shadow', 'raster', 'presentation'])!);
+    await profiler.flush();
+    const retained = profiler.drain();
+    expect(retained.map((timing) => timing.frameId)).toEqual([2, 2, 2]);
+    expect(profiler.droppedSamples).toBe(4);
+    f.buffers[1]!.data[3] = 0n;
+    profiler.submitted(profiler.begin(3, ['shadow', 'raster', 'presentation'])!);
+    await profiler.flush();
+    expect(profiler.drain()).toEqual([]);
+    expect(profiler.droppedSamples).toBe(7);
+    profiler.dispose();
+  });
+
+  it('counts skipped and failed frame readbacks in individual pass units', async () => {
+    const f = fixture();
+    const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
+    profiler.submitted(profiler.begin(1, ['shadow', 'raster', 'temporal', 'presentation'])!);
+    expect(profiler.begin(2, ['shadow', 'raster', 'presentation'])).toBeNull();
+    f.buffers[1]!.mapping.reject(new Error('Readback failed'));
+    await profiler.flush();
+    expect(profiler.droppedSamples).toBe(7);
+    expect(profiler.pendingSamples).toBe(0);
+    expect(() => profiler.begin(3, ['shadow', 'shadow'])).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+    profiler.dispose();
+  });
+
+  it('reuses a slot after synchronous mapping failure and can cancel its next recording', () => {
+    const f = fixture();
+    const profiler = new GpuProfiler(f.device as unknown as GPUDevice, 1);
+    f.buffers[1]!.mapAsync.mockImplementationOnce(() => { throw new Error('Synchronous mapping failure'); });
+    profiler.submitted(profiler.begin(1, 'clear')!);
+    expect(profiler.pendingSamples).toBe(0);
+    profiler.cancel(profiler.begin(2, 'clear')!);
+    expect(profiler.pendingSamples).toBe(0);
+    expect(profiler.droppedSamples).toBe(2);
+    expect(profiler.begin(3, 'clear')).not.toBeNull();
+    profiler.dispose();
+  });
 });
 
 describe('engine telemetry and scene ownership', () => {
@@ -185,7 +267,7 @@ describe('engine telemetry and scene ownership', () => {
   function scene() {
     return {
       initialUploadBytes: 1024, gpuBufferBytes: 2048, gpuTextureBytes: 640 * 360 * 4,
-      encode: vi.fn(() => ({ drawCalls: 1, dispatchCalls: 0, triangles: 120, uploadBytes: 64 })),
+      encode: vi.fn((..._args: unknown[]) => ({ drawCalls: 1, dispatchCalls: 0, triangles: 120, uploadBytes: 64 })),
       dispose: vi.fn(),
     };
   }
@@ -213,7 +295,7 @@ describe('engine telemetry and scene ownership', () => {
     expect(f.adapter.requestDevice).toHaveBeenCalledWith(expect.objectContaining({ requiredFeatures: ['timestamp-query'] }));
     expect(engine.info.profiling.reason).toBe('available');
     const frame = engine.render();
-    expect(frame.allocatedGpuBufferBytes).toBe(128);
+    expect(frame.allocatedGpuBufferBytes).toBe(512);
     expect(engine.getTelemetry().pendingGpuSamples).toBe(1);
     expect(f.encoder.beginRenderPass).toHaveBeenCalledWith(expect.objectContaining({ timestampWrites: expect.any(Object) }));
     f.buffers[1]!.mapping.resolve();
@@ -381,5 +463,94 @@ describe('engine telemetry and scene ownership', () => {
     await microtasks();
     expect(cpu.dispose).toHaveBeenCalledOnce();
     expect(f.device.destroy).toHaveBeenCalledOnce();
+  });
+
+  it('selects the raster renderer and passes controls with exactly the active named timestamps', async () => {
+    const value = {
+      ...scene(),
+      passNames: vi.fn((controls: RasterControls) => controls.temporal === false
+        ? ['shadow', 'raster', 'presentation'] as const : ['shadow', 'raster', 'temporal', 'presentation'] as const),
+    };
+    vi.mocked(RasterRenderer.create).mockResolvedValue(value as unknown as RasterRenderer);
+    const engine = await ready(true);
+    await engine.setScene({ renderer: 'raster', seed: 17 });
+    expect(SceneRenderer.create).not.toHaveBeenCalled();
+    expect(RasterRenderer.create).toHaveBeenCalledWith(f.device, 'bgra8unorm', { renderer: 'raster', seed: 17 });
+    const controls = { timeSeconds: 3, temporal: false, debugView: 'normal' as const, cameraCut: true };
+    engine.render(controls);
+    expect(value.passNames).toHaveBeenCalledWith(controls);
+    const timestamps = value.encode.mock.calls[0]![6] as unknown as Record<string, GPURenderPassTimestampWrites>;
+    expect(Object.keys(timestamps)).toEqual(['shadow', 'raster', 'presentation']);
+    expect(engine.getTelemetry().pendingGpuSamples).toBe(3);
+    f.buffers[1]!.mapping.resolve();
+    await engine.flushGpuTimings();
+    expect(engine.drainGpuTimings().map(({ pass }) => pass)).toEqual(['shadow', 'raster', 'presentation']);
+  });
+
+  it('keeps a diffuse scene usable while raster loads and safely disposes an outdated raster result', async () => {
+    const original = scene();
+    const late = { ...scene(), passNames: vi.fn(() => ['shadow', 'raster', 'presentation'] as const) };
+    const wait = deferred<RasterRenderer>();
+    vi.mocked(SceneRenderer.create).mockResolvedValue(original as unknown as SceneRenderer);
+    vi.mocked(RasterRenderer.create).mockReturnValue(wait.promise);
+    const engine = await ready();
+    await engine.setScene({ renderer: 'diffuse' });
+    const pending = engine.setScene({ renderer: 'raster' });
+    const rejection = expect(pending).rejects.toMatchObject({ code: 'SCENE_LOAD_SUPERSEDED' });
+    await microtasks();
+    engine.render();
+    expect(original.encode).toHaveBeenCalledOnce();
+    await engine.setScene(null);
+    expect(original.dispose).toHaveBeenCalledOnce();
+    wait.resolve(late as unknown as RasterRenderer);
+    await rejection;
+    expect(late.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('validates renderer/debug controls consistently while preserving the diffuse defaults', async () => {
+    const engine = await ready();
+    await expect(engine.setScene({ renderer: 'other' as 'diffuse' })).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
+    expect(() => engine.render({ temporal: 'yes' as unknown as boolean })).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+    expect(() => engine.render({ cameraCut: 1 as unknown as boolean })).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+    expect(() => engine.render({ debugView: 'other' as 'final' })).toThrowError(expect.objectContaining({ code: 'INVALID_OPTIONS' }));
+    const value = scene();
+    vi.mocked(SceneRenderer.create).mockResolvedValue(value as unknown as SceneRenderer);
+    await engine.setScene({});
+    engine.render({ temporal: false, debugView: 'final' });
+    expect(value.encode).toHaveBeenCalledWith(f.encoder, expect.any(Object), 640, 360, 0, undefined);
+  });
+
+  it('forces a camera cut after failed raster submission until a raster frame successfully submits', async () => {
+    const value = { ...scene(), passNames: vi.fn(() => ['shadow', 'raster', 'temporal', 'presentation'] as const) };
+    vi.mocked(RasterRenderer.create).mockResolvedValue(value as unknown as RasterRenderer);
+    const engine = await ready();
+    await engine.setScene({ renderer: 'raster' });
+    const controls = { timeSeconds: 1, temporal: true, debugView: 'final' as const, cameraCut: false };
+    engine.render(controls);
+    f.device.queue.submit.mockImplementationOnce(() => { throw new Error('First failed submission'); });
+    expect(() => engine.render(controls)).toThrowError(expect.objectContaining({ code: 'RENDER_FAILED' }));
+    f.device.queue.submit.mockImplementationOnce(() => { throw new Error('Retry failed submission'); });
+    expect(() => engine.render(controls)).toThrowError(expect.objectContaining({ code: 'RENDER_FAILED' }));
+    engine.render(controls);
+    engine.render(controls);
+    const encodedControls = value.encode.mock.calls.map((call) => call[5] as RasterControls);
+    expect(encodedControls.map((options) => options.cameraCut)).toEqual([false, false, true, true, false]);
+    for (const options of encodedControls) expect(options).toMatchObject({ timeSeconds: 1, temporal: true, debugView: 'final' });
+    expect(controls.cameraCut).toBe(false);
+    expect(engine.getTelemetry().submittedFrames).toBe(3);
+  });
+
+  it('retains failed-frame invalidation across a successful clear frame', async () => {
+    const value = { ...scene(), passNames: vi.fn(() => ['shadow', 'raster', 'presentation'] as const) };
+    vi.mocked(RasterRenderer.create).mockResolvedValue(value as unknown as RasterRenderer);
+    const engine = await ready();
+    f.device.queue.submit.mockImplementationOnce(() => { throw new Error('Clear submission failed'); });
+    expect(() => engine.render()).toThrowError(expect.objectContaining({ code: 'RENDER_FAILED' }));
+    engine.render();
+    await engine.setScene({ renderer: 'raster' });
+    engine.render({ temporal: false, debugView: 'normal' });
+    expect(value.encode.mock.calls[0]![5]).toEqual({ temporal: false, debugView: 'normal', cameraCut: true });
+    engine.render({ temporal: false, debugView: 'normal' });
+    expect(value.encode.mock.calls[1]![5]).toEqual({ temporal: false, debugView: 'normal' });
   });
 });

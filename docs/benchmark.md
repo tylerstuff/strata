@@ -13,6 +13,8 @@ npm run benchmark:sustained
 
 The runner opens installed Chrome in a separate temporary profile, headed, on the hardware WebGPU adapter. The normal run measures 1280×720 then 1920×1080. Each resolution gets 30 seconds of shader/runtime warm-up followed by 60 seconds of moving-camera capture. The sustained run measures 1080p for 180 seconds after 30 seconds of warm-up. Keep the tab visible, connect AC power, record the chosen power profile and close competing GPU workloads where practical. Never silently change the user's power settings. A hidden tab cancels the run; a known software adapter is rejected for performance runs.
 
+See [the initial M2 baseline](benchmarks/2026-09-05-m2-baseline.md) for the first hardware evidence and [the raster guide](raster.md) for feature comparisons.
+
 Results and camera-time-zero PNGs go to `~/Downloads/Strata-Benchmark-Results/<timestamp>/`, outside Git. Override with `--output /external/results`; `--device-label` can record a useful machine label. Capture images only after timing stops. Images identify scene settings; their CSS screenshot size is recorded separately from the internal render resolution. `--warmup`, `--duration`, `--seed` and `--instance-count` support experiments but must match between comparisons. The benchmark page can also be opened through `npm run benchmark:serve` and saves a single-run JSON from its UI.
 
 `STRATA_TEST_BROWSER_CHANNEL=chrome npm run benchmark:smoke` uses short 0.25-second warm-up and 1-second captures for functional checks. CI explicitly selects software WebGPU and a headed Chromium virtual display. Smoke timings are never hardware performance evidence, and CI uploads no benchmark results or model files.

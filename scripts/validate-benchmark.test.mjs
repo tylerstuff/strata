@@ -81,3 +81,21 @@ test('rejects failed, hidden, software, blank, or GPU-invalid performance captur
     assert.throws(() => validateBenchmarkReport(report), expected);
   }
 });
+
+test('keeps complete named pass timings distinct from the number of timed frames', () => {
+  const report = fixture();
+  const run = report.runs[0];
+  Object.assign(run.workload, { renderer: 'raster', temporal: true });
+  Object.assign(run.profiling, { gpuTimestampAvailable: true, reason: 'available', capturedGpuSamples: 2, timedFrameCount: 2, capturedPassSampleCount: 8 });
+  const zero = { count: 2, min: 0, mean: 0, p50: 0, p95: 0, p99: 0, max: 0 };
+  run.summary.gpuPassMs = { ...zero };
+  const passes = { shadow: 0, raster: 0, temporal: 0, presentation: 0 };
+  run.frames.forEach(frame => { frame.gpuMs = 0; frame.gpuPasses = { ...passes }; });
+  run.gpuPasses = Object.fromEntries(Object.keys(passes).map(name => [name, { ...zero, sampleCount: 2, totalMs: 0 }]));
+  assert.equal(validateBenchmarkReport(report), report);
+  delete run.frames[0].gpuPasses.shadow;
+  assert.throws(() => validateBenchmarkReport(report), /incomplete frame pass timings/);
+  run.frames[0].gpuPasses.shadow = 0;
+  run.profiling.capturedPassSampleCount = 2;
+  assert.throws(() => validateBenchmarkReport(report), /pass sample count is inconsistent/);
+});

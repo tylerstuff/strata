@@ -3,5 +3,5 @@ export { StrataError } from './errors.js';
 export type { StrataErrorCode } from './errors.js';
 export type {
   CreateEngineOptions, Engine, EngineInfo, EngineState, EngineTelemetry,
-  FrameMetrics, GpuTiming, ProceduralSceneOptions,
+  FrameMetrics, GpuTiming, ProceduralSceneOptions, RasterControls, RenderOptions,
 } from './types.js';

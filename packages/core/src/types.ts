@@ -1,5 +1,12 @@
 export type { ProceduralSceneOptions } from './rendering/scene-renderer.js';
 import type { ProceduralSceneOptions } from './rendering/scene-renderer.js';
+export type { RasterControls } from './rendering/raster-types.js';
+import type { RasterControls } from './rendering/raster-types.js';
+
+export interface RenderOptions extends RasterControls {
+  /** Deterministic scene time, independent of wall-clock scheduling. */
+  timeSeconds?: number;
+}
 
 export interface CreateEngineOptions {
   /** A dedicated HTML canvas. One live engine may own it at a time. */
@@ -67,7 +74,7 @@ export interface FrameMetrics {
 export interface GpuTiming {
   readonly frameId: number;
   readonly pass: string;
-  /** Nanosecond timestamp difference converted to milliseconds, possibly quantized to zero. */
+  /** One named pass duration, excluding between-pass gaps and display scanout; may be quantized to zero. */
   readonly gpuMs: number;
 }
 
@@ -77,8 +84,9 @@ export interface EngineTelemetry {
   readonly allocatedGpuBufferBytes: number;
   readonly allocatedGpuTextureBytes: number;
   readonly wasmMemoryBytes: number;
+  /** Pending individual pass samples, not frames. */
   readonly pendingGpuSamples: number;
-  /** Includes full-ring skips, failed readbacks, and unread queue overflow. */
+  /** Dropped individual pass samples from full rings, failed readbacks, or unread queue overflow. */
   readonly droppedGpuSamples: number;
   readonly gpuErrorCount: number;
   /** Most recent uncaptured GPU error, capped at 2048 characters. */
@@ -93,7 +101,7 @@ export interface Engine {
   /** Replace the deterministic benchmark scene, or return to the clear-only baseline. */
   setScene(options: ProceduralSceneOptions | null): Promise<void>;
   /** Submit a frame; the host owns scheduling. timeSeconds is deterministic scene time. */
-  render(options?: { timeSeconds?: number }): FrameMetrics;
+  render(options?: RenderOptions): FrameMetrics;
   getTelemetry(): EngineTelemetry;
   /** Consume available results without waiting for the GPU. The queue is bounded. */
   drainGpuTimings(): GpuTiming[];

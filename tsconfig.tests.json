@@ -3,5 +3,5 @@
   "compilerOptions": {
     "skipLibCheck": true
   },
-  "include": ["packages/core/src/**/*.ts", "tests/unit/**/*.ts", "vitest.config.ts"]
+  "include": ["packages/core/src/**/*.ts", "tests/unit/**/*.ts", "tests/browser/**/*.ts", "vitest.config.ts"]
 }
