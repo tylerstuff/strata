@@ -8,6 +8,15 @@ function adapterDescription(adapter: GPUAdapter) {
     description: info.description, isFallbackAdapter: info.isFallbackAdapter };
 }
 
+function trackDeviceLoss(device: GPUDevice, errors: string[]) {
+  const health: { lost: { reason: GPUDeviceLostReason; message: string } | null } = { lost: null };
+  void device.lost.then(info => {
+    health.lost = { reason: info.reason, message: info.message };
+    if (info.reason !== 'destroyed') errors.push(`GPU device lost (${info.reason}): ${info.message}`);
+  });
+  return health;
+}
+
 async function readStats(device: GPUDevice, source: GPUBuffer, size = 32): Promise<number[]> {
   const buffer = device.createBuffer({ size, usage: 0x1 | 0x8 });
   try {
@@ -21,6 +30,7 @@ export async function validateReflectionSmoke() {
   const adapter = await navigator.gpu.requestAdapter(); require(adapter, 'WebGPU adapter unavailable.');
   const device = await adapter.requestDevice(); const gpuErrors: string[] = [];
   device.addEventListener('uncapturederror', event => gpuErrors.push(event.error.message));
+  const health = trackDeviceLoss(device, gpuErrors);
   let renderer: ReflectionRenderer | undefined; let target: GPUTexture | undefined;
   try {
     renderer = await ReflectionRenderer.create(device, 'rgba8unorm', { renderer: 'reflections', roughness: 0,
@@ -35,9 +45,9 @@ export async function validateReflectionSmoke() {
     require(reflectionStats[1]! > 0 && reflectionStats[5] === 0, `No valid bounded reflection work: ${reflectionStats}`);
     const kernel = await runReflectionKernelValidation(device);
     require(gpuErrors.length === 0, gpuErrors.join('\n'));
-    return { adapter: adapterDescription(adapter), stats, reflectionStats, reflectionTelemetry: renderer.reflectionTelemetry, kernel, gpuErrors };
+    return { adapter: adapterDescription(adapter), stats, reflectionStats, reflectionTelemetry: renderer.reflectionTelemetry, kernel, gpuErrors, deviceLoss: health.lost };
   } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${gpuErrors.join('\n')}`);
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${gpuErrors.join('\n')}\nDevice loss: ${JSON.stringify(health.lost)}`);
   } finally { renderer?.dispose(); target?.destroy(); device.destroy(); }
 }
 
@@ -135,21 +145,26 @@ function imageMetrics(image: Pixels) {
 }
 
 let session: { adapter: GPUAdapter; device: GPUDevice; context: GPUCanvasContext; canvas: HTMLCanvasElement;
-  renderer: ReflectionRenderer; frame: number; width: number; height: number; gpuErrors: string[] } | undefined;
+  renderer: ReflectionRenderer; frame: number; width: number; height: number; gpuErrors: string[]; health: ReturnType<typeof trackDeviceLoss>; currentCase: string } | undefined;
 const prior = new Map<string, { image: Pixels; metadata: Pixels; metrics: ReturnType<typeof imageMetrics>; epoch: number }>();
 export async function startReflectionValidation(cameraMode: 'receiver' | 'tour' = 'receiver', budget = 32768, scale: .25 | .5 | 1 = 1) {
   disposeReflectionValidation();
   const adapter = await navigator.gpu.requestAdapter(); require(adapter, 'WebGPU unavailable.'); const device = await adapter.requestDevice();
   const gpuErrors: string[] = []; device.addEventListener('uncapturederror', event => gpuErrors.push(event.error.message));
+  const health = trackDeviceLoss(device, gpuErrors);
   const canvas = document.querySelector('canvas'); require(canvas, 'Reflection canvas missing.'); canvas.width = 320; canvas.height = 180;
   const context = canvas.getContext('webgpu') as GPUCanvasContext | null; require(context, 'WebGPU canvas unavailable.');
   const format = navigator.gpu.getPreferredCanvasFormat(); context.configure({ device, format, alphaMode: 'opaque', usage: 0x10 | 0x1 });
   try {
     const renderer = await ReflectionRenderer.create(device, format, { renderer: 'reflections', cameraMode,
       roughness: 0, resolutionScale: scale, maxRaysPerFrame: budget });
-    session = { adapter, device, context, canvas, renderer, frame: 0, width: 320, height: 180, gpuErrors };
+    session = { adapter, device, context, canvas, renderer, frame: 0, width: 320, height: 180, gpuErrors, health, currentCase: 'setup' };
     return { cameraMode, budget, resolutionScale: scale, adapter: adapterDescription(adapter), width: 320, height: 180 };
   } catch (error) { context.unconfigure(); device.destroy(); throw error; }
+}
+export function reflectionValidationDiagnostics() {
+  return session ? { frame: session.frame, currentCase: session.currentCase, deviceLoss: session.health.lost, gpuErrors: session.gpuErrors,
+    reflectionTelemetry: session.renderer.reflectionTelemetry } : null;
 }
 export function disposeReflectionValidation() {
   if (!session) return null;
@@ -166,7 +181,14 @@ async function step(patch: Controls = {}, time = 0, capture = true) {
   const encoder = s.device.createCommandEncoder(); const target = s.context.getCurrentTexture();
   const stats = s.renderer.encode(encoder, target.createView(), s.width, s.height, time, controls);
   s.device.queue.submit([encoder.finish()]); s.renderer.submitted(++s.frame);
-  if (!capture) return null;
+  if (!capture) {
+    // Functional accumulation is frame-count based, never throughput evidence. Keep
+    // slow software backends to one queued warmup frame instead of flooding their
+    // command queue with 65/240 complete render graphs before the first readback.
+    await s.device.queue.onSubmittedWorkDone();
+    require(s.health.lost === null, `GPU lost during ${s.currentCase}: ${JSON.stringify(s.health.lost)}`);
+    return null;
+  }
   const telemetry = s.renderer.reflectionTelemetry; const mode = telemetry.mode; const diagnostic = s.renderer.reflectionCache.diagnostics;
   const image = mode === 'off' && !s.renderer.giTelemetry.enabled ? await readTexture(s.device, target) : await readTexture(s.device, s.renderer.composer.outputTexture!);
   const metadata = await readTexture(s.device, diagnostic.metadataTexture); const raw = await readTexture(s.device, diagnostic.rawTexture);
@@ -221,7 +243,7 @@ function checkMirrorOracle(raw: Pixels) {
   return { expectedHits, actualHits, falseHits, falseMisses, interiorFailures, silhouetteTolerancePixels: 1 };
 }
 export async function runReflectionCase(name: string) {
-  require(session, 'Reflection session missing.'); const s = session; let result!: NonNullable<Awaited<ReturnType<typeof step>>>;
+  require(session, 'Reflection session missing.'); const s = session; s.currentCase = name; let result!: NonNullable<Awaited<ReturnType<typeof step>>>;
   let evidence: Record<string, unknown> = {};
   if (name === 'cold-world') {
     result = (await step({ reflections: { mode: 'world', roughness: 0 } }))!;

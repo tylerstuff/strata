@@ -24,7 +24,7 @@ const args = ['--enable-unsafe-webgpu'];
 if (process.env.STRATA_TEST_SOFTWARE_GPU === '1') args.push(...(platform() === 'linux'
   ? ['--enable-features=Vulkan', '--use-angle=vulkan', '--use-vulkan=swiftshader', '--use-webgpu-adapter=swiftshader', '--disable-vulkan-surface']
   : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']));
-let server; let browser;
+let server; let browser; let page;
 try {
   const [revision, dirty] = await Promise.all([command('git', ['rev-parse', 'HEAD']), command('git', ['status', '--porcelain'])]);
   report.source = { commit: revision.stdout.trim(), dirty: dirty.stdout.trim().length > 0 };
@@ -32,9 +32,10 @@ try {
   browser = await chromium.launch({ channel: process.env.STRATA_TEST_BROWSER_CHANNEL ?? 'chromium',
     headless: process.env.STRATA_TEST_HEADED !== '1', args });
   report.host.browser = browser.version(); report.softwareGpu = process.env.STRATA_TEST_SOFTWARE_GPU === '1';
-  const page = await browser.newPage({ viewport: { width: 1000, height: 800 }, deviceScaleFactor: 1 });
+  page = await browser.newPage({ viewport: { width: 1000, height: 800 }, deviceScaleFactor: 1 });
   const errors = []; report.browserErrors = errors;
   page.on('pageerror', error => errors.push(error.message));
+  page.on('crash', () => errors.push('Browser page crashed.'));
   page.on('console', message => { if (message.type() === 'error') { errors.push(message.text()); console.error(message.text()); } });
   await page.route(`${server.url}/reflection-validation.html`, route => route.fulfill({ contentType: 'text/html',
     body: '<!doctype html><meta charset="utf-8"><title>Strata reflection validation</title><canvas width="320" height="180"></canvas>' }));
@@ -76,7 +77,12 @@ try {
   }
   assert.deepEqual(errors, []);
   console.log(`Reflection validation passed. Local evidence: ${directory}`);
-} catch (error) { report.failure = error.message; throw error; }
+} catch (error) {
+  report.failure = error.message;
+  report.diagnostics = await page?.evaluate(async () => (await import('/reflection-validation.js')).reflectionValidationDiagnostics()).catch(() => null);
+  console.error('Reflection failure diagnostics:', JSON.stringify(report.diagnostics));
+  throw error;
+}
 finally {
   const cleanup = await Promise.allSettled([browser?.close(), server?.close()]);
   await writeFile(resolve(directory, 'report.json'), JSON.stringify(report, null, 2) + '\n');
