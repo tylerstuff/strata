@@ -53,6 +53,12 @@ reference; it is not a proof of quaternion construction, bit-identical CPU/GPU
 positions, stable normals for arbitrarily thin triangles, or all future animation
 poses. General large-world scene support is a separate engine feature.
 
+`loadGltf` accepts at most 1,024 images, matching renderer admission.
+`maxSourceBytes` defaults to 256 MiB and permits an explicit ceiling up to 2 GiB
+for large local scenes. Raising it does not raise the renderer's 256 MiB static
+geometry or 512 MiB texture budget. Source images remain unchanged; use the
+texture allocation estimator to choose a disclosed upload cap.
+
 `maxSourceBytes` admits the extra precision data before allocation: 24 temporary
 bytes per output vertex (including deindexed flat faces), 128 bytes per authored
 JSON matrix, 128 bytes per hierarchy-product or skin-palette error matrix, and

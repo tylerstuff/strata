@@ -59,6 +59,32 @@ function translationClip(f: Fixture, node = 0): void {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('generated glTF rest geometry and materials', () => {
+  it('admits an explicit 2 GiB source ceiling and rejects larger budgets before fetching', async () => {
+    const f = new Fixture(); f.triangle(); f.serve();
+    await expect(loadGltf('https://fixture.test/path/scene.gltf', { maxSourceBytes: 2 ** 31 })).resolves.toHaveProperty('primitives');
+    vi.mocked(fetch).mockClear();
+    await expect(loadGltf('https://fixture.test/path/scene.gltf', { maxSourceBytes: 2 ** 31 + 1 })).rejects.toMatchObject({ code: 'SCENE_LOAD_FAILED' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it('loads a material referencing image 1023 while retaining byte-budget enforcement', async () => {
+    const f = new Fixture(); const primitive = f.triangle();
+    f.document.images = Array.from({ length: 1024 }, () => ({ uri: '../texture.png' }));
+    f.document.textures = [{ source: 1023 }];
+    f.document.materials = [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }];
+    primitive.material = 0;
+    const asset = await f.load();
+    expect(asset.images).toHaveLength(1024);
+    expect(asset.materials[0]!.baseColorTexture!.image).toBe(1023);
+    await expect(loadGltf('https://fixture.test/path/scene.gltf', { maxSourceBytes: 32768 }))
+      .rejects.toMatchObject({ code: 'UNSUPPORTED_LIMIT' });
+  });
+  it('rejects more images than the renderer supports before fetching image resources', async () => {
+    const f = new Fixture(); f.triangle();
+    f.document.images = Array.from({ length: 1025 }, () => ({ uri: '../texture.png' }));
+    await expect(f.load()).rejects.toMatchObject({ code: 'SCENE_LOAD_FAILED' });
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('texture.png'))).toBe(false);
+  });
+
   it.each([1e9, -1e9])('preserves a unit triangle translated by %s before normalization', async offset => {
     const f = new Fixture(); f.triangle(); f.document.nodes = [{ mesh: 0, translation: [offset, 0, 0] }];
     const asset = await f.load(), data = asset.primitives[0]!.vertices;
