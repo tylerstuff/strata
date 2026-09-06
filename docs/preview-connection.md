@@ -173,7 +173,12 @@ descendants. On Linux, it opens and retains `/proc/<pid>/stat` descriptors after
 the initial expected-label check and a live `ChildProcess` observation. Current
 parent checks bracket descendant admission. Later label, parent or process-group
 changes do not replace the retained identity; raw start ticks stay decimal strings
-in diagnostics. Darwin continues using the existing `ps` identity checks.
+in diagnostics. Darwin matches the selected `ps ucomm` accounting label, PID and
+second-resolution start time. Its `comm` argument-derived display can become a
+parenthesized fallback during exit; accounting labels avoid that formatting
+transition. Actual label or start-time changes still latch uncertainty. This is
+not an immutable executable identity or protection against hostile PID reuse.
+Linux retains its `comm` census and descriptor-based identity checks.
 
 The process census discovers candidates. A missing or dead census row for an
 owned process requires confirmation through its retained descriptor or the

@@ -256,6 +256,24 @@ test('successful graceful disposal is observed without fallback signals', { skip
   ownedSignalsOnly(result, [], control.pid);
 });
 
+test('Darwin production census admits accounting labels for the owned Node root and child', { skip: process.platform !== 'darwin', timeout: 8000 }, async context => {
+  const fixture = await launchFixture(context);
+  const tracker = await trackerFor(context, fixture);
+  fixture.child.send('dispose');
+  assert.deepEqual(await fixture.exit, { code: 0, signal: null });
+  const result = await tracker.cleanup({ reason: 'graceful', termGraceMs: 50, killGraceMs: 100 });
+  for (const pid of [fixture.pid, fixture.childPid]) {
+    // comm would expose the absolute Node executable here. The production
+    // accounting-label census must also accept the expected root's basename.
+    assert.equal(result.observed.find(row => row.pid === pid)?.command, 'node');
+  }
+  assert.equal(result.cleanupUnknown, false);
+  assert.deepEqual(result.identityMismatches, []);
+  assert.deepEqual(result.signals, []);
+  assert.deepEqual(result.remaining, []);
+  await assertStopped(fixture.pid, fixture.childPid);
+});
+
 test('timeout cleanup escalates an owned TERM-resistant child within a bound', { skip: unsupported, timeout: 8000 }, async context => {
   const fixture = await launchFixture(context, { mode: 'ignore-term' });
   const control = await launchFixture(context, { parent: false });

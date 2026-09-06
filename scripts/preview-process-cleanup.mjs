@@ -33,9 +33,11 @@ function diagnosticDetail(value, stringBytes = 512) {
 }
 
 async function census() {
-  // Select the process label, not argv or environment columns. The label can
-  // change during a process lifetime and is not executable identity.
-  const { stdout } = await execute('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,lstart=,stat=,comm='], {
+  // Darwin comm depends on argument storage and can become a parenthesized
+  // fallback during exit. ucomm reads the accounting label directly (ps(1)).
+  // Labels can still change; neither field is executable or birth identity.
+  const label = process.platform === 'darwin' ? 'ucomm' : 'comm';
+  const { stdout } = await execute('/bin/ps', ['-axo', `pid=,ppid=,pgid=,lstart=,stat=,${label}=`], {
     env: { ...process.env, LC_ALL: 'C', LANG: 'C' }, encoding: 'utf8', timeout: CENSUS_MS,
     maxBuffer: 4 * 1024 * 1024,
   });
@@ -44,9 +46,9 @@ async function census() {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+((?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(\S+)\s+(.+?)\s*$/.exec(line);
     try { assert.ok(match, 'Ambiguous process census row'); }
     catch (error) {
-      // This prefix is only the selected PID/PPID/PGID/lstart/stat/comm columns;
+      // This prefix is only the selected PID/PPID/PGID/lstart/stat/label columns;
       // ps was never asked for argv or environment values.
-      error.diagnostic = { kind: 'ps-comm-row-parse', rowIndex, rowBytes: Buffer.byteLength(line), rowPrefix: diagnosticText(line, 384) };
+      error.diagnostic = { kind: `ps-${label}-row-parse`, rowIndex, rowBytes: Buffer.byteLength(line), rowPrefix: diagnosticText(line, 384) };
       throw error;
     }
     return { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]),
@@ -90,7 +92,7 @@ function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, read
   let deadline = Infinity;
   const report = { rootPid, cleanupUnknown: false, observed: [], signals: [], remaining: [],
     identityMismatches: [], censusErrors: [], limitations: [
-      'Identity evidence is matched observed PID, executable command and second-resolution ps start time; it is not a hostile PID-reuse-proof OS sandbox.',
+      'Identity evidence is matched observed PID, selected process label and second-resolution ps start time; it is not a hostile PID-reuse-proof OS sandbox.',
     ] };
   function unknown(message) {
     report.cleanupUnknown = true;
