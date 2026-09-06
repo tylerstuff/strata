@@ -4,6 +4,9 @@ import type { GeometryCluster, GeometryManifest, GeometryPage } from './format.j
 import type { GeometryMode } from './virtual-types.js';
 import { planRetainedResidency } from './retained-residency.js';
 import type { RetainedResidencyPlan } from './retained-residency.js';
+import { GeometryChangeSignal } from './transfer-budget.js';
+import type { GeometryInitialization, GeometryInitializationStatus, GeometryResourceLease, GeometryRequestLease,
+  GeometryTransferBudget, GeometryUploadFrame } from './transfer-budget.js';
 
 export interface GeometryPageDemand { readonly tileId: number; readonly lod: number; readonly priority: number }
 export interface GeometryPageMapping { readonly pageId: number; readonly slot: number }
@@ -11,6 +14,13 @@ export interface GeometryPageUpdate {
   readonly uploaded: readonly GeometryPageMapping[];
   readonly evicted: readonly GeometryPageMapping[];
   readonly uploadBytes: number;
+}
+/** Explicit pool and typed-array storage only; parsed manifest/JS objects belong to the caller. */
+export interface GeometryPageCacheEstimate {
+  readonly capacityPages: number;
+  readonly pageBytes: number;
+  readonly gpuBufferBytes: number;
+  readonly residentBytes: number;
 }
 export interface GeometryPageCacheOptions {
   geometryMode?: GeometryMode;
@@ -38,6 +48,7 @@ interface Request {
   readonly controller: AbortController;
   cancelled: boolean;
   finished: boolean;
+  lease?: GeometryRequestLease;
 }
 interface Failure { attempts: number; retryAt: number; terminal: boolean }
 interface Settings {
@@ -114,10 +125,17 @@ export class GeometryPageCache {
   private readonly roots: ReadonlySet<number>;
   private readonly clustersByPage: readonly (readonly GeometryCluster[])[];
   private readonly pending = new Map<number, Request>();
+  // Disposal clears scheduling state immediately; the original load/body/hash
+  // chains remain owned until their catch/finally cleanup has actually run.
+  private readonly requestOperations = new Set<Promise<void>>();
+  private disposalSettlement: Promise<void> | undefined;
+  private resolveDisposalSettlement: (() => void) | undefined;
   private readonly completed = new Map<number, Uint8Array<ArrayBuffer>>();
+  private readonly completedLeases = new Map<number, GeometryRequestLease>();
   private readonly failures = new Map<number, Failure>();
   private readonly lastUsed = new Map<number, number>();
   private readonly waiters = new Set<() => void>();
+  private hostChanges: GeometryChangeSignal | undefined;
   private demands: readonly GeometryPageDemand[] = [];
   private wanted: Set<number>;
   private pageOrder: number[];
@@ -140,6 +158,8 @@ export class GeometryPageCache {
     private readonly manifest: GeometryManifest,
     private readonly manifestUrl: URL,
     private readonly settings: Settings,
+    private readonly transferBudget?: GeometryTransferBudget,
+    private readonly allocationLease?: GeometryResourceLease,
   ) {
     this.buffer = device.createBuffer({ label: 'Strata fixed geometry page pool', size: settings.capacityPages * manifest.pageBytes, usage: 0x80 | 0x8 });
     this.slots = new Int32Array(settings.capacityPages).fill(-1);
@@ -150,6 +170,112 @@ export class GeometryPageCache {
     const clusters: GeometryCluster[][] = Array.from({ length: manifest.pages.length }, () => []);
     for (const cluster of manifest.clusters) clusters[cluster.pageId]!.push(cluster);
     this.clustersByPage = clusters;
+  }
+
+  static estimate(device: GPUDevice, manifest: GeometryManifest, options: GeometryPageCacheOptions = {}): GeometryPageCacheEstimate {
+    const normalized = settings(device, manifest, options);
+    return Object.freeze({ capacityPages: normalized.capacityPages, pageBytes: manifest.pageBytes,
+      gpuBufferBytes: normalized.capacityPages * manifest.pageBytes,
+      residentBytes: (normalized.capacityPages + manifest.pages.length) * Int32Array.BYTES_PER_ELEMENT });
+  }
+
+  /**
+   * Internal host-driven initialization. No allocation, request or write happens
+   * before advance; a supplied admission lease transfers on successful return.
+   * Later ordinary update() calls retain their existing per-cache upload policy.
+   */
+  static begin(device: GPUDevice, manifest: GeometryManifest, manifestUrl: string | URL,
+    options: GeometryPageCacheOptions, budget: GeometryTransferBudget,
+    admission?: GeometryResourceLease): GeometryInitialization<GeometryPageCache> {
+    options = { ...options };
+    const normalized = settings(device, manifest, options);
+    const estimate = GeometryPageCache.estimate(device, manifest, options);
+    const url = new URL(String(manifestUrl), typeof location === 'undefined' ? undefined : location.href);
+    const required = { residentBytes: estimate.residentBytes, gpuBufferBytes: estimate.gpuBufferBytes };
+    if (estimate.pageBytes > budget.limits.pageStagingBytes || estimate.pageBytes > budget.limits.uploadBytesPerFrame
+      || estimate.residentBytes > budget.limits.residentBytes || estimate.gpuBufferBytes > budget.limits.gpuBufferBytes) {
+      throw new StrataError('INVALID_OPTIONS', 'Geometry cache initialization cannot fit the configured aggregate budget.');
+    }
+    if (admission && (admission.budget !== budget || admission.released
+      || admission.amounts.transientBytes !== 0 || admission.amounts.residentBytes !== estimate.residentBytes
+      || admission.amounts.gpuBufferBytes !== estimate.gpuBufferBytes)) {
+      throw new StrataError('INVALID_OPTIONS', 'Geometry cache admission does not match its owned allocations.');
+    }
+    const changes = new GeometryChangeSignal();
+    let status: GeometryInitializationStatus = 'pending';
+    let error: unknown;
+    let allocation = admission;
+    let cache: GeometryPageCache | undefined;
+    let retiredCacheSettlement: Promise<void> | undefined;
+    let resolveSettlement!: () => void;
+    const settlement = new Promise<void>(resolve => { resolveSettlement = resolve; });
+    const unsubscribe = budget.subscribe(() => changes.notify());
+    const detach = () => { unsubscribe(); options.signal?.removeEventListener('abort', abort); };
+    const cleanup = () => {
+      detach();
+      if (cache) {
+        cache.hostChanges = undefined; cache.dispose();
+        retiredCacheSettlement = cache.whenDisposedAndSettled();
+        void retiredCacheSettlement.then(resolveSettlement);
+        cache = undefined;
+      } else { allocation?.release(); if (!retiredCacheSettlement) resolveSettlement(); }
+      allocation = undefined;
+    };
+    const fail = (cause: unknown) => { error = cause; status = 'failed'; cleanup(); changes.notify(); };
+    const abort = () => {
+      if (status === 'taken' || status === 'disposed' || status === 'failed') return;
+      error = new StrataError('INITIALIZATION_ABORTED', 'Geometry initialization was aborted.');
+      status = 'disposed'; cleanup(); changes.notify();
+    };
+    const handle: GeometryInitialization<GeometryPageCache> = {
+      get status() { return status; },
+      get error() { return error; },
+      get revision() { return changes.revision; },
+      advance(frame) {
+        const before = frame.writtenBytes;
+        if (status !== 'pending') return { status, uploadBytes: 0 };
+        try {
+          if (frame.budget !== budget) throw new StrataError('INVALID_OPTIONS', 'Geometry initialization needs a frame from its owning budget.');
+          frame.assertCurrent();
+          if (options.signal?.aborted) { abort(); return { status, uploadBytes: 0 }; }
+          if (!cache) {
+            allocation ??= budget.tryReserve(required);
+            if (!allocation) return { status, uploadBytes: 0 };
+            cache = new GeometryPageCache(device, manifest, url, normalized, budget, allocation);
+            cache.hostChanges = changes;
+          }
+          cache.update(frame);
+          if (cache.pageOrder.some(pageId => cache!.failures.get(pageId)?.terminal)) {
+            throw new StrataError('SCENE_LOAD_FAILED', 'A required initial geometry page failed validation or loading.');
+          }
+          if (cache.pageOrder.every(pageId => cache!.mapping[pageId] !== -1)) {
+            cache.initialBytes = cache.counts.uploadedBytes;
+            cache.preloading = false;
+            cache.replan();
+            status = 'ready'; changes.notify();
+          }
+        } catch (cause) { fail(cause); }
+        return { status, uploadBytes: frame.writtenBytes - before };
+      },
+      waitForChange(afterRevision) {
+        return status !== 'pending' ? Promise.resolve() : changes.wait(afterRevision);
+      },
+      whenDisposedAndSettled() { return settlement; },
+      takeReady() {
+        if (status !== 'ready' || !cache) throw new StrataError('INVALID_OPTIONS', 'Geometry initialization is not ready for ownership transfer.');
+        const result = cache; cache = undefined; allocation = undefined;
+        result.hostChanges = undefined; status = 'taken'; detach(); changes.notify();
+        resolveSettlement();
+        return result;
+      },
+      dispose() {
+        if (status === 'taken' || status === 'disposed') return;
+        status = 'disposed'; cleanup(); changes.notify();
+      },
+    };
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
+    return handle;
   }
 
   /** Roots (or all pages in resident modes) are ready before exposing the cache to rendering. */
@@ -268,7 +394,10 @@ export class GeometryPageCache {
 
   private cancelUnwanted(): void {
     for (const pageId of this.completed.keys()) {
-      if (!this.wanted.has(pageId)) { this.completed.delete(pageId); this.counts.discardedCompletions++; }
+      if (!this.wanted.has(pageId)) {
+        this.completed.delete(pageId); this.completedLeases.get(pageId)?.release(); this.completedLeases.delete(pageId);
+        this.counts.discardedCompletions++;
+      }
     }
     for (const request of this.pending.values()) {
       if (!this.wanted.has(request.pageId) && !request.cancelled && !request.finished) {
@@ -280,7 +409,7 @@ export class GeometryPageCache {
   }
 
   /** Synchronous frame boundary: commit pool uploads and mapping changes before GPU encoding. */
-  update(): GeometryPageUpdate {
+  update(frame?: GeometryUploadFrame): GeometryPageUpdate {
     this.assertLive();
     if (this.settings.residencyPolicy === 'retain-fallback') this.replan();
     this.frame++;
@@ -310,13 +439,16 @@ export class GeometryPageCache {
         slot = this.mapping[victim]!;
       }
       // Keep the previous mapping intact if a synchronous upload fails.
-      this.device.queue.writeBuffer(this.buffer, slot * this.manifest.pageBytes, bytes);
+      if (frame) {
+        if (!frame.write(this.device, this.buffer, slot * this.manifest.pageBytes, bytes)) break;
+      } else this.device.queue.writeBuffer(this.buffer, slot * this.manifest.pageBytes, bytes);
       if (victim !== -1) {
         this.mapping[victim] = -1; this.lastUsed.delete(victim);
         evicted.push({ pageId: victim, slot }); this.counts.evictions++;
       }
       this.slots[slot] = pageId; this.mapping[pageId] = slot; this.lastUsed.set(pageId, this.frame);
       this.completed.delete(pageId);
+      this.completedLeases.get(pageId)?.release(); this.completedLeases.delete(pageId);
       uploaded.push({ pageId, slot });
       this.counts.uploadedPages++; this.counts.uploadedBytes += bytes.byteLength;
       if (this.settings.residencyPolicy === 'retain-fallback') this.replan();
@@ -335,17 +467,19 @@ export class GeometryPageCache {
       if (failure?.terminal) continue;
       if (failure && failure.retryAt > this.settings.now()) { retryAt = Math.min(retryAt, failure.retryAt); continue; }
       if (this.pending.size >= this.settings.concurrent || this.pending.size + this.completed.size >= this.settings.reservedPages) break;
-      this.request(pageId);
+      const lease = this.transferBudget?.tryRequest(this.manifest.pageBytes);
+      if (this.transferBudget && !lease) break;
+      this.request(pageId, lease);
     }
     if (Number.isFinite(retryAt)) this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.pump(); this.notify(); }, Math.max(1, retryAt - this.settings.now()));
   }
 
-  private request(pageId: number): void {
-    const request: Request = { pageId, epoch: this.epoch, controller: new AbortController(), cancelled: false, finished: false };
+  private request(pageId: number, lease?: GeometryRequestLease): void {
+    const request: Request = { pageId, epoch: this.epoch, controller: new AbortController(), cancelled: false, finished: false, ...(lease ? { lease } : {}) };
     this.pending.set(pageId, request);
     this.counts.requestsStarted++;
     const timer = setTimeout(() => request.controller.abort(), this.settings.timeoutMs);
-    void this.load(this.manifest.pages[pageId]!, request.controller.signal).then(bytes => {
+    const operation = this.load(this.manifest.pages[pageId]!, request.controller.signal).then(bytes => {
       request.finished = true;
       if (this.disposed || request.epoch !== this.epoch || request.cancelled || !this.wanted.has(pageId)) {
         this.counts.discardedCompletions++; return;
@@ -355,6 +489,11 @@ export class GeometryPageCache {
       // must not count one validated payload as both pending and completed.
       if (this.pending.get(pageId) === request) this.pending.delete(pageId);
       this.completed.set(pageId, bytes);
+      if (request.lease) {
+        request.lease.finishRequest();
+        this.completedLeases.set(pageId, request.lease);
+        delete request.lease;
+      }
       this.counts.requestsCompleted++;
     }).catch(cause => {
       request.finished = true;
@@ -367,9 +506,18 @@ export class GeometryPageCache {
     }).finally(() => {
       clearTimeout(timer);
       if (this.pending.get(pageId) === request) this.pending.delete(pageId);
+      request.lease?.release(); delete request.lease;
       this.notify();
       this.pump();
     });
+    this.requestOperations.add(operation);
+    const settled = (): void => {
+      this.requestOperations.delete(operation);
+      this.resolveSettlementIfDisposed();
+    };
+    // Observe both outcomes without replacing the original operation: even a
+    // failing cleanup must finish before the owner can report settlement.
+    void operation.then(settled, settled);
   }
 
   private async load(page: GeometryPage, signal: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
@@ -410,8 +558,19 @@ export class GeometryPageCache {
   }
 
   private changed(): Promise<void> { return new Promise(resolve => this.waiters.add(resolve)); }
-  private notify(): void { for (const resolve of this.waiters) resolve(); this.waiters.clear(); }
+  private notify(): void { for (const resolve of this.waiters) resolve(); this.waiters.clear(); this.hostChanges?.notify(); }
   private assertLive(): void { if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'This geometry cache has been disposed.'); }
+
+  /** Waits for disposal and original request/body/hash/finally settlement, not GPU completion. */
+  whenDisposedAndSettled(): Promise<void> {
+    this.disposalSettlement ??= new Promise(resolve => { this.resolveDisposalSettlement = resolve; });
+    this.resolveSettlementIfDisposed();
+    return this.disposalSettlement;
+  }
+
+  private resolveSettlementIfDisposed(): void {
+    if (this.disposed && this.requestOperations.size === 0) this.resolveDisposalSettlement?.();
+  }
 
   dispose(): void {
     if (this.disposed) return;
@@ -422,9 +581,13 @@ export class GeometryPageCache {
       request.cancelled = true; request.controller.abort();
     }
     this.pending.clear(); this.completed.clear(); this.lastUsed.clear();
+    for (const lease of this.completedLeases.values()) lease.release();
+    this.completedLeases.clear();
     this.retainedPlan = undefined;
     this.mapping.fill(-1); this.slots.fill(-1); this.wanted.clear(); this.pageOrder = [];
     this.buffer.destroy();
+    this.allocationLease?.release();
     this.notify();
+    this.resolveSettlementIfDisposed();
   }
 }

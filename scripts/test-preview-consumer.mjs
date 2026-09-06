@@ -29,7 +29,8 @@ async function pack(name, directory) {
   const packed = Array.isArray(result) ? result.find(item => item.name === name) : result[name];
   assert.ok(packed, `npm pack did not report ${name}`);
   const files = new Set(packed.files.map(file => file.path));
-  for (const required of ['dist/index.js', 'dist/index.d.ts', 'README.md', ...(name === '@strata-engine/preview' ? ['dist/bin.js'] : [])]) {
+  for (const required of ['dist/index.js', 'dist/index.d.ts', 'README.md', ...(name === '@strata-engine/preview'
+    ? ['dist/bin.js', 'dist/project.js', 'dist/project.d.ts', 'dist/project-bin.js', 'dist/browser/project-client.js'] : [])]) {
     assert.ok(files.has(required), `${name} is missing ${required}; build the authoring and preview packages first`);
   }
   assert.equal([...files].some(file => /(?:^|\/)(?:src|tests|target|node_modules)\//.test(file)), false,
@@ -62,6 +63,8 @@ function verifyManifest(archive, name) {
     assert.equal(manifest.dependencies?.['@strata-engine/core'], '0.0.0');
     assert.equal(manifest.dependencies?.playwright, '1.63.0');
     assert.equal(manifest.bin?.['strata-preview'], './dist/bin.js');
+    assert.equal(manifest.bin?.['strata-project'], './dist/project-bin.js');
+    assert.deepEqual(manifest.exports?.['./project'], { types: './dist/project.d.ts', import: './dist/project.js' });
   }
   return manifest;
 }
@@ -134,6 +137,7 @@ try {
   }, null, 2));
   run(process.execPath, [join(root, 'node_modules', 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.json')], consumer);
   process.stdout.write(run(process.execPath, ['workflow.mjs'], consumer));
+  process.stdout.write(run(process.execPath, ['project-workflow.mjs'], consumer));
   await assert.rejects(readFile(toolLog, 'utf8'), { code: 'ENOENT' }, 'Packed consumer invoked a Rust tool or browser');
   console.log('Packed preview: isolated archives, public declarations, fake-driver orchestration and real artifact publication passed; no browser/GPU validation');
 } finally {
