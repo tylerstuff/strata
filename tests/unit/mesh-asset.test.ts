@@ -19,6 +19,18 @@ describe('conventional mesh data boundary', () => {
     expect(result.normalization).toEqual({ scale: 1, translation: [0, 0, 0] });
     expect(result.primitives.map(p => p.deformation!.node)).toEqual([0, 1]);
   });
+  it('owns compressed mip payloads and counts them in encoded source bytes', () => {
+    const mips = [new Uint8Array(8), new Uint8Array(8), new Uint8Array(8)];
+    const image = { name: 'compressed', mimeType: 'image/png' as const, width: 4, height: 4,
+      bytes: new Uint8Array([1, 2, 3]), compressed: { format: 'bc1-rgba-unorm' as const, mips } };
+    const result = createMeshAsset({ meshes: [mesh()], materials: [material], images: [image] });
+    mips[0]!.fill(255); image.bytes.fill(255);
+    expect(result.images[0]!.compressed!.mips[0]![0]).toBe(0);
+    expect(result.images[0]!.bytes[0]).toBe(1);
+    expect(result.stats.encodedBytes).toBe(27);
+    expect(() => createMeshAsset({ meshes: [mesh()], materials: [material], images: [{ ...image,
+      compressed: { ...image.compressed, mips: mips.slice(1) } }] })).toThrow(/complete mip chain/);
+  });
   it('rejects malformed indices, attributes, references and coordinate limits', () => {
     for (const corrupt of [(m: ReturnType<typeof mesh>) => { m.indices[2] = 3; },
       (m: ReturnType<typeof mesh>) => { m.vertices[1] = NaN; },

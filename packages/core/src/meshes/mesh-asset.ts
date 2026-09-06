@@ -1,3 +1,4 @@
+import { validateBlockCompression } from '../imported/imported-compression.js';
 import { StrataError } from '../errors.js';
 import type { ImportedAsset, ImportedMaterial, ImportedImage, ImportedPrimitive, ImportedVec3 } from '../imported/imported-types.js';
 
@@ -41,6 +42,10 @@ export function createMeshAsset(options: MeshAssetOptions): ImportedAsset {
   for (const image of images) {
     if (!image || !(image.bytes instanceof Uint8Array) || !(image.bytes.buffer instanceof ArrayBuffer)) fail('image bytes are required.');
     encodedBytes += image.bytes.byteLength;
+    if (image.compressed) {
+      validateBlockCompression(image.compressed, image.width, image.height);
+      encodedBytes += image.compressed.mips.reduce((sum: number, mip: Uint8Array) => sum + mip.byteLength, 0);
+    }
   }
   if (geometryBytes > 128 * 1024 * 1024 || encodedBytes > 128 * 1024 * 1024) fail('source geometry and encoded images each have a 128 MiB limit.');
   const min: [number, number, number] = [Infinity, Infinity, Infinity], max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
@@ -56,7 +61,7 @@ export function createMeshAsset(options: MeshAssetOptions): ImportedAsset {
   });
   const bounds = { min: min as ImportedVec3, max: max as ImportedVec3 };
   return { version: 1, sourceUrl: 'strata:mesh-asset', primitives,
-    materials: structuredClone(options.materials), images: images.map(image => ({ name: image.name, mimeType: image.mimeType, width: image.width, height: image.height, bytes: image.bytes.slice() })), bounds, sourceBounds: bounds,
+    materials: structuredClone(options.materials), images: images.map(image => ({ name: image.name, mimeType: image.mimeType, width: image.width, height: image.height, bytes: image.bytes.slice(), ...(image.compressed ? { compressed: { ...image.compressed, mips: image.compressed.mips.map((mip: Uint8Array<ArrayBuffer>) => mip.slice()) } } : {}) })), bounds, sourceBounds: bounds,
     normalization: { scale: 1, translation: [0, 0, 0] }, maxTextureDimension, warnings: [], clips: [],
     rig: { nodes: primitives.map(() => ({ parent: null, translation: [0, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] })), skins: [] },
     stats: { meshInstances: primitives.length, primitives: primitives.length, vertices: primitives.reduce((sum, p) => sum + p.vertices.length / 16, 0),

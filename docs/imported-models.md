@@ -161,3 +161,13 @@ Loading is bounded by source and geometry byte limits. The default maximum uploa
 Local collection files, derived assets and captures remain outside Git under the configurable external asset directory. See [the asset policy](benchmark-assets.md). CI uses small generated fixtures only. [Issue #33](https://github.com/tylerstuff/strata/issues/33) tracks implementation and validation; gallery images are not evidence of a general 60 FPS target.
 
 The animation and skinning contracts follow the [Khronos glTF specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#animations) and its interpolation appendix.
+
+## Optional compressed texture variants
+
+`ImportedImage.compressed` accepts a complete power-of-two BC1, BC3 or BC5 mip chain alongside its PNG/JPEG fallback. Enable `texture-compression-bc` through `createEngine({ requiredFeatures: [...] })` only after checking the adapter. Without the enabled feature, uploads use the existing PNG/JPEG path. Pass `textureCompressionBC: true` to `estimateImportedTextureAllocation` only for a device with that feature enabled. The texture budget stays unchanged; estimates and telemetry include selected source mip, format and actual block payload bytes, excluding driver padding.
+
+The optional `@strata-engine/core/gltf` entry exports `parseDdsMipChain(bytes, { normalY: 'down' })` for legacy single-layer 2D DXT1, DXT5 and ATI2 DDS files. Dimensions must be powers of two from 4 to 16384 with a complete mip chain; cube maps, arrays, DX10 headers and incomplete payloads reject. The returned mip views share caller storage; `createMeshAsset` snapshots those views and counts them against its encoded-image budget. Attach the parsed variant to an image whose dimensions match. DDS is not automatically discovered by `loadGltf`.
+
+BC1/BC3 color roles use sRGB formats; packed material roles remain linear. BC5 is restricted to normal maps, reconstructs positive Z, and defaults to an upward green channel. Set `normalY: 'down'` for DirectX conventions. Small images or caps that cannot form a valid block-compressed base level use the fallback. Native mip selection never enlarges a source image or exceeds the requested cap.
+
+This is bounded static texture residency, not demand streaming or texture transcoding. `loadGltf` still loads fallback bytes, and attaching variants adds source memory. The generated `npm run test:compressed-textures` fixture validates fallback, mip selection, alpha masking, BC5 orientation and disposal in a WebGPU browser; it records unavailable compression support explicitly.

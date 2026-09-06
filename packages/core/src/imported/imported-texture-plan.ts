@@ -1,8 +1,11 @@
+import { validateBlockCompression } from './imported-compression.js';
 import { StrataError } from '../errors.js';
 import type { ImportedAsset } from './imported-types.js';
 import { importedEnvironmentTextureBytes, importedTextureBudget } from './imported-limits.js';
 
 export interface ImportedTextureAllocationOptions {
+  /** True only when the requested device enabled texture-compression-bc. */
+  readonly textureCompressionBC?: boolean;
   /** Requested upload edge, a positive integer up to 16384. */
   readonly maxTextureDimension: number;
   /** Device texture edge limit, a positive integer up to 16384. */
@@ -10,6 +13,8 @@ export interface ImportedTextureAllocationOptions {
 }
 
 export interface ImportedTextureAllocationRecord {
+  readonly format?: GPUTextureFormat;
+  readonly sourceMip?: number;
   readonly image: number;
   readonly sourceWidth: number;
   readonly sourceHeight: number;
@@ -60,6 +65,7 @@ export function estimateImportedTextureAllocation(
     || asset.materials.length > 4096 || asset.images.length > 1024) fail('texture allocation needs bounded material and image arrays.');
   if (!options || typeof options !== 'object' || Array.isArray(options)
     || !validEdge(options.maxTextureDimension) || !validEdge(options.maxTextureDimension2D)) fail('texture edge limits must be positive integers up to 16384.');
+  if (options.textureCompressionBC !== undefined && typeof options.textureCompressionBC !== 'boolean') fail('textureCompressionBC must be boolean.');
   const requestedMaxTextureDimension = options.maxTextureDimension;
   const effectiveMaxTextureDimension = Math.min(requestedMaxTextureDimension, options.maxTextureDimension2D);
   const textures: ImportedTextureAllocationRecord[] = [], seen = new Set<string>();
@@ -73,12 +79,28 @@ export function estimateImportedTextureAllocation(
       if (!Number.isSafeInteger(ref.image) || ref.image < 0 || ref.image >= asset.images.length) fail('material references an absent image.');
       const colorSpace = role === 'baseColorTexture' || role === 'emissiveTexture' ? 'srgb' : 'linear';
       const key = `${ref.image}/${colorSpace}`;
-      if (seen.has(key)) continue;
       const image = asset.images[ref.image];
       if (!image || typeof image !== 'object' || Array.isArray(image)) fail('referenced image metadata must be an object.');
-      const extent = importedTextureExtent(image.width, image.height, effectiveMaxTextureDimension);
+      if (image.compressed?.format === 'bc5-rg-unorm' && role !== 'normalTexture') fail('BC5 variants may only be bound as normal maps.');
+      if (seen.has(key)) continue;
+      let extent = importedTextureExtent(image.width, image.height, effectiveMaxTextureDimension);
+      let format: GPUTextureFormat | undefined, sourceMip: number | undefined;
+      if (image.compressed) {
+        validateBlockCompression(image.compressed, image.width, image.height);
+        if (image.compressed.format === 'bc5-rg-unorm' && role !== 'normalTexture') fail('BC5 variants may only be bound as normal maps.');
+        if (options.textureCompressionBC && effectiveMaxTextureDimension >= 4) {
+          sourceMip = Math.max(0, Math.ceil(Math.log2(Math.max(image.width, image.height) / effectiveMaxTextureDimension)));
+          const w = Math.max(1, image.width >> sourceMip), h = Math.max(1, image.height >> sourceMip);
+          if (w >= 4 && h >= 4) {
+            const base = image.compressed.format;
+            format = (colorSpace === 'srgb' ? `${base}-srgb` : base) as GPUTextureFormat;
+            const mips = image.compressed.mips.slice(sourceMip);
+            extent = { width: w, height: h, mipLevels: mips.length, bytes: mips.reduce((sum: number, mip: Uint8Array) => sum + mip.byteLength, 0) };
+          } else sourceMip = undefined;
+        }
+      }
       textures.push({ image: ref.image, sourceWidth: image.width, sourceHeight: image.height,
-        uploadWidth: extent.width, uploadHeight: extent.height, colorSpace, mipLevels: extent.mipLevels, gpuBytes: extent.bytes });
+        ...(format === undefined ? {} : { format, sourceMip: sourceMip! }), uploadWidth: extent.width, uploadHeight: extent.height, colorSpace, mipLevels: extent.mipLevels, gpuBytes: extent.bytes });
       gpuTextureBytes += extent.bytes;
       seen.add(key);
     }

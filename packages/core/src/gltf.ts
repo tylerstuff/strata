@@ -10,3 +10,6 @@ export { measureImportedPoseBounds, importedPoseBoundsLimits } from './imported/
 export type { ImportedPoseBoundsOptions, ImportedPoseBoundsResult } from './imported/imported-pose-bounds.js';
 
 export type { ImportedIndirectOptions, ImportedIndirectTraceOptions, ImportedIndirectDenoise, ImportedIndirectProgress, ImportedIndirectReadback, ImportedSpatialDiagnostics } from './imported/imported-indirect-types.js';
+
+export { parseDdsMipChain } from './imported/imported-compression.js';
+export type { ImportedBlockCompression } from './imported/imported-types.js';

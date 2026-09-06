@@ -22,7 +22,7 @@ function gpu() {
   const writes: { label: string; data: Float32Array }[] = [];
   const pass = { setPipeline: vi.fn(), setBindGroup: vi.fn(), setVertexBuffer: vi.fn(), setIndexBuffer: vi.fn(), drawIndexed: vi.fn(), draw: vi.fn(), end: vi.fn() };
   const encoder = { beginRenderPass: vi.fn(() => pass), finish: vi.fn(() => ({})) };
-  const device = { limits: { maxBufferSize: 512 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024, maxTextureDimension2D: 8192, maxBindGroups: 4, maxStorageBuffersPerShaderStage: 8, maxSampledTexturesPerShaderStage: 16, maxSamplersPerShaderStage: 16 },
+  const device = { features: new Set<GPUFeatureName>(), limits: { maxBufferSize: 512 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024, maxTextureDimension2D: 8192, maxBindGroups: 4, maxStorageBuffersPerShaderStage: 8, maxSampledTexturesPerShaderStage: 16, maxSamplersPerShaderStage: 16 },
     createShaderModule: vi.fn(() => ({})), createRenderPipelineAsync: vi.fn(async (descriptor: GPURenderPipelineDescriptor) => ({ label: descriptor.label, getBindGroupLayout: vi.fn((group: number) => ({ group })) })),
     createBuffer: vi.fn((d: GPUBufferDescriptor) => { const b = { label: d.label ?? '', size: d.size, destroy: vi.fn() }; buffers.push(b); return b; }),
     createTexture: vi.fn((d: GPUTextureDescriptor) => { const t = { descriptor: d, destroy: vi.fn(), createView: vi.fn(() => ({})) }; textures.push(t); return t; }),

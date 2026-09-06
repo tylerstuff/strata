@@ -110,7 +110,11 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let shadowGradient = shadowReceiverGradient(input.world);
   let baseSample = textureSample(importedBase, importedBaseSampler, input.uv);
   let mr = textureSample(importedMr, importedMrSampler, input.uv);
-  let normalSample = textureSample(importedNormal, importedNormalSampler, input.uv).xyz * 2.0 - 1.0;
+  var normalSample = textureSample(importedNormal, importedNormalSampler, input.uv).xyz * 2.0 - 1.0;
+  if (importedMaterial.alpha.z > 1.5) {
+    let xy = normalSample.xy * vec2f(1.0, select(1.0, -1.0, importedMaterial.alpha.z > 2.5));
+    normalSample = vec3f(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
+  }
   let occlusion = mix(1.0, textureSample(importedOcclusion, importedOcclusionSampler, input.uv).r, importedMaterial.factors.w);
   let emission = textureSample(importedEmissive, importedEmissiveSampler, input.uv).rgb * importedMaterial.emissive.rgb * importedMaterial.emissive.a;
   let base = baseSample * importedMaterial.base * input.color;
