@@ -108,8 +108,8 @@ to perceptual roughness 0.06–1. Each texel uses 256 deterministic GGX samples 
 N=V=reflection direction, normalized by the sum of positive NoL. This split-sum
 approximation does not retain view-dependent convolution for a nonuniform source.
 
-The shader reads those same layers through a 2D-array view and performs explicit
-bilinear and mip interpolation. Taps crossing one face edge fetch the corresponding
+The shader reads precomputed face aprons through a 2D-array view with hardware
+bilinear filtering and explicit mip interpolation. Aprons crossing one face edge contain the corresponding
 adjacent-face border texel. A corner's missing fourth tap is the mean of the three
 incident face-corner texels. Both presets use the same rule, including the final
 1-square mip. No texture load goes outside a face. This costs four to six explicit
@@ -121,8 +121,7 @@ failure: a constant-white cube returned 0.71132487 at direction
 view reproduced the cube-array result; a two-square mip also lost energy when
 its footprint crossed an edge. The failure conflicts with constant-preserving
 [seamless cube filtering](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-cubemapedge).
-Explicit adjacent-face loads avoid this dependency without changing radiance,
-roughness, energy acceptance, or the generated data. This evidence identifies
+Explicit adjacent-face aprons avoid this cube-sampler dependency while retaining the canonical radiance/roughness data. The only added source quantization is binary16 rounding of corner means; 2D-array filtering can also round interpolation weights. This evidence identifies
 tested browser behavior, not an upstream SwiftShader revision or general adapter
 classification.
 
@@ -156,8 +155,8 @@ node scripts/generate-imported-environment.mjs
 node scripts/generate-imported-environment.mjs --check
 ```
 
-The fixed texture payload is 540640 bytes: two cubes at 262128 bytes each and a
-16384-byte DFG lookup. A 176-byte uniform holds the selected SH, mode, intensity
+The canonical generated payload remains 540640 bytes: two cubes at 262128 bytes each and a
+16384-byte DFG lookup. At load time, the seven levels receive one-texel adjacent-face aprons and are packed vertically into a 66×141×12 RGBA16F array. GPU texture allocation is 909760 bytes, including the DFG; actual level-rectangle uploads total 592096 bytes. Hardware bilinear sampling uses those aprons and explicit interpolation between roughness levels. Cube corners store the mean of their three incident face texels, rounded once to binary16; numeric filtering acceptance allows 0.001 linear error on the generated seam/corner witnesses. Source texels remain bit-identical. A 176-byte uniform holds the selected SH, mode, intensity
 and rotation. Resources are allocated once per imported scene, including when
 environment illumination is off; toggles do not allocate. They share the scene's
 creation failure/cancellation cleanup and disposal. Decode/upload is bounded and
@@ -190,7 +189,7 @@ and color-space role, and include every RGBA8 mip level. Base/emissive maps are
 sRGB; metallic/roughness, normal and AO maps are linear. One image used in both
 roles allocates two textures. Sampler differences do not duplicate texture data.
 Unreferenced images allocate nothing. The total includes both white fallback
-texels (eight bytes) and all 540640 environment bytes, even when unlit/off.
+texels (eight bytes) and all 909760 environment bytes, even when unlit/off.
 
 The returned `gpuTextureBytes`, `textureBudgetBytes`, `fitsBudget`, requested and
 effective edges and per-texture records let a caller choose a cap without decoding
@@ -216,7 +215,7 @@ shader must fail the same furnace assertion. Signed spatial RGB fields test
 adjacent border-row orientation. Another 196 analytic face/mip/preset witnesses
 test all axes, seams, corners, unequal edge weights and fractional LOD; their
 expectations contain no CPU copy of the production sampler. Actual shader
-mutations that reverse a border row, discard adjacent-face color, or discard mip
+mutations that reverse face-row orientation, discard adjacent-face color, or discard mip
 interpolation must fail the same controls. Rendered generated meshes check
 authored unlit invariance, explicit matte relighting, unchanged source PBR and
 metal illumination without a direct light. These are functional controls, not

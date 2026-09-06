@@ -1,4 +1,4 @@
-import { createEnvironmentResources, environmentUniform, importedEnvironmentShader } from '../../packages/core/src/imported/imported-environment.js';
+import { createEnvironmentResources, environmentUniform, importedEnvironmentShader, uploadEnvironmentLevel } from '../../packages/core/src/imported/imported-environment.js';
 import { createImportedEnvironmentCubeCases } from './imported-environment-cube-cases.js';
 
 type V3 = readonly [number, number, number];
@@ -89,7 +89,7 @@ export async function validateImportedEnvironment(device: GPUDevice) {
     // Constant white incident radiance in all faces/levels. Isolate BRDF energy from texture prefilter approximations.
     for (let level = 0; level < 7; level++) {
       const edge = 64 >> level, data = new Uint16Array(edge * edge * 12 * 4).fill(0x3c00);
-      device.queue.writeTexture({ texture: resources.cube, mipLevel: level }, data, { bytesPerRow: edge * 8, rowsPerImage: edge }, [edge, edge, 12]);
+      uploadEnvironmentLevel(device, resources.cube, level, data);
     }
     const constant = environmentUniform({ preset: 'studio', intensity: 1, rotationRadians: 0 }, 'authored');
     constant.fill(0, 8); constant.set([Math.PI / .28209479177387814, Math.PI / .28209479177387814, Math.PI / .28209479177387814], 8);
@@ -123,7 +123,7 @@ export async function validateImportedEnvironment(device: GPUDevice) {
       const n = unit(directions[face % 6]!); const offset = ((face * 64 + y) * 64 + x) * 4;
       data.set([...n.map(component => toHalf(1 + .2 * component)), 0x3c00], offset);
     }
-    device.queue.writeTexture({ texture: resources.cube, mipLevel: 0 }, data, { bytesPerRow: 64 * 8, rowsPerImage: 64 }, [64, 64, 12]);
+    uploadEnvironmentLevel(device, resources.cube, 0, data);
     for (const rotation of [0, Math.PI / 2]) {
       const uniform = environmentUniform({ preset: 'studio', intensity: 1, rotationRadians: rotation }, 'authored');
       const result = await run(metallicQueries, uniform);
@@ -144,8 +144,7 @@ export async function validateImportedEnvironment(device: GPUDevice) {
         errors.push(near(value.map((v, channel) => v - diffuse[index * 2 + 1]![channel]!), rotated.map(v => (1 + .2 * 2 / 3 * v) * .96), .001, 'Affine irradiance and diffuse-only material AO'));
       });
     }
-    const reversedRowShader = importedEnvironmentShader.replace('importedCubeLoad(direction, adjacent.face, edge, level, preset)',
-      'importedCubeLoad(vec3f(direction.x, -direction.y, direction.z), adjacent.face, edge, level, preset)');
+    const reversedRowShader = importedEnvironmentShader.replace('p = vec2f(-d.z, -d.y)', 'p = vec2f(-d.z, d.y)');
     require(reversedRowShader !== importedEnvironmentShader, 'Reversed-border-row mutation must apply.');
     const reversedRow = await device.createComputePipelineAsync({ layout, compute: { module: device.createShaderModule({ code: reversedRowShader + probe }), entryPoint: 'environmentProbe' } });
     const seamDirection = unit([1, .37, 1]);
@@ -153,12 +152,11 @@ export async function validateImportedEnvironment(device: GPUDevice) {
     let rowRejected = false; try { near(rowResult[0]!, seamDirection.map(v => 1 + .2 * v), .002, 'Signed gradient adjacent row'); } catch { rowRejected = true; }
     require(rowRejected, 'Reversed adjacent border row was accepted.');
 
-    // Independent exact face/mip colors exercise all signed seams, all corners,
+    // Independent face/mip colors exercise (0.001 permits binary16 corner rounding and hardware filtering) all signed seams, all corners,
     // unequal edge weights and fractional LOD without reproducing the sampler.
     const cubeFixture = createImportedEnvironmentCubeCases();
     for (const { level, edge, data } of cubeFixture.mipLevels) {
-      device.queue.writeTexture({ texture: resources.cube, mipLevel: level }, data,
-        { bytesPerRow: edge * 8, rowsPerImage: edge }, [edge, edge, 12]);
+      uploadEnvironmentLevel(device, resources.cube, level, data);
     }
     const cubeProbe = probe.replace('importedEnvironmentLight(q.base.xyz, q.parameters.x, q.parameters.y,\n    q.normal.xyz, q.view.xyz, q.parameters.z)',
       'importedCubeRadiance(q.normal.xyz, q.parameters.x, i32(q.parameters.y))');
@@ -171,12 +169,11 @@ export async function validateImportedEnvironment(device: GPUDevice) {
     for (let offset = 0; offset < cubeFixture.queries.length; offset += 128) {
       const batch = cubeFixture.queries.slice(offset, offset + 128);
       const output = await run(batch.map(query), constant, cube);
-      output.forEach((rgb, index) => errors.push(near(rgb, batch[index]!.expected, .00001, batch[index]!.label)));
+      output.forEach((rgb, index) => errors.push(near(rgb, batch[index]!.expected, .001, batch[index]!.label)));
     }
     // A same-face clamp can preserve a constant source while losing its neighbor's
     // color. This mutation must fail the very same nonuniform seam assertion.
-    const clampedEdgeShader = importedEnvironmentShader.replace('return importedCubeLoad(direction, adjacent.face, edge, level, preset);',
-      'return textureLoad(importedEnvironmentCube, clamp(pixel, vec2i(0), vec2i(edge - 1)), preset * 6 + face, level).rgb;');
+    const clampedEdgeShader = importedEnvironmentShader.replace('address.uv * f32(edge) + vec2f(1.0)', 'clamp(address.uv, vec2f(0.5 / f32(edge)), vec2f(1.0 - 0.5 / f32(edge))) * f32(edge) + vec2f(1.0)');
     require(clampedEdgeShader !== importedEnvironmentShader, 'Clamped-edge mutation must apply.');
     const seam = cubeFixture.queries.find(q => q.label.includes('seam'))!;
     const clampedEdge = await run([query(seam)], constant, await cubePipeline(clampedEdgeShader));

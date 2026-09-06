@@ -28,6 +28,10 @@ export class GpuProfiler {
   private resultCount = 0;
   private disposed = false;
   private dropped = 0;
+  private skippedFrames = 0;
+  private failedReadbacks = 0;
+  private evictedFrames = 0;
+  private cancelledFrames = 0;
   readonly allocatedBufferBytes: number;
 
   constructor(
@@ -76,6 +80,10 @@ export class GpuProfiler {
     }
   }
 
+  get diagnostics() { return { ringCapacity: this.capacity,
+    pendingFrames: this.slots.filter(slot => slot.busy).length,
+    skippedFrames: this.skippedFrames, failedReadbacks: this.failedReadbacks,
+    evictedFrames: this.evictedFrames, cancelledFrames: this.cancelledFrames }; }
   get droppedSamples(): number { return this.dropped; }
   get pendingSamples(): number {
     return this.slots.reduce((count, slot) => count + (slot.busy ? slot.activeIndices.length : 0), 0);
@@ -90,6 +98,7 @@ export class GpuProfiler {
     }
     const slot = this.slots.find((candidate) => !candidate.busy);
     if (!slot) {
+      this.skippedFrames++;
       this.dropped += names.length;
       return null;
     }
@@ -134,6 +143,7 @@ export class GpuProfiler {
           const start = values[index * 2]!;
           const end = values[index * 2 + 1]!;
           if (start === undefined || end === undefined || end < start) {
+            this.failedReadbacks++;
             this.dropped += slot.activeIndices.length;
             return;
           }
@@ -148,18 +158,19 @@ export class GpuProfiler {
         }
         // Keep frame groups atomic so queue pressure cannot yield misleading partial sums.
         if (frame.length > this.resultCapacity) {
+          this.evictedFrames++;
           this.dropped += frame.length;
           return;
         }
         while (this.resultCount + frame.length > this.resultCapacity) {
-          const removed = this.results.shift()!;
+          const removed = this.results.shift()!; this.evictedFrames++;
           this.resultCount -= removed.length;
           this.dropped += removed.length;
         }
         this.results.push(frame);
         this.resultCount += frame.length;
       } catch {
-        if (!this.disposed) this.dropped += slot.activeIndices.length;
+        if (!this.disposed) { this.failedReadbacks++; this.dropped += slot.activeIndices.length; }
       } finally {
         try { slot.readBuffer.unmap(); } catch { /* The device may already be destroyed. */ }
         slot.busy = false;
@@ -173,6 +184,7 @@ export class GpuProfiler {
 
   cancel(slot: Slot): void {
     if (slot.busy && !slot.pending) {
+      this.cancelledFrames++;
       slot.busy = false;
       this.dropped += slot.activeIndices.length;
     }
@@ -206,7 +218,7 @@ export class GpuProfiler {
     if (this.disposed) return;
     this.disposed = true;
     for (const slot of this.slots) {
-      if (slot.busy) this.dropped += slot.activeIndices.length;
+      if (slot.busy) { this.cancelledFrames++; this.dropped += slot.activeIndices.length; }
       slot.busy = false;
       try { slot.readBuffer.destroy(); } catch { /* Continue releasing other slots. */ }
       try { slot.resolveBuffer.destroy(); } catch { /* Continue releasing other slots. */ }

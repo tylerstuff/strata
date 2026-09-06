@@ -138,6 +138,10 @@ export interface EngineTelemetry {
   readonly pendingGpuSamples: number;
   /** Dropped individual pass samples from full rings, failed readbacks, or unread queue overflow. */
   readonly droppedGpuSamples: number;
+  /** Cumulative frame-level causes, separate from pass-sample loss counts. Present when GPU profiling is active. */
+  readonly gpuProfiling?: { readonly ringCapacity: number; readonly pendingFrames: number;
+    readonly skippedFrames: number; readonly failedReadbacks: number;
+    readonly evictedFrames: number; readonly cancelledFrames: number };
   readonly gpuErrorCount: number;
   /** Most recent uncaptured GPU error, capped at 2048 characters. */
   readonly lastGpuError: string | null;
