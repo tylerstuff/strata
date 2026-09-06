@@ -5,13 +5,26 @@
   "type": "module",
   "license": "UNLICENSED",
   "sideEffects": false,
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md",
+    "RAPIER-LICENSE"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./gameplay": { "types": "./dist/gameplay.d.ts", "import": "./dist/gameplay.js" },
-    "./gltf": { "types": "./dist/gltf.d.ts", "import": "./dist/gltf.js" },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./gameplay": {
+      "types": "./dist/gameplay.d.ts",
+      "import": "./dist/gameplay.js"
+    },
+    "./gltf": {
+      "types": "./dist/gltf.d.ts",
+      "import": "./dist/gltf.js"
+    },
     "./worker.js": "./dist/worker.js",
     "./strata_runtime.wasm": "./dist/strata_runtime.wasm",
     "./package.json": "./package.json"
@@ -20,5 +33,8 @@
     "type": "git",
     "url": "git+https://github.com/tylerstuff/strata.git",
     "directory": "packages/core"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "0.20.0"
   }
 }
