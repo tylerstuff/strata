@@ -37,6 +37,8 @@ jobs:
       - run: npm run build
       - name: Validate preview lifecycle and packed CPU consumer
         run: npm run check:preview
+      - name: Validate owned preview process cleanup without a GPU
+        run: npm run test:preview:processes
       - run: npx playwright install --with-deps chromium
       - name: Install the virtual display and software Vulkan runtime
         run: sudo apt-get update && sudo apt-get install -y xvfb xauth libvulkan1 mesa-vulkan-drivers
@@ -52,6 +54,11 @@ jobs:
           STRATA_TEST_HEADED: '1'
       - name: Validate packed preview revisions, pixels, receipts, and CLI captures
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:preview:browser
+        env:
+          STRATA_TEST_SOFTWARE_GPU: '1'
+          STRATA_TEST_HEADED: '1'
+      - name: Validate installed preview connection revisions, captures and shutdown
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:preview:connection:browser
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'

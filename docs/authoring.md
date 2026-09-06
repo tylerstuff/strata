@@ -3,14 +3,17 @@
 `@strata-engine/authoring` is a separate optional Node.js package for creating,
 inspecting and editing versioned scene documents through JSON, TypeScript and the
 `strata-scene` CLI. This is the first independent slice of
-[#8](https://github.com/tylerstuff/strata/issues/8). It establishes a shared data
-contract before browser preview or connection adapters are added.
+[#8](https://github.com/tylerstuff/strata/issues/8). Its shared data contract is also
+used by the separate optional [preview package](preview.md), which lowers supported
+opaque procedural root boxes into Core and provides browser capture tooling.
+The optional [stdio connection](preview-connection.md) loads these files through
+the same authoring validation before controlling a preview session.
 
-**The browser runtime does not load these documents yet.** The procedural box
-fixture demonstrates authoring data. It does not wrap the fixed renderer demos,
-cook geometry, import models, launch a viewport or establish rendering support for
-the recorded materials and assets. The existing restricted
-[integrated courtyard](integrated.md) retains its own runtime contract.
+**This authoring package handles documents, not browser execution.** It does not
+cook geometry, import models or launch a viewport. External asset records alone
+do not establish runtime support, and the authored preview profile rejects them.
+The restricted [integrated courtyard](integrated.md) retains its own runtime
+contract.
 
 ## Install and run
 
@@ -249,7 +252,9 @@ Every CLI invocation emits one JSON result to stdout and requires no prompts or
 stdin. Success has `{ok: true, command, ...}`; failure has
 `{ok: false, command, diagnostics}`. Help declares supported capabilities and
 explicitly marks browser loading, cooking, importing, preview and local connection
-support as absent.
+support as absent from `strata-scene`. Those capability flags describe this
+authoring CLI; the optional preview package supplies its own capture CLI and
+[connection entry point](preview-connection.md).
 
 | Exit code | Meaning |
 | --- | --- |
@@ -325,9 +330,12 @@ and must be scheduled separately from hardware measurement windows. Record its
 actual outcome on issue #8 rather than treating a CPU-only authoring pass as the
 complete check.
 
-Browser scene loading, asset cooking/import, preview lifecycle and readiness,
-scene-revision-linked images/telemetry, local connection/MCP evaluation, ordinary
-browser scene application packaging and optional visual tooling remain issue #8
-work. Coordinate precision and large-world contracts continue under #18. This
-slice does not satisfy the full issue acceptance criteria or make graphics
-performance claims.
+The separate [preview workflow](preview.md) supplies browser readiness and
+revision-linked captures for procedural boxes. The [local connection
+implementation](preview-connection.md) reuses those operations; its CPU and
+restricted installed-browser checks passed. The [saved-project builder](project.md)
+also passed separate generated-app browser checks for this procedural profile.
+General asset cooking/import, broader application building and broader scene
+authoring remain issue #8 work. Coordinate precision and large-world
+contracts continue under #18. These bounded tools do not satisfy the full issue
+acceptance criteria or establish graphics performance.

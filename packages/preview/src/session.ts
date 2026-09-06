@@ -275,6 +275,13 @@ export class PreviewSession<Scene, View, Commit, Frame> {
     });
   }
 
+  /**
+   * Wait for actual mutation/artifact settlement, even after disposal or fault.
+   * Early caller rejection is not settlement. This has no deadline and does not
+   * dispose the driver or assert operation success; shutdown hosts own those steps.
+   */
+  whenIdle(): Promise<void> { return this.#gate.whenIdle(); }
+
   /** Idempotent; interrupts pending work instead of waiting indefinitely for it. */
   dispose(): Promise<void> {
     this.#gate.dispose();
