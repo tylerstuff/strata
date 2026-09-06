@@ -48,21 +48,33 @@ describe('frozen renderer-pair proof schedule', () => {
     }
   });
 
-  it('rejects every mutated primitive plus missing, additional, reordered and sparse plan input', () => {
-    const paths: string[][] = [];
-    const visit = (value: unknown, path: string[]) => {
-      if (value !== null && typeof value === 'object') for (const [key, child] of Object.entries(value)) visit(child, [...path, key]);
-      else paths.push(path);
-    };
-    visit(rendererProofPlan, []); expect(paths.length).toBeGreaterThan(2000);
-    for (const path of paths) {
-      const copy = structuredClone(rendererProofPlan);
-      let parent = copy as unknown as Record<string, unknown>;
-      for (const key of path.slice(0, -1)) parent = parent[key] as Record<string, unknown>;
-      const key = path.at(-1)!, value = parent[key];
-      parent[key] = typeof value === 'number' ? value + 1 : typeof value === 'boolean' ? !value : `${value}-mutated`;
-      expect(() => validateRendererProofPlan(copy), path.join('.')).toThrow();
-    }
+  const primitivePaths: string[][] = [];
+  const visitPrimitives = (value: unknown, path: string[]) => {
+    if (value !== null && typeof value === 'object') {
+      for (const [key, child] of Object.entries(value)) visitPrimitives(child, [...path, key]);
+    } else primitivePaths.push(path);
+  };
+  visitPrimitives(rendererProofPlan, []);
+  it('covers every primitive in the complete frozen plan', () => {
+    expect(primitivePaths.length).toBeGreaterThan(2000);
+    expect(new Set(primitivePaths.map(path => path.join('.'))).size).toBe(primitivePaths.length);
+  });
+  // Keep every mutation and the ordinary per-test deadline. One exhaustive
+  // test exceeded that deadline on CI when run beside the expanded unit suite.
+  for (let first = 0; first < primitivePaths.length; first += 100) {
+    const paths = primitivePaths.slice(first, first + 100);
+    it(`rejects mutated plan primitives ${first + 1} through ${first + paths.length}`, () => {
+      for (const path of paths) {
+        const copy = structuredClone(rendererProofPlan);
+        let parent = copy as unknown as Record<string, unknown>;
+        for (const key of path.slice(0, -1)) parent = parent[key] as Record<string, unknown>;
+        const key = path.at(-1)!, value = parent[key];
+        parent[key] = typeof value === 'number' ? value + 1 : typeof value === 'boolean' ? !value : `${value}-mutated`;
+        expect(() => validateRendererProofPlan(copy), path.join('.')).toThrow();
+      }
+    });
+  }
+  it('rejects missing, additional, reordered and sparse plan input', () => {
     const variants = [
       (p: typeof rendererProofPlan) => { delete (p.steps.reflections[0] as { controls?: unknown }).controls; },
       (p: typeof rendererProofPlan) => { Object.assign(p.steps.reflections[0]!.controls, { unknownControl: false }); },
