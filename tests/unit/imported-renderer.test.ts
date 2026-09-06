@@ -1,3 +1,4 @@
+import { createMeshAsset } from '../../packages/core/src/meshes/mesh-asset.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ImportedRenderer } from '../../packages/core/src/imported/imported-renderer.js';
 import { ImportedGeometry, importedTextureExtent } from '../../packages/core/src/imported/imported-geometry.js';
@@ -253,4 +254,51 @@ describe('imported scene resource and temporal contracts', () => {
     expect(g.writes.slice(writes).some(w => w.label === 'Strata imported directional light and explicit fill')).toBe(false);
     r.submitted(2); r.dispose();
   });
+});
+
+
+describe('application mesh transform submission', () => {
+  it('reuses allocations, shares posed bounds, and retains only submitted motion history', async () => {
+    const g = gpu(), source = asset();
+    const geometry = await ImportedGeometry.create(g.device, createMeshAsset({ meshes: source.primitives, materials: source.materials }));
+    const matrix = new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+    const count = g.buffers.length;
+    geometry.update({ transforms: matrix }); geometry.prepare(true, true); geometry.submitted();
+    matrix[12] = 4;
+    geometry.update({ transforms: matrix }); matrix[12] = 999;
+    geometry.prepare(true, false);
+    expect(geometry.telemetry.bounds).toEqual({ min: [3,0,0], max: [5,2,0] });
+    const poses = g.writes.filter(w => w.data.length === 16);
+    expect(poses.at(-2)!.data[12]).toBe(4); expect(poses.at(-1)!.data[12]).toBe(0);
+    geometry.cancelFrame();
+    const before = geometry.telemetry;
+    matrix[12] = 9000;
+    expect(() => geometry.update({ transforms: matrix, background: [1,0,0] })).toThrow();
+    expect(geometry.telemetry).toEqual(before);
+    matrix[12] = 2; geometry.update({ transforms: matrix }); geometry.prepare(true, false);
+    const next = g.writes.filter(w => w.data.length === 16);
+    expect(next.at(-2)!.data[12]).toBe(2); expect(next.at(-1)!.data[12]).toBe(0);
+    expect(g.buffers.length).toBe(count);
+    geometry.submitted(); geometry.update(); geometry.prepare(true, false);
+    const reset = g.writes.filter(w => w.data.length === 16);
+    expect(reset.at(-2)!.data[12]).toBe(0); expect(reset.at(-1)!.data[12]).toBe(2);
+    geometry.dispose(); geometry.dispose(); expect(g.buffers.every(b => b.destroy.mock.calls.length === 1)).toBe(true);
+  });
+});
+
+
+it('rejects reflected roots atomically when any attached primitive is single-sided', async () => {
+  for (const doubleSided of [false, true]) {
+    const g = gpu(), source = asset();
+    const created = createMeshAsset({ meshes: source.primitives, materials: [{ ...material, doubleSided }] });
+    const geometry = await ImportedGeometry.create(g.device, created);
+    const before = geometry.telemetry, writes = g.writes.length;
+    const matrix = new Float32Array([-1,0,0,0,0,1,0,0,0,0,1,0,2,0,0,1]);
+    if (doubleSided) { geometry.update({ transforms: matrix }); geometry.prepare(true, false); }
+    else {
+      expect(() => geometry.update({ transforms: matrix, background: [1,0,0] })).toThrow(/double-sided/);
+      expect(geometry.telemetry).toEqual(before); expect(g.writes.length).toBe(writes);
+    }
+    geometry.dispose();
+  }
 });

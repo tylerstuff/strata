@@ -1,5 +1,5 @@
 import { loadGltf, type LoadGltfOptions } from '@strata-engine/core/gltf';
-import { createEngine, StrataError, SceneCommitError, validateAuthoredBoxScene, validateBoxCamera, validateAuthoredFrameCamera } from '@strata-engine/core';
+import { createEngine, createMeshAsset, StrataError, SceneCommitError, validateAuthoredBoxScene, validateBoxCamera, validateAuthoredFrameCamera } from '@strata-engine/core';
 import type { BoxSceneDescriptor, BoxCamera, SceneCommitReceipt, SceneOptions, AuthoredFrameMetadata, AuthoredBoxSceneOptions, ReflectionMode, ReflectionSceneOptions, ReflectionControls, ReflectionTelemetry, IntegratedSceneOptions, IntegratedTelemetry, IntegratedCameraMode } from '@strata-engine/core';
 
 const canvas = document.createElement('canvas');
@@ -90,3 +90,11 @@ async function lifecycle() {
 }
 
 void lifecycle;
+
+const generatedAsset: import('@strata-engine/core').ImportedAsset = createMeshAsset({
+  meshes: [{ name: 'generated', vertices: new Float32Array(48), indices: new Uint32Array([0,1,2]), material: 0 }],
+  materials: [{ name: 'opaque', baseColorFactor: [1,1,1,1], metallicFactor: 0, roughnessFactor: 1, emissiveFactor: [0,0,0],
+    emissiveStrength: 1, normalScale: 1, occlusionStrength: 1, alphaMode: 'OPAQUE', alphaCutoff: .5, doubleSided: false }],
+});
+const applicationTransforms: import('@strata-engine/core').ImportedControls = { transforms: new Float64Array(16) };
+void generatedAsset; void applicationTransforms;

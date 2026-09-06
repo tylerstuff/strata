@@ -15,3 +15,7 @@ export type {
 } from './types.js';
 
 export type { ImportedIndirectOptions, ImportedIndirectTraceOptions, ImportedIndirectDenoise, ImportedIndirectProgress, ImportedIndirectReadback, ImportedSpatialDiagnostics } from './imported/imported-indirect-types.js';
+
+export { createMeshAsset } from './meshes/mesh-asset.js';
+export type { MeshAssetOptions, MeshGeometry } from './meshes/mesh-asset.js';
+export type { ImportedMaterial, ImportedImage, ImportedTexture, ImportedSampler } from './imported/imported-types.js';

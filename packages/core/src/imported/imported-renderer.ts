@@ -157,6 +157,7 @@ export class ImportedRenderer {
     if (!this.indirect && input?.indirect !== undefined) throw new StrataError('UNSUPPORTED_FEATURE', 'Create the imported scene with indirect options before enabling progressive lighting.');
     if (input?.indirect?.denoise !== undefined) this.indirect!.validateDenoise(input.indirect.denoise);
     if (this.indirect && input?.presentation === 'ground') throw new StrataError('UNSUPPORTED_FEATURE', 'Progressive imported lighting traces the model only; ground participation is unsupported.');
+    if (this.indirect && input?.transforms !== undefined) throw new StrataError('UNSUPPORTED_FEATURE', 'Static progressive tracing does not support dynamic mesh transforms.');
     const reset = this.geometry.update(input); this.forceReset = this.forceReset || reset;
     if (this.indirect) {
       const lighting = this.geometry.lighting;

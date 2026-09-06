@@ -1,4 +1,4 @@
-import { createEngine } from '@strata-engine/core';
+import { createEngine, createMeshAsset } from '@strata-engine/core';
 import { installHarness } from './harness.js';
 
-installHarness(createEngine);
+installHarness(createEngine, createMeshAsset);

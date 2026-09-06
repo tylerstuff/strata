@@ -92,7 +92,7 @@ export interface ImportedAsset {
   readonly materials: readonly ImportedMaterial[];
   readonly images: readonly ImportedImage[];
   readonly sourceBounds: ImportedBounds;
-  /** Largest extent is two units; X/Z center is zero and min Y is zero. */
+  /** glTF loader output is normalized to two units. createMeshAsset preserves application units. */
   readonly bounds: ImportedBounds;
   readonly normalization: { readonly scale: number; readonly translation: ImportedVec3 };
   /** Explicit maximum upload edge. The renderer reports actual source/upload dimensions. */
@@ -135,6 +135,12 @@ export interface ImportedEnvironment {
   readonly rotationRadians?: number;
 }
 export interface ImportedControls {
+  /** Complete column-major root-world matrices, one per node, consumed during render.
+   * Root-only rigid scenes, no skins or active clips. Omission selects the normal
+   * rest/animation pose for this frame. Matrices use final scene units, bypassing
+   * asset normalization. Fixed topology; GPU current/previous palettes are reused.
+   */
+  readonly transforms?: Float32Array<ArrayBuffer> | Float64Array<ArrayBuffer>;
   /** Requires a scene created with indirect options. Disabling retains the matching direct-only baseline. */
   readonly indirect?: { readonly enabled: boolean; readonly denoise?: ImportedIndirectDenoise };
   /** Authored is the default. Relit changes only unlit materials to geometric-normal matte dielectric (roughness .65). */

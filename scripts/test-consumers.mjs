@@ -269,6 +269,15 @@ async function checkConsumer(kind, url) {
     assert.equal(authored.telemetry.scene.lastSubmittedFrameId, authored.metrics.frameId);
     assert.deepEqual(authored.metrics.authored.origin, [1000000.01, 0, 3]);
     assert.ok((await loadedModules()).some(module => module.source.includes(authoredModuleMarker)), `${kind}: authored renderer did not load`);
+    const meshes = await page.evaluate(() => strataTest.exerciseMeshes());
+    assert.equal(meshes.moved.scene.sceneGeneration, meshes.receipt.sceneGeneration, 'Movement must not reload a scene');
+    assert.deepEqual(meshes.moved.imported.bounds, { min: [0,0,0], max: [2,2,0] });
+    assert.equal(meshes.rejected, 'INVALID_OPTIONS');
+    assert.equal(meshes.afterRejected.submittedFrames, meshes.moved.frameId);
+    assert.equal(meshes.first.allocatedGpuBufferBytes, meshes.moved.allocatedGpuBufferBytes);
+    assert.deepEqual(meshes.resized.imported.bounds, { min: [1,0,0], max: [3,2,0] });
+    assert.equal(meshes.telemetry.gpuErrorCount, 0, meshes.telemetry.lastGpuError ?? undefined);
+    assert.equal(meshes.cleared.allocatedGpuTextureBytes, 0);
     const cleared = await page.evaluate(() => strataTest.exerciseScene(null));
     assert.equal(cleared.metrics.dispatchCalls, 0);
     assert.equal(cleared.telemetry.allocatedGpuBufferBytes, 0);
