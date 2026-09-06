@@ -20,3 +20,6 @@ export { createMeshAsset } from './meshes/mesh-asset.js';
 export type { MeshAssetOptions, MeshGeometry } from './meshes/mesh-asset.js';
 export type { ImportedMaterial, ImportedImage, ImportedTexture, ImportedSampler } from './imported/imported-types.js';
 export { prepareMeshTangents } from './meshes/mesh-tangents.js';
+
+export { combineImportedAssets } from './meshes/mixed-asset.js';
+export type { BakedProbeVolume } from './imported/baked-probes.js';

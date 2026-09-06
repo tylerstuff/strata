@@ -11,7 +11,7 @@ export interface RasterControls {
   cameraCut?: boolean;
 }
 
-export type RasterPassName = 'selection' | 'shadow' | 'raster' | 'temporal' | 'presentation' | 'gi-primary' | 'gi-trace' | 'gi-update' | 'gi-shade' | 'reflection-trace' | 'reflection-resolve';
+export type RasterPassName = 'selection' | 'shadow-static' | 'shadow' | 'raster' | 'temporal' | 'presentation' | 'gi-primary' | 'gi-trace' | 'gi-update' | 'gi-shade' | 'reflection-trace' | 'reflection-resolve';
 export type RasterTimestamps = Partial<Record<RasterPassName, GPURenderPassTimestampWrites>>;
 
 /**

@@ -1,3 +1,4 @@
+import { bakedProbeShader } from './baked-probes.js';
 import { importedEnvironmentShader } from './imported-environment.js';
 import { importedTransformShader } from './imported-transform.js';
 
@@ -5,6 +6,7 @@ import { importedTransformShader } from './imported-transform.js';
 export const importedShader = /* wgsl */ `
 ${importedEnvironmentShader}
 ${importedTransformShader}
+${bakedProbeShader}
 struct ImportedMaterial {
   base: vec4f,
   emissive: vec4f,
@@ -158,6 +160,7 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let environment = importedEnvironmentLight(base.rgb, roughness, metallic, normal, view, materialAo);
   var lightmapped = vec3f(0.0);
   if (importedMaterial.lightmap.x > 0.0) { lightmapped = base.rgb * (1.0 - metallic) * lightmapDiffuse(input.lightmapUv); }
+  if (importedMaterial.lightmap.y > 0.5) { lightmapped += base.rgb * (1.0 - metallic) * bakedProbeDiffuse(input.world, normal); }
   let baked = select(vec3f(0.0), base.rgb * (1.0 - metallic) * input.color.rgb * importedEnvironmentSettings.modes.z, bakedMode);
   var output: GBufferOutput;
   output.hdr = vec4f(select(direct + fill + baked + lightmapped + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
