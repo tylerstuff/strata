@@ -19,6 +19,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./connection": {
+      "types": "./dist/connection.d.ts",
+      "import": "./dist/connection.js"
+    },
     "./project": {
       "types": "./dist/project.d.ts",
       "import": "./dist/project.js"
@@ -33,6 +37,7 @@
   "dependencies": {
     "@strata-engine/authoring": "0.0.0",
     "@strata-engine/core": "0.0.0",
+    "@types/node": "^22.0.0",
     "playwright": "1.63.0"
   },
   "repository": {
@@ -42,6 +47,7 @@
   },
   "bin": {
     "strata-preview": "./dist/bin.js",
+    "strata-preview-connection": "./dist/connection-bin.js",
     "strata-project": "./dist/project-bin.js"
   }
 }
