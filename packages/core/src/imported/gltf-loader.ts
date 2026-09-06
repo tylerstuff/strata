@@ -136,10 +136,11 @@ function materialData(document: GltfObject): ImportedMaterial[] {
       ...(extensions.KHR_materials_unlit === undefined ? {} : { unlit: true }),
     };
     const lm = extensions.EXT_strata_lightmap === undefined ? undefined : object(extensions.EXT_strata_lightmap, 'EXT_strata_lightmap');
-    if (lm && (lm.version !== 1 || lm.encoding !== 'rgbm' || object(lm.texture, 'lightmap.texture').texCoord !== 1)) gltfError('Lightmaps require version 1 RGBM on TEXCOORD_1.');
+    if (lm && (![1,2].includes(lm.version as number) || lm.encoding !== 'rgbm' || object(lm.texture, 'lightmap.texture').texCoord !== 1)) gltfError('Lightmaps require version 1 RGBM on TEXCOORD_1.');
+    const point = lm?.version === 2 ? object(lm.pointLight, 'lightmap.pointLight') : undefined;
     const bindings = { baseColorTexture: texture(pbr.baseColorTexture), metallicRoughnessTexture: texture(pbr.metallicRoughnessTexture), normalTexture: texture(material.normalTexture),
       occlusionTexture: texture(material.occlusionTexture), emissiveTexture: texture(material.emissiveTexture) };
-    return { ...result, ...(lm ? { lightmapTexture: texture(lm.texture, 1)!, lightmapRange: scalar(lm.range, 'lightmap.range', 0.000001, 65536) } : {}), ...Object.fromEntries(Object.entries(bindings).filter(([, value]) => value !== undefined)) };
+    return { ...result, ...(point ? { bakedPointLightTexture:texture(point.texture,1)!, bakedPointLightRange:scalar(point.range,'point layer range',.000001,65536), bakedPointLight:object(point.light,'baked point light') as unknown as NonNullable<ImportedMaterial['bakedPointLight']> } : {}), ...(lm ? { lightmapTexture: texture(lm.texture, 1)!, lightmapRange: scalar(lm.range, 'lightmap.range', 0.000001, 65536) } : {}), ...Object.fromEntries(Object.entries(bindings).filter(([, value]) => value !== undefined)) };
   });
 }
 

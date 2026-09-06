@@ -459,3 +459,17 @@ it('rejects double-counted local lighting and preserves point state after invali
   expect(()=>geometry.update({bakedVertexLighting:{intensity:1}})).toThrow();
   geometry.dispose();
 });
+
+it('snapshots baked lamp descriptors and rejects mismatched light and malformed shadow controls',async()=>{
+  const g=gpu(),source=asset(),sampler={wrapS:33071 as const,wrapT:33071 as const,magFilter:9729 as const,minFilter:9729 as const};
+  vi.stubGlobal('createImageBitmap',vi.fn(async()=>({width:1,height:1,close:vi.fn()})));
+  const light={id:'lamp',position:[0,2,0] as [number,number,number],color:[1,.5,.2] as const,intensity:1,range:5};
+  const a={...source,images:[{name:'RGBM',mimeType:'image/png' as const,width:1,height:1,bytes:new Uint8Array([1])}],materials:[{...material,lightmapTexture:{image:0,sampler},lightmapRange:1,bakedPointLightTexture:{image:0,sampler},bakedPointLightRange:1,bakedPointLight:light}],primitives:source.primitives.map(p=>({...p,lightmapUvs:new Float32Array(6)}))};
+  await expect(ImportedGeometry.create(g.device,a,undefined,undefined,{...light,range:6})).rejects.toThrow(/fixed scene/);
+  const geometry=await ImportedGeometry.create(g.device,a,undefined,undefined,light);light.position[0]=8;
+  expect(()=>geometry.update({})).not.toThrow();
+  expect(()=>geometry.update({pointLight:light})).toThrow(/fixed/);
+  expect(()=>geometry.update({bakedShadows:1 as unknown as boolean})).toThrow();
+  expect(geometry.update({bakedShadows:false})).toBe(true);expect(geometry.update({bakedShadows:false})).toBe(false);
+  geometry.dispose();for(const r of [...g.buffers,...g.textures])expect(r.destroy).toHaveBeenCalledOnce();
+});

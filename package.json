@@ -66,6 +66,7 @@
     "test:imported-baked": "node scripts/test-imported-baked.mjs",
     "test:hybrid-baked": "node scripts/test-hybrid-baked.mjs",
     "test:point-shadow": "node scripts/test-point-shadow.mjs",
+    "bake:shadow-layer": "node scripts/bake-shadow-layer.mjs",
     "bake:probes": "node scripts/bake-probes.mjs"
   },
   "devDependencies": {

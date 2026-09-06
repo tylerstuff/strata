@@ -50,7 +50,7 @@ export function importedTextureExtent(width: number, height: number, edge: numbe
   return { width: w, height: h, mipLevels, bytes };
 }
 
-const textureRoles = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'occlusionTexture', 'emissiveTexture', 'lightmapTexture'] as const;
+const textureRoles = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'occlusionTexture', 'emissiveTexture', 'lightmapTexture', 'bakedPointLightTexture'] as const;
 
 /**
  * Estimates retained imported-scene texture payload without decoding, allocating GPU resources or importing environment data.
@@ -73,7 +73,7 @@ export function estimateImportedTextureAllocation(
   const textures: ImportedTextureAllocationRecord[] = [], seen = new Set<string>();
   if (options.pointShadowMapSize !== undefined && options.pointShadowMapSize !== 512 && options.pointShadowMapSize !== 1024) fail('point shadow edge must be 512 or 1024.');
   let gpuTextureBytes = 8 + importedEnvironmentTextureBytes + (options.pointShadowMapSize ? options.pointShadowMapSize ** 2 * 48 : 24);
-  const lightmaps = new Set(asset.materials.flatMap(m => m?.lightmapTexture ? [m.lightmapTexture.image] : []));
+  const lightmaps = new Set(asset.materials.flatMap(m => [m?.lightmapTexture?.image,m?.bakedPointLightTexture?.image].filter((v):v is number=>v!==undefined)));
   for (const material of asset.materials) {
     if (!material || typeof material !== 'object' || Array.isArray(material)) fail('material must be an object.');
     for (const role of textureRoles) {
@@ -81,7 +81,7 @@ export function estimateImportedTextureAllocation(
       if (ref === undefined) continue;
       if (!ref || typeof ref !== 'object' || Array.isArray(ref)) fail('material texture reference must be an object.');
       if (!Number.isSafeInteger(ref.image) || ref.image < 0 || ref.image >= asset.images.length) fail('material references an absent image.');
-      const isLightmap = role === 'lightmapTexture';
+      const isLightmap = role === 'lightmapTexture' || role === 'bakedPointLightTexture';
       if (!isLightmap && lightmaps.has(ref.image)) fail('lightmap images cannot be reused by other texture roles.');
       const colorSpace = role === 'baseColorTexture' || role === 'emissiveTexture' ? 'srgb' : 'linear';
       const key = `${ref.image}/${colorSpace}`;

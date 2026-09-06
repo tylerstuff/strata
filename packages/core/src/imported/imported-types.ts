@@ -38,6 +38,10 @@ export interface ImportedMaterial {
   readonly bakedProbeLighting?: boolean;
   /** Explicit local direct-light receiver; static combined lightmaps are incompatible. */
   readonly localLighting?: boolean;
+  /** Direct irradiance/pi from one fixed baked lamp, on the static lightmap UVs. */
+  readonly bakedPointLightTexture?: ImportedTexture;
+  readonly bakedPointLightRange?: number;
+  readonly bakedPointLight?: ImportedPointLightControl;
   readonly name: string;
   /** KHR_materials_unlit: base color bypasses lighting, metallic/roughness, normal, AO and emission. */
   readonly unlit?: boolean;
@@ -161,6 +165,8 @@ export interface ImportedEnvironment {
   readonly rotationRadians?: number;
 }
 export interface ImportedControls {
+  /** Toggle only dynamic occlusion of the separate baked lamp contribution. */
+  readonly bakedShadows?: boolean;
   readonly pointLight?: ImportedPointLightControl;
   /** Explicit revision must match the scene bake; omission retains the enable state. */
   readonly bakedProbes?: { readonly revision: string; readonly enabled: boolean };

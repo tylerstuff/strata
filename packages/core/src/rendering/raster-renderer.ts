@@ -362,15 +362,15 @@ export class RasterRenderer {
               ...(face === 0 ? { beginningOfPassWriteIndex: stamp.beginningOfPassWriteIndex! } : { endOfPassWriteIndex: stamp.endOfPassWriteIndex! }) } : undefined;
             const pass = encoder.beginRenderPass({ label: `Strata ${name} face ${face}`, colorAttachments: [],
               depthStencilAttachment: { view: (cached ? point.cacheViews : point.views)[face]!, depthClearValue: 1,
-                depthLoadOp: cached ? 'clear' : 'load', depthStoreOp: 'store' }, ...(writes ? { timestampWrites: writes } : {}) });
+                depthLoadOp: 'clear', depthStoreOp: 'store' }, ...(writes ? { timestampWrites: writes } : {}) });
             drawGeometry(pass, 'shadow', cached, face);
           }
           pointDraws += 6 * (cached ? point.staticDrawCalls : point.dynamicDrawCalls);
           pointTriangles += 6 * (cached ? point.staticTriangles : point.dynamicTriangles);
         };
         if (rebuild) { faces(true); this.cachedPointRevision = point.revision; } else pointSkipped.push('point-shadow-static');
-        if (rebuild || moving) encoder.copyTextureToTexture({ texture: point.cache }, { texture: point.texture }, [point.size, point.size, 6]);
-        if (moving) faces(false); else pointSkipped.push('point-shadow');
+        // Dynamic depth remains separate, allowing baked receivers to shadow only direct light.
+        if (rebuild || moving) faces(false); else pointSkipped.push('point-shadow');
       } else pointSkipped.push('point-shadow-static', 'point-shadow');
     }
     const raster = encoder.beginRenderPass({ label: 'Strata PBR and shared geometry outputs', colorAttachments: [
