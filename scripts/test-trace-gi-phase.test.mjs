@@ -96,14 +96,18 @@ test('native PNG preserves BGRA channel values exactly without exposure, resampl
   assert.throws(() => phaseNativePng(source, 3, 2));
 });
 test('late errors, missing device/browser/server teardown, forced kill and whole deadline cannot pass', () => {
-  const valid = () => ({ status: 'pass', browserErrors: [], network: { admissible: true }, cleanup: { browserOwnershipVerified: true, browserLaunchSettled: true, deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
+  const valid = () => ({ status: 'pass', browserErrors: [], network: { admissible: true }, rawTransportStatus: 'passed', consumerIntegrity: { admissible: true }, cleanup: { browserOwnershipVerified: true, browserLaunchSettled: true, deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
   assert.equal(finalizePhaseStatus(valid(), 1000), 'pass');
   for (const mutation of [r => r.browserErrors.push('late GPU error'), r => { r.cleanup.deviceDestroyed = false; },
     r => { r.cleanup.browserExited = false; }, r => { r.cleanup.serverClosed = false; }, r => { r.cleanup.forcedKill = true; },
     r => { r.cleanup.artifactsDrained = false; }, r => { r.cleanup.frozenInputsVerified = false; },
     r => { r.cleanup.browserOwnershipVerified = false; }, r => { r.cleanup.browserLaunchSettled = false; },
-    r => { r.network.admissible = false; }, r => { delete r.network; }, r => { r.status = 'fail'; }]) { const r = valid(); mutation(r); assert.equal(finalizePhaseStatus(r, 1000), 'fail'); }
+    r => { r.network.admissible = false; }, r => { delete r.network; }, r => { delete r.consumerIntegrity; }, r => { r.consumerIntegrity.admissible = false; }, r => { r.status = 'fail'; }]) { const r = valid(); mutation(r); assert.equal(finalizePhaseStatus(r, 1000), 'fail'); }
   assert.equal(finalizePhaseStatus(valid(), PHASE_LIMITS.totalMs), 'fail');
+  const instrumented = valid(); instrumented.network.admissible = false; instrumented.rawTransportStatus = 'failed';
+  assert.equal(finalizePhaseStatus(instrumented, 1000), 'consumer-integrity-pass');
+  assert.equal(finalizePhaseStatus(instrumented, 1001), 'consumer-integrity-pass');
+  instrumented.status = 'fail'; assert.equal(finalizePhaseStatus(instrumented, 1002), 'fail');
 });
 test('cleanup confirms the exact owned child exited, not merely a resolved close promise', async t => {
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
@@ -133,7 +137,7 @@ test('an operation queued before expiry cannot start after the monotonic deadlin
   await assert.rejects(pending, /deadline/); assert.equal(calls, 0);
 });
 test('disk reports stay provisional and a late completed write cannot return an admitted child success', async () => {
-  const report = () => ({ status: 'pass', browserErrors: [], network: { admissible: true }, cleanup: { browserOwnershipVerified: true, browserLaunchSettled: true, deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
+  const report = () => ({ status: 'pass', browserErrors: [], network: { admissible: true }, rawTransportStatus: 'passed', consumerIntegrity: { admissible: true }, cleanup: { browserOwnershipVerified: true, browserLaunchSettled: true, deviceDestroyed: true, browserExited: true, serverClosed: true, artifactsDrained: true, frozenInputsVerified: true } });
   let clock = 100, written;
   const runtime = { now: () => clock, write: async (_path, bytes) => { written = JSON.parse(bytes); clock = PHASE_LIMITS.totalMs + 1; } };
   await assert.rejects(publishPhaseReport(report(), '/synthetic-report.json', 0, runtime), /deadline/);
@@ -144,4 +148,8 @@ test('disk reports stay provisional and a late completed write cannot return an 
   assert.equal(completed.status, 'collected'); assert.equal(completed.childDataCompletedElapsedMs, 200);
   assert.equal(completed.reportSha256, proofHash(JSON.stringify(written, null, 2) + '\n'));
   assert.equal(written.observedElapsedMs, 100, 'The receipt does not claim to know its own later write completion.');
+  const observed = report(); observed.network.admissible = false; observed.rawTransportStatus = 'failed';
+  const receipt = await publishPhaseReport(observed, '/synthetic-instrumented-report.json', 0, runtime);
+  assert.equal(receipt.status, 'consumer-integrity-collected'); assert.equal(written.status, 'consumer-integrity-collected');
+  assert.equal(written.network.admissible, false); assert.equal(written.rawTransportStatus, 'failed');
 });

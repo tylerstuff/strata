@@ -10,6 +10,8 @@ import { bundleTraceProof, newExternalDirectory, proofHash, traceProofInputs } f
 import { compareTraceGiPhaseCells } from './trace-gi-phase-comparison.mjs';
 import { createOwnedBrowserLaunch } from './owned-browser-launch.mjs';
 import { createPhaseNetworkObserver, PHASE_NETWORK_LIMITS } from './phase-network-observer.mjs';
+import { PHASE_CONSUMER_CONTRACT } from './phase-consumer-observer.mjs';
+import { phaseConsumerAssets, validatePhaseConsumerIntegrity } from './phase-consumer-admission.mjs';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const command = promisify(execFile);
@@ -17,7 +19,7 @@ const json = value => `${JSON.stringify(value, null, 2)}\n`;
 const inside = (root, path) => { const p = relative(root, path); return !isAbsolute(p) && p !== '..' && !p.startsWith(`..${sep}`); };
 export const PHASE_SOURCE = 'c91c285489a9befe8ce27d7264dfc56a295d12d5';
 export const PHASE_BROWSER_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-export const PHASE_PLAN_SHA = '590b30bae791b4654c92e9e633a8c4e965d9f8f9af87dd1545459f3bdb5e942d';
+export const PHASE_PLAN_SHA = '218b91b6362a570ea5cb9aec3c43c9d5357e2be5fb870e7f04738f662f8a1d53';
 export const PHASE_RUNS = Object.freeze([
   { id: '1-incremental-5399', updater: 'incremental', phaseLabel: 5399 },
   { id: '2-full-5399', updater: 'full', phaseLabel: 5399 },
@@ -135,7 +137,7 @@ async function shaderSources(api) {
 async function runnerGraph() {
   const files = ['scripts/test-trace-gi-phase.mjs', 'scripts/trace-gi-phase-comparison.mjs', 'scripts/test-trace-updates.mjs',
     'scripts/benchmark-server.mjs', 'scripts/gallery-catalog.mjs', 'scripts/owned-browser-launch.mjs',
-    'scripts/phase-network-observer.mjs', 'package.json', 'package-lock.json'];
+    'scripts/phase-network-observer.mjs', 'scripts/phase-consumer-observer.mjs', 'scripts/phase-consumer-admission.mjs', 'package.json', 'package-lock.json'];
   return Object.fromEntries(await Promise.all(files.map(async path => [path, proofHash(await readFile(resolve(repository, path)))])));
 }
 export async function preparePhase(args) {
@@ -153,7 +155,8 @@ export async function preparePhase(args) {
   const diagnosticShaders = { exactShadowLoad: api.traceGiPhaseShadowReadShader };
   assert.equal(typeof diagnosticShaders.exactShadowLoad, 'string');
   const artifacts = [];
-  for (const [name, bytes] of [['plan.md', sourcePlan], ['workload.json', json(plan)], ['shaders.json', json(shaders)], ['diagnostic-shaders.json', json(diagnosticShaders)]]) {
+  for (const [name, bytes] of [['plan.md', sourcePlan], ['workload.json', json(plan)], ['shaders.json', json(shaders)], ['diagnostic-shaders.json', json(diagnosticShaders)],
+    ['phase-consumer-observer.mjs', await readFile(resolve(repository, 'scripts/phase-consumer-observer.mjs'))]]) {
     await writeFile(resolve(output, name), bytes, { flag: 'wx' }); artifacts.push({ name, bytes: Buffer.byteLength(bytes), sha256: proofHash(bytes) });
   }
   const runners = await runnerGraph();
@@ -163,7 +166,7 @@ export async function preparePhase(args) {
   const manifest = { schemaVersion: 1, kind: 'strata-issue20-shared-lighting-phase-diagnostic', correctnessOnly: true, performanceEligible: false,
     runnable: !before.status && !args['--allow-dirty-draft'], createdAt: new Date().toISOString(), source: before,
     measuredBase: PHASE_SOURCE, planSha256: PHASE_PLAN_SHA, runs: PHASE_RUNS, limits: PHASE_LIMITS,
-    probeObservables: PHASE_PROBE_OBSERVABLES, assets, runners, browserExecutable,
+    probeObservables: PHASE_PROBE_OBSERVABLES, consumerContract: PHASE_CONSUMER_CONTRACT, assets, runners, browserExecutable,
     bundles: { incremental: candidate, full: control, cpu }, artifacts,
     shaders: Object.fromEntries(Object.entries(shaders).map(([key, code]) => [key, proofHash(code)])),
     diagnosticShaders: Object.fromEntries(Object.entries(diagnosticShaders).map(([key, code]) => [key, proofHash(code)])) };
@@ -179,10 +182,13 @@ export async function verifyPhase(manifestPath, sha256) {
   assert.equal(manifest.measuredBase, PHASE_SOURCE); assert.equal(manifest.planSha256, PHASE_PLAN_SHA);
   assert.deepEqual(manifest.runs, PHASE_RUNS); assert.deepEqual(manifest.limits, PHASE_LIMITS);
   assert.deepEqual(manifest.probeObservables, PHASE_PROBE_OBSERVABLES);
+  assert.deepEqual(manifest.consumerContract, PHASE_CONSUMER_CONTRACT, 'A newly frozen instrumented consumer contract is required.');
   assert.equal(manifest.browserExecutable?.path, await realpath(PHASE_BROWSER_EXECUTABLE));
   await verifyPhaseFile(PHASE_BROWSER_EXECUTABLE, manifest.browserExecutable);
   assert.deepEqual(await sourceState(), manifest.source, 'Exact clean reviewed source required.'); await verifyRuntimeBase();
   assert.deepEqual(await runnerGraph(), manifest.runners); assertPhaseBundleGraph(manifest.bundles.incremental, manifest.bundles.full);
+  const observerArtifacts = manifest.artifacts.filter(file => file.name === 'phase-consumer-observer.mjs');
+  assert.equal(observerArtifacts.length, 1); assert.equal(observerArtifacts[0].sha256, manifest.runners['scripts/phase-consumer-observer.mjs']);
   for (const file of [...manifest.artifacts, ...Object.values(manifest.bundles).flatMap(b => b.files)]) {
     const target = await realpath(resolve(directory, file.name)); assert(inside(directory, target)); await verifyPhaseFile(target, file);
   }
@@ -248,30 +254,33 @@ export async function closePhaseBrowser(browserServer) {
   return { pid: process.pid, exitCode: process.exitCode, signalCode: process.signalCode };
 }
 export function finalizePhaseStatus(report, elapsedMs) {
-  if (report.browserErrors.length || report.status !== 'pass' || !report.cleanup.browserExited || !report.cleanup.serverClosed
+  if (report.browserErrors.length || !['pass', 'consumer-integrity-pass'].includes(report.status) || !report.cleanup.browserExited || !report.cleanup.serverClosed
     || !report.cleanup.deviceDestroyed || !report.cleanup.artifactsDrained || !report.cleanup.frozenInputsVerified
     || !report.cleanup.browserOwnershipVerified || !report.cleanup.browserLaunchSettled
-    || report.network?.admissible !== true || report.cleanup.forcedKill || elapsedMs >= PHASE_LIMITS.totalMs) report.status = 'fail';
+    || !report.network || report.consumerIntegrity?.admissible !== true
+    || report.rawTransportStatus !== (report.network.admissible ? 'passed' : 'failed') || report.cleanup.forcedKill || elapsedMs >= PHASE_LIMITS.totalMs) report.status = 'fail';
+  if (report.status !== 'fail') report.status = report.network.admissible ? 'pass' : 'consumer-integrity-pass';
   report.observedElapsedMs = elapsedMs; return report.status;
 }
+const publishedStatus = status => status === 'pass' ? 'collected' : status === 'consumer-integrity-pass' ? 'consumer-integrity-collected' : 'fail';
 /** A disk report is a provisional data artifact, never independently a passing run. */
 export async function publishPhaseReport(report, path, started, { now = () => performance.now(), write = writeFile } = {}) {
   const beforeWrite = now() - started;
   finalizePhaseStatus(report, beforeWrite);
-  const document = { ...report, status: report.status === 'pass' ? 'collected' : 'fail',
+  const document = { ...report, status: publishedStatus(report.status),
     publication: { status: 'provisional', childReportWriteStartedElapsedMs: beforeWrite,
       admission: 'Requires independent supervisor observation of child exit0, completed artifact writes and retired owned process groups within the original absolute300s allocation. This file alone is not a pass.' } };
   const bytes = json(document);
   await withPhaseDeadline(() => write(path, bytes, { flag: 'wx' }), 'Provisional report publication', PHASE_LIMITS.totalMs - beforeWrite, now);
   const completed = now() - started; finalizePhaseStatus(report, completed);
-  return { path, status: report.status === 'pass' ? 'collected' : 'fail', reportSha256: proofHash(bytes),
+  return { path, status: publishedStatus(report.status), reportSha256: proofHash(bytes),
     childDataCompletedElapsedMs: completed, admission: document.publication.admission };
 }
 
 /** Loopback server serves ONLY the reviewed bundles and allowlisted assets, verifying bytes on each request. */
 async function frozenPhaseServer(frozen, failures, network) {
   const routes = new Map();
-  for (const name of ['incremental.mjs', 'full.mjs', 'workload.json', 'shaders.json', 'diagnostic-shaders.json']) {
+  for (const name of ['incremental.mjs', 'full.mjs', 'workload.json', 'shaders.json', 'diagnostic-shaders.json', 'phase-consumer-observer.mjs']) {
     const record = [...frozen.manifest.artifacts, ...Object.values(frozen.manifest.bundles).flatMap(b => b.files)].find(a => a.name === name);
     assert(record, `Missing frozen route ${name}`); routes.set(`/proof/${name}`, { ...record, path: resolve(frozen.directory, name) });
   }
@@ -294,7 +303,7 @@ export async function runPhase(args) {
   const output = await newExternalDirectory(args['--output']);
   const report = { kind: 'strata-issue20-shared-lighting-phase-results', correctnessOnly: true, performanceEligible: false,
     startedAt: new Date().toISOString(), manifest: { path: resolve(args['--manifest']), sha256: args['--manifest-sha256'] },
-    status: 'running', browserErrors: [], cells: [], cleanup: {}, lifecycleEvents: [], limits: PHASE_LIMITS };
+    status: 'running', browserErrors: [], browserRequestFailures: [], cells: [], cleanup: {}, lifecycleEvents: [], limits: PHASE_LIMITS };
   let browser, browserServer, server, watchdog, launchOwner, stopped = false, acceptingCallbacks = true, activeCell = null, totalBytes = 0, published;
   let lifecycleStage = 'preflight-completed';
   const network = createPhaseNetworkObserver({ now: () => performance.now() - started,
@@ -317,6 +326,7 @@ export async function runPhase(args) {
   const work = async () => {
     stage('server-creation');
     server = await frozenPhaseServer(frozen, report.browserErrors, network);
+    report.serverOrigin = server.url;
     if (stopped) { await server.close(); throw Error('Timed out during server creation.'); } active();
     assert.equal(process.env.STRATA_OWNED_BROWSER_EXECUTABLE_PATH, frozen.manifest.browserExecutable.path, 'Supervisor browser executable differs.');
     assert.equal(process.env.STRATA_OWNED_BROWSER_EXECUTABLE_SHA256, frozen.manifest.browserExecutable.sha256, 'Supervisor browser SHA256 differs.');
@@ -334,7 +344,7 @@ export async function runPhase(args) {
     for (const [name, callback] of Object.entries(network.browser)) page.on(name, callback);
     page.setDefaultTimeout(15000); page.setDefaultNavigationTimeout(15000);
     page.on('pageerror', e => report.browserErrors.push(String(e))); page.on('console', m => { if (m.type() === 'error') report.browserErrors.push(m.text()); });
-    page.on('requestfailed', r => report.browserErrors.push(`${r.url()}: ${r.failure()?.errorText}`));
+    page.on('requestfailed', r => report.browserRequestFailures.push(`${r.url()}: ${r.failure()?.errorText}`));
     await page.exposeFunction('savePhaseArtifact', (cellId, artifact) => persist(async () => {
       assert.equal(cellId, activeCell?.id, 'Artifact belongs to inactive cell.');
       const cell = activeCell, bytes = validatePhaseArtifact(artifact);
@@ -362,10 +372,11 @@ export async function runPhase(args) {
     stage('device-creation');
     await page.goto(`${server.url}/proof.html`); active();
     // One hardware device for the invocation; every renderer/cache cell is freshly owned.
-    report.deviceResult = await page.evaluate(async () => {
+    report.deviceResult = await page.evaluate(async consumerAssets => {
       const errors = [], state = { errors, expectedDestroy: false, openScopes: 0 };
-      const [api, workload, shaders, diagnostic] = await Promise.all([import('/proof/incremental.mjs'), fetch('/proof/workload.json').then(r => r.json()),
-        fetch('/proof/shaders.json').then(r => r.json()), fetch('/proof/diagnostic-shaders.json').then(r => r.json())]);
+      const [api, workload, shaders, diagnostic, consumer] = await Promise.all([import('/proof/incremental.mjs'), fetch('/proof/workload.json').then(r => r.json()),
+        fetch('/proof/shaders.json').then(r => r.json()), fetch('/proof/diagnostic-shaders.json').then(r => r.json()), import('/proof/phase-consumer-observer.mjs')]);
+      state.consumerAssets = consumerAssets; state.installConsumerObserver = consumer.installPhaseConsumerObserver;
       api.validateTraceGiPhasePlan(workload);
       if (!navigator.gpu || navigator.gpu.getPreferredCanvasFormat() !== 'bgra8unorm') throw Error('Expected native BGRA WebGPU presentation.');
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance', forceFallbackAdapter: false });
@@ -390,7 +401,7 @@ export async function runPhase(args) {
       } });
       const info = adapter.info; return { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description,
         isFallbackAdapter: info.isFallbackAdapter, features: [...adapter.features].sort(), format: navigator.gpu.getPreferredCanvasFormat() };
-    });
+    }, phaseConsumerAssets(frozen.manifest.assets.files, server.url));
     for (const run of PHASE_RUNS) {
       active(); activeCell = { ...run, bytes: 0, eventBytes: 0, artifacts: [], pngs: [], events: [] }; report.cells.push(activeCell);
       stage('cell-start');
@@ -398,15 +409,19 @@ export async function runPhase(args) {
       const completed = await withPhaseDeadline(() => page.evaluate(async run => {
         const s = globalThis.strataPhaseState;
         const firstShader = s.shaderDescriptors.length;
+        const observer = s.installConsumerObserver({ cellId: run.id, assets: s.consumerAssets });
+        let result, consumer;
         try {
           const api = await import(`/proof/${run.updater}.mjs`);
-          const result = await api.runTraceGiPhaseCell(s.recorded, { plan: s.workload, phaseLabel: run.phaseLabel,
+          result = await api.runTraceGiPhaseCell(s.recorded, { plan: s.workload, phaseLabel: run.phaseLabel,
             manifestUrl: new URL('/external-assets/manifest.json', location.href).href, traceProxyUrl: new URL('/external-assets/trace-proxy.json', location.href).href },
           artifact => globalThis.savePhaseArtifact(run.id, artifact), value => globalThis.recordPhaseEvent(run.id, value));
-          if (s.errors.length) throw Error(s.errors.join('\n')); return { result, shaderDescriptors: s.shaderDescriptors.slice(firstShader) };
-        } catch (error) { return { result: { status: 'failed', failure: { message: error.message, stack: error.stack, proofEvidence: error.proofEvidence } }, shaderDescriptors: s.shaderDescriptors.slice(firstShader) }; }
+          if (s.errors.length) throw Error(s.errors.join('\n'));
+        } catch (error) { result = { status: 'failed', failure: { message: error.message, stack: error.stack, proofEvidence: error.proofEvidence } }; }
+        finally { consumer = await observer.finish(); }
+        return { result, consumer, shaderDescriptors: s.shaderDescriptors.slice(firstShader) };
       }, run), `Phase cell ${run.id}`, remainingWork(frozen.workload.maxCellMs));
-      cell.result = completed.result; cell.shaderDescriptors = completed.shaderDescriptors;
+      cell.result = completed.result; cell.consumer = completed.consumer; cell.shaderDescriptors = completed.shaderDescriptors;
       await writes; await writeFile(resolve(output, `${run.id}.json`), json(cell), { flag: 'wx' });
       assert.equal(cell.result.status, 'passed', cell.result.failure?.message); activeCell = null;
     }
@@ -473,6 +488,9 @@ export async function runPhase(args) {
     report.cleanup.browserOwnershipVerified = Boolean(launchOwner?.server && launchOwner.children.length === 1 &&
       launchOwner.errors.length === 0 && launchOwner.unverifiedSpawns.length === 0 && launchOwner.server.process() === launchOwner.children[0]);
     report.network = network.snapshot(); network.dispose();
+    report.rawTransportStatus = report.network.admissible ? 'passed' : 'failed';
+    report.consumerIntegrity = validatePhaseConsumerIntegrity({ cells: report.cells, assets: frozen.manifest.assets.files,
+      origin: server?.url, network: report.network, cleanup: report.cleanup, browserRequestFailures: report.browserRequestFailures });
     finalizePhaseStatus(report, performance.now() - started);
     report.collectionCleanupCompletedAt = new Date().toISOString(); report.totalRawBytes = totalBytes;
     try { published = await publishPhaseReport(report, resolve(output, 'report.json'), started); }
