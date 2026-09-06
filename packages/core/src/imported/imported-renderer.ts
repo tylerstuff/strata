@@ -1,5 +1,5 @@
 import { StrataError } from '../errors.js';
-import { RasterRenderer, normalizeRasterControls } from '../rendering/raster-renderer.js';
+import { RasterRenderer, normalizeRasterControls, validateShadowMapSize } from '../rendering/raster-renderer.js';
 import type { CameraFrame } from '../rendering/raster-math.js';
 import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from '../rendering/raster-types.js';
 import type { SceneFrameStats } from '../rendering/scene-renderer.js';
@@ -41,6 +41,7 @@ export class ImportedRenderer {
   static async create(device: GPUDevice, format: GPUTextureFormat, options: ImportedSceneOptions, context?: CreationContext): Promise<ImportedRenderer> {
     if (!options || options.renderer !== 'imported') throw new StrataError('INVALID_OPTIONS', 'Imported rendering requires a decoded glTF asset.');
     checkAbort(options.signal);
+    const shadowMapSize = validateShadowMapSize(options.shadowMapSize, device.limits.maxTextureDimension2D);
     // Preparation and shaders remain in optional chunks and are loaded only for explicit progressive scenes.
     let prepared: Awaited<ReturnType<typeof import('./static-trace-data.js')['prepareImportedStaticTrace']>> | undefined;
     let result: Awaited<ReturnType<CpuRuntime['buildStaticBvh']>> | undefined;
@@ -83,7 +84,7 @@ export class ImportedRenderer {
         });
         geometry.useIndirectBaseline();
       }
-      raster = await RasterRenderer.create(device, format, {}, geometry, indirect);
+      raster = await RasterRenderer.create(device, format, {}, geometry, indirect, shadowMapSize);
       checkAbort(options.signal);
       return new ImportedRenderer(raster, geometry, retainedAssetBytes(options.asset), indirect, prepared ? {
         estimatedPeakCpuBytes: prepared.estimatedPeakCpuBytes, preparedTraceGpuBytes: prepared.traceGpuBytes,

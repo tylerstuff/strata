@@ -302,3 +302,14 @@ it('rejects reflected roots atomically when any attached primitive is single-sid
     geometry.dispose();
   }
 });
+
+it('allocates the requested shadow edge, counts its bytes and rejects unsupported sizes before allocation', async()=>{
+ const a=gpu(),b=gpu();const low=await ImportedRenderer.create(a.device,'rgba8unorm',{renderer:'imported',asset:asset(),shadowMapSize:1024});
+ const high=await ImportedRenderer.create(b.device,'rgba8unorm',{renderer:'imported',asset:asset(),shadowMapSize:4096});
+ expect(high.gpuTextureBytes-low.gpuTextureBytes).toBe((4096**2-1024**2)*4);
+ expect(b.textures.find(t=>t.descriptor.label==='Strata directional shadow depth')!.descriptor.size).toEqual([4096,4096]);
+ low.dispose();high.dispose();expect(high.gpuTextureBytes).toBe(0);
+ const limited=gpu();limited.raw.limits.maxTextureDimension2D=2048;
+ await expect(ImportedRenderer.create(limited.device,'rgba8unorm',{renderer:'imported',asset:asset(),shadowMapSize:4096})).rejects.toMatchObject({code:'UNSUPPORTED_LIMIT'});
+ expect(limited.textures).toHaveLength(0);expect(limited.buffers).toHaveLength(0);
+});

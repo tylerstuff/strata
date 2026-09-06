@@ -278,6 +278,7 @@ async function checkConsumer(kind, url) {
     assert.deepEqual(meshes.resized.imported.bounds, { min: [1,0,0], max: [3,2,0] });
     assert.equal(meshes.telemetry.gpuErrorCount, 0, meshes.telemetry.lastGpuError ?? undefined);
     assert.equal(meshes.cleared.allocatedGpuTextureBytes, 0);
+    assert.equal(meshes.highShadow.allocatedGpuTextureBytes-meshes.first.allocatedGpuTextureBytes,(4096**2-2048**2)*4);
     const cleared = await page.evaluate(() => strataTest.exerciseScene(null));
     assert.equal(cleared.metrics.dispatchCalls, 0);
     assert.equal(cleared.telemetry.allocatedGpuBufferBytes, 0);

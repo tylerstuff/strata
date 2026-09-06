@@ -82,3 +82,42 @@ The local SM64 example still uses a separate Fast3D adapter. Its existing packet
 contain projected positions and baked combiner inputs, not the world-space mesh,
 normal and material data needed here. Migrating that boundary is subsequent work;
 creating this helper does not automatically upgrade the game's lighting.
+
+## UV tangent preparation and shadow quality
+
+`prepareMeshTangents(vertices, indices, { signal? })` is an asynchronous public
+asset-preparation helper. It snapshots the interleaved 16-float vertices and
+triangle indices, returning new vertices with UV-derived tangent4 attributes.
+Other attributes remain unchanged. Use it before `createMeshAsset` when a
+procedural mesh or adapter supplies normal maps but no authored tangent basis.
+
+Normals must already be unit length. Split vertices at UV/normal discontinuities
+and mirrored-island boundaries before calling. Collapsed UV triangles contribute
+no derivatives; unsupported vertices receive a perpendicular fallback. This
+shares the glTF loader's algorithm and does not claim exact MikkTSpace parity.
+The working budget (owned copies plus tangent accumulation) is 128 MiB. Preparation
+runs in TypeScript with cancellation checkpoints; it is an asset-load operation,
+not a per-frame animation step or a demonstrated large-mesh cooking throughput.
+
+```ts
+import { prepareMeshTangents, createMeshAsset } from '@strata-engine/core';
+const prepared = await prepareMeshTangents(vertices, indices);
+const asset = createMeshAsset({
+  meshes: [{ name: 'surface', vertices: prepared, indices, material: 0 }],
+  materials, images,
+});
+await engine.setScene({ renderer: 'imported', asset, shadowMapSize: 4096 });
+```
+
+Imported scenes optionally choose `shadowMapSize: 1024 | 2048 | 4096`; omission
+retains 2048. Unsupported device limits reject before imported GPU allocation.
+Changing it requires scene recreation. Depth storage is respectively 4, 16 or
+64 MiB, counted in texture telemetry and released on disposal. A 4096 map halves
+world-space texel spacing relative to 2048 for the same fitted light volume; it
+retains the same bias and PCF algorithm. This is a resolution option, not cascaded
+shadows, contact tracing, softer area-light shadows or a performance guarantee.
+
+Use matched cameras and lighting to compare quality and total-frame costs.
+Source material detail and environment lighting remain independent controls;
+normal maps do not change mesh silhouettes, and distant lighting has no local
+occlusion or GI.

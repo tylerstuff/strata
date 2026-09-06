@@ -206,7 +206,7 @@ describe('imported progressive GI CPU orchestration', () => {
       expect(renderer.importedTelemetry.indirect).toMatchObject({ temporal: false, rasterAmbient: 'disabled', rasterEnvironment: 'disabled' });
     }
     expect(h.geometry.useIndirectBaseline).toHaveBeenCalledOnce(); expect(boundary.geometry).toHaveBeenCalledOnce();
-    expect(boundary.effect).toHaveBeenCalledOnce(); expect(boundary.raster).toHaveBeenCalledWith(h.device, 'rgba8unorm', {}, h.geometry, h.effect);
+    expect(boundary.effect).toHaveBeenCalledOnce(); expect(boundary.raster).toHaveBeenCalledWith(h.device, 'rgba8unorm', {}, h.geometry, h.effect, 2048);
     renderer.dispose(); renderer.dispose(); expect(h.raster.dispose).toHaveBeenCalledOnce();
   });
 
