@@ -7,7 +7,8 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { inflateSync } from 'node:zlib';
 import { bundleTraceProof, proofHash } from './test-trace-updates.mjs';
-import { assertPhaseBundleGraph, closePhaseBrowser, finalizePhaseStatus, parsePhaseArguments, phaseNativePng, publishPhaseReport, PHASE_LIMITS, PHASE_RUNS,
+import { PHASE_CONSUMER_CONTRACT } from './phase-consumer-observer.mjs';
+import { assertPhaseBundleGraph, closePhaseBrowser, finalizePhaseStatus, parsePhaseArguments, phaseNativePng, publishPhaseReport, PHASE_LIMITS, PHASE_RUNS, PHASE_PLAN_SHA, PHASE_SOURCE, PHASE_PROBE_OBSERVABLES,
   validatePhaseArtifact, verifyPhase, verifyPhaseFile, withPhaseDeadline } from './test-trace-gi-phase.mjs';
 
 const temporary = async t => { const path = await mkdtemp(join(tmpdir(), 'strata-phase-launcher-')); t.after(() => rm(path, { recursive: true, force: true })); return path; };
@@ -40,6 +41,17 @@ test('manifest tampering and non-runnable drafts fail before GPU import or sourc
   await assert.rejects(verifyPhase(path, proofHash(bytes)), /Draft manifests/);
   await assert.rejects(verifyPhase(path, '0'.repeat(64)), /Frozen SHA256 differs/);
   await assert.rejects(verifyPhaseFile(path, { sha256: proofHash(bytes), bytes: 1 }), /Frozen length/);
+});
+test('a rehashed manifest cannot relabel missing, duplicated or stale plan bytes as the new contract', async t => {
+  const directory = await temporary(t), path = join(directory, 'manifest.json');
+  const base = { schemaVersion: 1, kind: 'strata-issue20-shared-lighting-phase-diagnostic', runnable: true,
+    correctnessOnly: true, performanceEligible: false, measuredBase: PHASE_SOURCE, planSha256: PHASE_PLAN_SHA,
+    runs: PHASE_RUNS, limits: PHASE_LIMITS, probeObservables: PHASE_PROBE_OBSERVABLES, consumerContract: PHASE_CONSUMER_CONTRACT };
+  for (const artifacts of [[], [{ name: 'plan.md', sha256: '0'.repeat(64) }],
+    [{ name: 'plan.md', sha256: PHASE_PLAN_SHA }, { name: 'plan.md', sha256: PHASE_PLAN_SHA }]]) {
+    const bytes = JSON.stringify({ ...base, artifacts }); await writeFile(path, bytes);
+    await assert.rejects(verifyPhase(path, proofHash(bytes)), /plan artifact|Plan artifact/);
+  }
 });
 test('raw artifact payloads reject traversal, noncanonical transport, tampering, dimensions and byte overruns', () => {
   const data = Buffer.from([0, 1, 2, 255]), valid = { name: 'final/native.bin', bytes: 4, sha256: proofHash(data), base64: data.toString('base64'), format: 'bgra8unorm', width: 1, height: 1 };

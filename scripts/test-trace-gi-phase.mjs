@@ -183,6 +183,9 @@ export async function verifyPhase(manifestPath, sha256) {
   assert.deepEqual(manifest.runs, PHASE_RUNS); assert.deepEqual(manifest.limits, PHASE_LIMITS);
   assert.deepEqual(manifest.probeObservables, PHASE_PROBE_OBSERVABLES);
   assert.deepEqual(manifest.consumerContract, PHASE_CONSUMER_CONTRACT, 'A newly frozen instrumented consumer contract is required.');
+  const plans = manifest.artifacts.filter(file => file.name === 'plan.md');
+  assert.equal(plans.length, 1, 'Exactly one pinned plan artifact is required.');
+  assert.equal(plans[0].sha256, PHASE_PLAN_SHA, 'Plan artifact must match the pinned admission contract.');
   assert.equal(manifest.browserExecutable?.path, await realpath(PHASE_BROWSER_EXECUTABLE));
   await verifyPhaseFile(PHASE_BROWSER_EXECUTABLE, manifest.browserExecutable);
   assert.deepEqual(await sourceState(), manifest.source, 'Exact clean reviewed source required.'); await verifyRuntimeBase();
