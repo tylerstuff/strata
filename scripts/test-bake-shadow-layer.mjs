@@ -18,3 +18,9 @@ for(let i=0;i<before.images.length;i++)assert.equal(resolve(output,decodeURIComp
 assert.equal(manifest.emitterFaces,2);assert.ok(manifest.maximumDiffuse>0);assert.equal(manifest.atlases.length,2);
 for(const m of after.materials.filter(m=>m.name!=='fixture-2')){const layer=m.extensions.EXT_strata_lightmap;assert.equal(layer.version,2);assert.deepEqual(layer.pointLight.light,light);assert.ok(layer.pointLight.range>0);}
 console.log('Generated Cycles direct layer and unchanged source references passed',root);
+
+const invalid=structuredClone(before);invalid.materials[1].name=invalid.materials[0].name;
+const invalidPath=join(combined,'duplicate-names.gltf');await writeFile(invalidPath,JSON.stringify(invalid));
+const rejected=spawnSync(process.execPath,['scripts/bake-shadow-layer.mjs','--input',invalidPath,'--config',config,'--output',join(root,'rejected'),'--blender',blender],{encoding:'utf8'});
+assert.notEqual(rejected.status,0);assert.match(rejected.stdout+rejected.stderr,/Unique named source materials required/);
+console.log('Ambiguous material selection rejected before baking');

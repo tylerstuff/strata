@@ -14,6 +14,8 @@ if not np.isfinite(translation).all() or int(cfg.get('maxEdge',1024)) not in [12
 for item in doc.get('buffers',[])+doc.get('images',[]):
  if not isinstance(item.get('uri'),str) or ':' in item['uri']:raise ValueError('External relative file assets required')
 if doc.get('animations') or doc.get('skins'):raise ValueError('Static lightmapped source required')
+names=[m.get('name') for m in doc.get('materials',[])]
+if not names or any(not isinstance(n,str) or not n for n in names) or len(set(names))!=len(names):raise ValueError('Unique named source materials required')
 if not cfg.get('receivers') or not all(isinstance(n,str) for n in cfg['receivers']):raise ValueError('Named receiver materials required')
 import_doc=json.loads(json.dumps(doc));import_doc['extensionsRequired']=[e for e in import_doc.get('extensionsRequired',[]) if e!='EXT_strata_lightmap']
 for item in import_doc.get('buffers',[])+import_doc.get('images',[]):
