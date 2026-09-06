@@ -19,3 +19,4 @@ export type { ImportedIndirectOptions, ImportedIndirectTraceOptions, ImportedInd
 export { createMeshAsset } from './meshes/mesh-asset.js';
 export type { MeshAssetOptions, MeshGeometry } from './meshes/mesh-asset.js';
 export type { ImportedMaterial, ImportedImage, ImportedTexture, ImportedSampler } from './imported/imported-types.js';
+export { prepareMeshTangents } from './meshes/mesh-tangents.js';

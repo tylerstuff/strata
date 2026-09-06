@@ -13,7 +13,12 @@ import type { RasterGiProvider } from './gi-provider.js';
 
 const bufferUsage = { copyDestination: 0x8, index: 0x10, vertex: 0x20, uniform: 0x40 };
 const textureUsage = { copyDestination: 0x2, binding: 0x4, attachment: 0x10 };
-const shadowSize = 2048;
+export function validateShadowMapSize(value: unknown, maximum: number): 1024 | 2048 | 4096 {
+  const size = value === undefined ? 2048 : value;
+  if (size !== 1024 && size !== 2048 && size !== 4096) throw new StrataError('INVALID_OPTIONS', 'Shadow map size must be 1024, 2048 or 4096.');
+  if (size > maximum) throw new StrataError('UNSUPPORTED_LIMIT', `Shadow map size ${size} exceeds the device limit.`);
+  return size;
+}
 const materialSize = 64;
 const frameUniformBytes = 352;
 const presentationUniformBytes = 16;
@@ -93,18 +98,17 @@ export class RasterRenderer {
     private readonly halfExtent: number,
     private readonly geometry?: RasterGeometryProvider | RasterGeometryGroup,
     private readonly gi?: RasterGiProvider,
+    private readonly shadowSize = 2048,
   ) { this.lightMatrix = geometry?.lightMatrix ?? createLightMatrix(halfExtent); }
 
-  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider | RasterGeometryGroup, gi?: RasterGiProvider): Promise<RasterRenderer> {
+  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider | RasterGeometryGroup, gi?: RasterGiProvider, requestedShadowSize?: number): Promise<RasterRenderer> {
+    const shadowSize = validateShadowMapSize(requestedShadowSize, device.limits.maxTextureDimension2D);
     const providers = geometry ? ('providers' in geometry ? [...geometry.providers] : [geometry]) : [];
     if (geometry && (!providers.length || new Set(providers).size !== providers.length || providers.filter(provider => provider.selectionPass).length > 1
       || !Number.isFinite(geometry.halfExtent) || geometry.halfExtent <= 0 || geometry.lightMatrix.length !== 16 || !geometry.lightMatrix.every(Number.isFinite))) {
       throw new StrataError('INVALID_OPTIONS', 'A geometry group needs unique providers and at most one selection pass.');
     }
     const data = geometry ? undefined : buildProceduralScene(options);
-    if (device.limits.maxTextureDimension2D < shadowSize) {
-      throw new StrataError('UNSUPPORTED_LIMIT', `Raster shadows require ${shadowSize}-pixel textures.`);
-    }
     const buffers: GPUBuffer[] = [];
     const textures: GPUTexture[] = [];
     let temporal: TemporalResolve | undefined;
@@ -202,7 +206,7 @@ export class RasterRenderer {
         shadowView, geometryPipelines, presentationPipeline,
         bufferBytes: geometryBytes + frameUniformBytes + presentationUniformBytes,
         initialUploadBytes: geometryBytes + material.baseColor.byteLength + material.metallicRoughness.byteLength,
-      }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry, gi);
+      }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry, gi, shadowSize);
     } catch (cause) {
       temporal?.dispose();
       for (const resource of [...buffers, ...textures]) resource.destroy();
@@ -214,7 +218,7 @@ export class RasterRenderer {
   get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.gpuBufferBytes ?? 0), 0) + (this.gi?.gpuBufferBytes ?? 0); }
   get gpuTextureBytes(): number {
     if (this.disposed) return 0;
-    return shadowSize * shadowSize * 4 + materialSize * materialSize * 8
+    return this.shadowSize * this.shadowSize * 4 + materialSize * materialSize * 8
       + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes + (this.gi?.gpuTextureBytes ?? 0)
       + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.gpuTextureBytes ?? 0), 0);
   }

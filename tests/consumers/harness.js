@@ -1,5 +1,5 @@
 // Shared by independently installed, packed-package consumer fixtures.
-export function installHarness(createEngine, createMeshAsset) {
+export function installHarness(createEngine, createMeshAsset, prepareMeshTangents) {
   const canvas = document.querySelector('canvas');
   let engine;
   let animationFrame;
@@ -62,7 +62,8 @@ export function installHarness(createEngine, createMeshAsset) {
       return { metrics, telemetry: engine.getTelemetry() };
     },
     async exerciseMeshes() {
-      const vertices = new Float32Array([[-1,0,0],[1,0,0],[0,2,0]].flatMap(p => [...p,0,0,1,0,0,1,0,0,1,1,1,1,1]));
+      let vertices = new Float32Array([[-1,0,0],[1,0,0],[0,2,0]].flatMap(p => [...p,0,0,1,0,0,1,0,0,1,1,1,1,1]));
+      vertices=await prepareMeshTangents(vertices,new Uint32Array([0,1,2]));
       const material = { name: 'Generated matte', baseColorFactor: [.8,.15,.05,1], metallicFactor: 0, roughnessFactor: .7,
         emissiveFactor: [0,0,0], emissiveStrength: 1, normalScale: 1, occlusionStrength: 1, alphaMode: 'OPAQUE', alphaCutoff: .5, doubleSided: true };
       const asset = createMeshAsset({ meshes: [{ name: 'Generated triangle', vertices, indices: new Uint32Array([0,1,2]), material: 0 }], materials: [material] });
@@ -81,9 +82,11 @@ export function installHarness(createEngine, createMeshAsset) {
       const resized = engine.render({ temporal: false, imported: { transforms } });
       await engine.waitForIdle();
       const telemetry = engine.getTelemetry();
+      engine.resize(128,96);await engine.setScene({renderer:'imported',asset,shadowMapSize:4096});
+      const highShadow=engine.render({temporal:false,imported:{transforms:new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1])}});await engine.waitForIdle();
       await engine.setScene(null);
       const cleared = engine.getTelemetry();
-      return { receipt, first, moved, rejected, afterRejected, resized, telemetry, cleared };
+      return { receipt, first, moved, rejected, afterRejected, resized, telemetry, cleared, highShadow };
     },
     dispose() {
       cancelAnimationFrame(animationFrame);
