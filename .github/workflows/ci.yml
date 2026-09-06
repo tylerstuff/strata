@@ -80,11 +80,23 @@ jobs:
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
-      - name: Validate generated geometry coverage, streaming, and resource transitions
+      - name: Validate geometry initialization, coverage, streaming, and resource transitions
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:geometry
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
+      - name: Save generated geometry initialization evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: geometry-initialization-results
+          path: |
+            ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/report.json
+            ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/report.sha256
+            ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/preparation.json
+            ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/host-*.png
+            ~/Downloads/Strata-Benchmark-Results/*-geometry-initialization/eager-*.png
+          if-no-files-found: ignore
       - name: Validate world-space tracing, probe cache, and rendered GI
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:gi
         env:

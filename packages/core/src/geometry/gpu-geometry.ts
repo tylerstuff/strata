@@ -3,7 +3,7 @@ import type { TerrainLight, TerrainRenderOptions } from './terrain-rendering.js'
 import { StrataError } from '../errors.js';
 import type { GeometryManifest } from './format.js';
 import { GeometryPageCache } from './page-cache.js';
-import type { GeometryPageDemand } from './page-cache.js';
+import type { GeometryPageDemand, GeometryPageCacheOptions } from './page-cache.js';
 import type { GeometryTelemetry, VirtualSceneOptions } from './virtual-types.js';
 import { buildGeometryMetadata, createTerrainCamera, geometryProjectionScale } from './geometry-data.js';
 import { geometrySelectionShader, geometryVertexShader } from './gpu-geometry-shaders.js';
@@ -11,11 +11,78 @@ import { createLightMatrix } from '../rendering/raster-math.js';
 import type { CameraFrame } from '../rendering/raster-math.js';
 import type { RasterControls } from '../rendering/raster-types.js';
 import type { RasterGeometryProvider } from '../rendering/geometry-provider.js';
+import { GeometryChangeSignal } from './transfer-budget.js';
+import type { GeometryInitialization, GeometryInitializationStatus, GeometryResourceLease, GeometryTransferBudget, GeometryUploadFrame } from './transfer-budget.js';
 
 const usage = { mapRead: 0x1, copySource: 0x4, copyDestination: 0x8, uniform: 0x40, storage: 0x80, indirect: 0x100 };
 const uniformBytes = 160;
 const argumentBytes = 64;
 const feedbackCapacity = 3;
+
+/** Tracks original asynchronous lifetimes independently of mutable runtime slots.
+ * Ending ownership does not cancel work, and transferred ownership has a new waiter. */
+class OwnedAsyncSettlement {
+  private ended = false;
+  private readonly pending = new Set<Promise<unknown>>();
+  private resolve!: () => void;
+  readonly promise = new Promise<void>(resolve => { this.resolve = resolve; });
+
+  track(operation: Promise<unknown>): void {
+    if (this.pending.has(operation)) return;
+    this.pending.add(operation);
+    const finished = (): void => { this.pending.delete(operation); this.check(); };
+    void operation.then(finished, finished);
+  }
+  end(): void { this.ended = true; this.check(); }
+  private check(): void { if (this.ended && this.pending.size === 0) this.resolve(); }
+}
+
+/** Scalar preflight only. The caller owns the already parsed manifest and its JS objects.
+ * The work-list reservation uses fullTriangles, a conservative bound on the packer's
+ * min(fullTriangles, capacityPages * maxPageTriangles); it is not physical GPU usage. */
+function initializationPlan(manifest: GeometryManifest) {
+  const bounded = (count: number, maximum: number): void => {
+    if (!Number.isSafeInteger(count) || count < 1 || count > maximum) {
+      throw new StrataError('UNSUPPORTED_LIMIT', 'Host geometry initialization exceeds the cooked metadata count limits.');
+    }
+  };
+  bounded(manifest.pages.length, 8192); bounded(manifest.tiles.length, 256); bounded(manifest.clusters.length, 262144);
+  let lodCount = 0; let pageRefs = 0; let clusterRefs = 0; let fullTriangles = 0;
+  for (const tile of manifest.tiles) {
+    bounded(tile.lods.length, 8); lodCount += tile.lods.length;
+    let tileTriangles = 0;
+    for (const lod of tile.lods) {
+      bounded(lod.pageIds.length, manifest.pages.length); bounded(lod.clusterIds.length, manifest.clusters.length);
+      pageRefs += lod.pageIds.length; clusterRefs += lod.clusterIds.length;
+      if (clusterRefs > manifest.clusters.length || pageRefs > manifest.clusters.length) {
+        throw new StrataError('UNSUPPORTED_LIMIT', 'Host geometry initialization requires the parsed unique cluster ownership contract.');
+      }
+      let triangles = 0;
+      for (const id of lod.clusterIds) {
+        const cluster = manifest.clusters[id];
+        if (!Number.isSafeInteger(id) || !cluster || !Number.isSafeInteger(cluster.triangleCount)
+          || cluster.triangleCount < 1 || cluster.triangleCount > 128) {
+          throw new StrataError('INVALID_OPTIONS', 'Host geometry initialization requires valid parsed cluster references.');
+        }
+        triangles += cluster.triangleCount;
+      }
+      tileTriangles = Math.max(tileTriangles, triangles);
+    }
+    fullTriangles += tileTriangles;
+  }
+  const metadataBytes = (16 + manifest.tiles.length * 12 + lodCount * 8 + manifest.clusters.length * 16 + pageRefs + clusterRefs) * 4;
+  const residencyBytes = manifest.pages.length * 4;
+  const selectionBytes = manifest.tiles.length * 32;
+  return {
+    metadataBytes, residencyBytes, selectionBytes, fullTriangles,
+    // Metadata, table, selections, two triangle lists, indirect/uniform, three feedback slots.
+    gpuBufferBytes: metadataBytes + residencyBytes + selectionBytes * 4 + fullTriangles * 8 + 416,
+    // Permanent typed storage includes the provider's light matrix.
+    residentBytes: residencyBytes + uniformBytes + argumentBytes + 64,
+    // The packer has pageTriangles scratch; createLightMatrix has two 64-byte operands.
+    transientBytes: metadataBytes + selectionBytes + residencyBytes + 128,
+  };
+}
 
 interface FeedbackSlot { readonly buffer: GPUBuffer; busy: boolean; frameId: number; pending: Promise<void> | null }
 interface Resources {
@@ -52,6 +119,7 @@ export class GpuGeometry implements RasterGeometryProvider {
   private readonly argumentReset = new Uint32Array(argumentBytes / 4);
   private readonly uniformData = new ArrayBuffer(uniformBytes);
   private disposed = false;
+  private readonly disposalSettlement = new OwnedAsyncSettlement();
   private residencyDirty = false;
   private droppedFeedback = 0;
   private latest: GeometryTelemetry = {
@@ -73,6 +141,8 @@ export class GpuGeometry implements RasterGeometryProvider {
     feedback: FeedbackSlot[],
     residencyWords: Uint32Array<ArrayBuffer>,
     private readonly rendering: TerrainRendering,
+    private readonly initializationLease?: GeometryResourceLease,
+    initializedLightMatrix?: Float32Array<ArrayBuffer>,
   ) {
     this.feedback = feedback; this.residencyWords = residencyWords;
     this.shaderSource = geometryVertexShader + rendering.shader(5);
@@ -80,7 +150,7 @@ export class GpuGeometry implements RasterGeometryProvider {
     if (!this.usesMaterialTextures) this.fragmentEntryPoint = 'terrainLambertFragment';
     const bounds = transformGeometryBounds(manifest.bounds, rendering.transform);
     this.halfExtent = Math.max(Math.abs(bounds.min[0]), Math.abs(bounds.max[0]), Math.abs(bounds.min[2]), Math.abs(bounds.max[2]));
-    this.lightMatrix = createLightMatrix(this.halfExtent);
+    this.lightMatrix = initializedLightMatrix ?? createLightMatrix(this.halfExtent);
     this.argumentReset[1] = 1; this.argumentReset[5] = 1;
     // The second half of the reference list is used by the shadow draw.
     this.argumentReset[6] = triangleCapacity * 3;
@@ -148,10 +218,231 @@ export class GpuGeometry implements RasterGeometryProvider {
     }
   }
 
+  /** Internal host-driven INITIALIZATION only. Normal prepare() is unchanged and is
+   * not covered by this shared budget. The optional terrain rendering path is excluded. */
+  static begin(device: GPUDevice, manifest: GeometryManifest, manifestUrl: URL, options: VirtualSceneOptions & GeometryPageCacheOptions,
+    budget: GeometryTransferBudget): GeometryInitialization<GpuGeometry> {
+    const allowedOptions = ['renderer', 'manifestUrl', 'geometryMode', 'residencyPolicy', 'poolBytes', 'pixelError',
+      'pageLoadDelayMs', 'maxConcurrentRequests', 'uploadBudgetBytes', 'cameraMode', 'signal', 'fetch', 'now',
+      'maxCompletedBytes', 'maxRetries', 'retryDelayMs', 'requestTimeoutMs'];
+    if (arguments.length !== 5 || !options || typeof options !== 'object' || options.renderer !== 'virtual'
+      || Object.keys(options).some(key => !allowedOptions.includes(key))) {
+      throw new StrataError('INVALID_OPTIONS', 'Host geometry initialization accepts only default terrain rendering and VirtualSceneOptions.');
+    }
+    options = { ...options };
+    if (options.geometryMode === 'mesh-lod') throw new StrataError('INVALID_OPTIONS', 'mesh-lod uses the conventional geometry provider.');
+    const mode = options.geometryMode ?? 'streamed';
+    const pixelError = options.pixelError ?? 2;
+    if (!Number.isFinite(pixelError) || pixelError <= 0 || pixelError > 1000) {
+      throw new StrataError('INVALID_OPTIONS', 'pixelError must be positive and at most 1000 pixels.');
+    }
+    if (options.cameraMode !== undefined && !['tour', 'coverage'].includes(options.cameraMode)) {
+      throw new StrataError('INVALID_OPTIONS', 'Unknown terrain camera mode.');
+    }
+    const plan = initializationPlan(manifest);
+    const cachePlan = GeometryPageCache.estimate(device, manifest, options);
+    const changes = new GeometryChangeSignal();
+    let status: GeometryInitializationStatus = 'pending'; let error: unknown;
+    let ownLease: GeometryResourceLease | undefined; let transientLease: GeometryResourceLease | undefined;
+    let cacheHandle: GeometryInitialization<GeometryPageCache> | undefined;
+    let cache: GeometryPageCache | undefined; let result: GpuGeometry | undefined;
+    let rendering: TerrainRendering | undefined; let lightMatrix: Float32Array<ArrayBuffer> | undefined;
+    let metadata: ReturnType<typeof buildGeometryMetadata> | undefined;
+    let initialSelections: Uint32Array<ArrayBuffer> | undefined;
+    let residencyWords: Uint32Array<ArrayBuffer> | undefined;
+    let pipelines: readonly [GPUComputePipeline, GPUComputePipeline] | undefined;
+    let pipelinesPending = false;
+    let resources: Resources | undefined; let feedback: FeedbackSlot[] = [];
+    const buffers: GPUBuffer[] = [];
+    let allocatedBytes = 0; let metadataOffset = 0; let selectionOffset = 0; let residencyOffset = 0;
+    let triangleCapacity = 0;
+    const disposalSettlement = new OwnedAsyncSettlement();
+    const unsubscribe = budget.subscribe(() => { if (status === 'pending') changes.notify(); });
+    const detach = (): void => { unsubscribe(); options.signal?.removeEventListener('abort', onAbort); };
+    const cleanup = (): void => {
+      detach();
+      if (result) {
+        result.dispose(); disposalSettlement.track(result.whenDisposedAndSettled()); result = undefined;
+      }
+      else {
+        if (cache) { cache.dispose(); disposalSettlement.track(cache.whenDisposedAndSettled()); }
+        rendering?.dispose();
+        for (const buffer of buffers) buffer.destroy();
+      }
+      // The cache handle retains canceled request/staging ownership until settlement.
+      if (cacheHandle) { cacheHandle.dispose(); disposalSettlement.track(cacheHandle.whenDisposedAndSettled()); }
+      // Pipeline compilation has no cancellation API. Keep this initializer's
+      // reservations/storage until every started compilation operation settles.
+      if (!pipelinesPending) {
+        transientLease?.release(); ownLease?.release(); transientLease = undefined; ownLease = undefined;
+        metadata = undefined; initialSelections = undefined; residencyWords = undefined; lightMatrix = undefined;
+      }
+      rendering = undefined; cache = undefined; resources = undefined; pipelines = undefined; feedback = [];
+      buffers.length = 0;
+      disposalSettlement.end();
+    };
+    const fail = (cause: unknown): void => {
+      if (status !== 'pending' && status !== 'ready') return;
+      status = 'failed'; error = cause; cleanup(); changes.notify();
+    };
+    const onAbort = (): void => fail(options.signal?.reason ?? new DOMException('Scene creation aborted.', 'AbortError'));
+    const checkAbort = (): void => { if (options.signal?.aborted) throw options.signal.reason ?? new DOMException('Scene creation aborted.', 'AbortError'); };
+    const watchCache = async (handle: GeometryInitialization<GeometryPageCache>): Promise<void> => {
+      while (status === 'pending' && handle.status === 'pending') {
+        const revision = handle.revision;
+        await handle.waitForChange(revision);
+        if (status !== 'pending') return;
+        if (options.signal?.aborted) { onAbort(); return; }
+        if ((handle.status as GeometryInitializationStatus) === 'failed') { fail(handle.error); return; }
+        changes.notify();
+      }
+    };
+    const allocate = (label: string, size: number, flags: GPUBufferUsageFlags): GPUBuffer => {
+      if (size > device.limits.maxBufferSize || ((flags & usage.storage) !== 0 && size > device.limits.maxStorageBufferBindingSize)) {
+        throw new StrataError('UNSUPPORTED_LIMIT', `${label} exceeds the GPU buffer/storage-binding limit.`);
+      }
+      if (allocatedBytes + size > plan.gpuBufferBytes) throw new StrataError('RENDER_FAILED', 'Geometry allocation exceeded its admitted plan.');
+      const value = device.createBuffer({ label, size, usage: flags }); buffers.push(value); allocatedBytes += size; return value;
+    };
+    const admit = (): boolean => {
+      const leases = budget.tryReserveMany([
+        { residentBytes: plan.residentBytes, gpuBufferBytes: plan.gpuBufferBytes },
+        { residentBytes: cachePlan.residentBytes, gpuBufferBytes: cachePlan.gpuBufferBytes },
+        { transientBytes: plan.transientBytes },
+      ]);
+      if (!leases) return false;
+      ownLease = leases[0]!; transientLease = leases[2]!;
+      try { cacheHandle = GeometryPageCache.begin(device, manifest, manifestUrl, options, budget, leases[1]!); }
+      catch (cause) { leases[1]!.release(); throw cause; }
+      disposalSettlement.track(watchCache(cacheHandle).catch(fail));
+      checkAbort();
+      rendering = new TerrainRendering(device);
+      metadata = buildGeometryMetadata(manifest, cachePlan.capacityPages);
+      if (metadata.words.byteLength !== plan.metadataBytes || metadata.triangleCapacity > plan.fullTriangles) {
+        throw new StrataError('RENDER_FAILED', 'Packed geometry disagrees with its scalar admission plan.');
+      }
+      triangleCapacity = metadata.triangleCapacity;
+      initialSelections = new Uint32Array(manifest.tiles.length * 8).fill(0xffffffff);
+      residencyWords = new Uint32Array(manifest.pages.length);
+      const bounds = manifest.bounds;
+      lightMatrix = createLightMatrix(Math.max(Math.abs(bounds.min[0]), Math.abs(bounds.max[0]), Math.abs(bounds.min[2]), Math.abs(bounds.max[2])));
+      const module = device.createShaderModule({ label: 'Strata virtual geometry selection', code: geometrySelectionShader });
+      const pending: Promise<GPUComputePipeline>[] = [];
+      const settlePipelines = (): void => {
+        if (!pending.length) return;
+        pipelinesPending = true;
+        disposalSettlement.track(Promise.allSettled(pending).then(values => {
+          pipelinesPending = false;
+          if (status !== 'pending') { cleanup(); changes.notify(); return; }
+          if (options.signal?.aborted) { onAbort(); return; }
+          const rejected = values.find(value => value.status === 'rejected');
+          if (rejected?.status === 'rejected') { fail(rejected.reason); return; }
+          pipelines = values.map(value => (value as PromiseFulfilledResult<GPUComputePipeline>).value) as unknown as readonly [GPUComputePipeline, GPUComputePipeline];
+          changes.notify();
+        }));
+      };
+      try {
+        const observe = (promise: Promise<GPUComputePipeline>): Promise<GPUComputePipeline> => promise.catch(cause => { fail(cause); throw cause; });
+        pending.push(observe(device.createComputePipelineAsync({ label: 'Strata projected-error tile selection', layout: 'auto', compute: { module, entryPoint: 'selectTiles' } })));
+        pending.push(observe(device.createComputePipelineAsync({ label: 'Strata cluster triangle compaction', layout: 'auto', compute: { module, entryPoint: 'compactClusters' } })));
+      } catch (cause) { settlePipelines(); throw cause; }
+      settlePipelines();
+      changes.notify(); return true;
+    };
+    const createResources = (): void => {
+      const [selectPipeline, compactPipeline] = pipelines!;
+      const metaBuffer = allocate('Strata cooked geometry metadata', plan.metadataBytes, usage.storage | usage.copyDestination);
+      const residency = allocate('Strata page residency table', plan.residencyBytes, usage.storage | usage.copyDestination);
+      const selections = allocate('Strata current tile LOD selections', plan.selectionBytes, usage.storage | usage.copyDestination | usage.copySource);
+      const triangles = allocate('Strata camera and shadow triangle references', triangleCapacity * 8, usage.storage);
+      const argumentsBuffer = allocate('Strata indirect geometry arguments and counters', argumentBytes, usage.storage | usage.indirect | usage.copySource | usage.copyDestination);
+      const uniform = allocate('Strata geometry selection camera', uniformBytes, usage.uniform | usage.copyDestination);
+      const entry = (binding: number, value: GPUBuffer): GPUBindGroupEntry => ({ binding, resource: { buffer: value } });
+      const selectBindings = device.createBindGroup({ label: 'Strata tile selection inputs', layout: selectPipeline.getBindGroupLayout(0), entries: [
+        entry(0, metaBuffer), entry(1, residency), entry(2, selections), entry(4, argumentsBuffer), entry(5, uniform),
+      ] });
+      const compactBindings = device.createBindGroup({ label: 'Strata cluster compaction inputs', layout: compactPipeline.getBindGroupLayout(0), entries: [
+        entry(0, metaBuffer), entry(2, selections), entry(3, triangles), entry(4, argumentsBuffer), entry(5, uniform),
+      ] });
+      feedback = Array.from({ length: feedbackCapacity }, (_, index) => ({
+        buffer: allocate(`Strata geometry feedback ${index}`, argumentBytes + plan.selectionBytes, usage.mapRead | usage.copyDestination),
+        busy: false, frameId: 0, pending: null,
+      }));
+      resources = { buffers: [...buffers], metadata: metaBuffer, residency, selections, triangles, arguments: argumentsBuffer, uniform,
+        selectPipeline, compactPipeline, selectBindings, compactBindings, bytes: allocatedBytes,
+        uploadedBytes: plan.metadataBytes + plan.residencyBytes + plan.selectionBytes };
+    };
+    const write = (frame: GeometryUploadFrame, buffer: GPUBuffer, bytes: Uint8Array<ArrayBuffer>, offset: number): number => {
+      const size = Math.min(bytes.byteLength - offset, Math.floor(frame.remainingBytes / 4) * 4);
+      if (!size) return offset;
+      return frame.write(device, buffer, offset, bytes.subarray(offset, offset + size)) ? offset + size : offset;
+    };
+    const handle: GeometryInitialization<GpuGeometry> = Object.freeze({
+      get status() { return status; }, get error() { return error; }, get revision() { return changes.revision; },
+      advance(frame: GeometryUploadFrame) {
+        const before = frame.writtenBytes;
+        if (status !== 'pending') return { status, uploadBytes: 0 };
+        try {
+          if (frame.budget !== budget) throw new StrataError('INVALID_OPTIONS', 'Geometry initialization requires a frame from its own budget.');
+          frame.assertCurrent();
+          checkAbort();
+          if (!ownLease && !admit()) return { status, uploadBytes: 0 };
+          if (!pipelines) return { status, uploadBytes: 0 };
+          if (!resources) createResources();
+          if (metadata) {
+            metadataOffset = write(frame, resources!.metadata, new Uint8Array(metadata.words.buffer), metadataOffset);
+            if (metadataOffset !== plan.metadataBytes) return { status, uploadBytes: frame.writtenBytes - before };
+            selectionOffset = write(frame, resources!.selections, new Uint8Array(initialSelections!.buffer), selectionOffset);
+            if (selectionOffset !== plan.selectionBytes) return { status, uploadBytes: frame.writtenBytes - before };
+            metadata = undefined; initialSelections = undefined; transientLease!.release(); transientLease = undefined;
+            changes.notify();
+          }
+          if (!cache) {
+            cacheHandle!.advance(frame);
+            if (cacheHandle!.status === 'failed') throw cacheHandle!.error;
+            if (cacheHandle!.status !== 'ready') return { status, uploadBytes: frame.writtenBytes - before };
+            cache = cacheHandle!.takeReady();
+            for (const page of manifest.pages) residencyWords![page.id] = cache.getSlot(page.id) >>> 0;
+          }
+          residencyOffset = write(frame, resources!.residency, new Uint8Array(residencyWords!.buffer), residencyOffset);
+          if (residencyOffset !== plan.residencyBytes) return { status, uploadBytes: frame.writtenBytes - before };
+          checkAbort();
+          result = new GpuGeometry(device, manifest, cache, resources!, triangleCapacity, pixelError, mode,
+            options.cameraMode ?? 'tour', options.pageLoadDelayMs ?? 0, feedback, residencyWords!, rendering!, ownLease, lightMatrix);
+          status = 'ready'; changes.notify();
+        } catch (cause) { fail(cause); }
+        return { status, uploadBytes: frame.writtenBytes - before };
+      },
+      waitForChange: (revision: number) => status !== 'pending' ? Promise.resolve() : changes.wait(revision),
+      whenDisposedAndSettled: () => disposalSettlement.promise,
+      takeReady() {
+        if (status !== 'ready') throw new StrataError('INVALID_OPTIONS', 'Geometry initialization is not ready or was already taken.');
+        const value = result!; result = undefined; status = 'taken'; detach();
+        // Clear handle references without touching the resources now owned by the provider.
+        ownLease = undefined; rendering = undefined; cache = undefined; cacheHandle = undefined; resources = undefined;
+        residencyWords = undefined; lightMatrix = undefined; pipelines = undefined; feedback = [];
+        buffers.length = 0;
+        // This handle has relinquished ownership. Provider disposal has its own
+        // settlement promise and must be awaited by the new owner on retirement.
+        disposalSettlement.end();
+        changes.notify(); return value;
+      },
+      dispose() {
+        if (status === 'taken' || status === 'disposed') return;
+        status = 'disposed'; cleanup(); changes.notify();
+      },
+    });
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+    return handle;
+  }
+
   get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bytes + this.cache.gpuBufferBytes + this.rendering.gpuBufferBytes; }
   get initialUploadBytes(): number { return this.resources.uploadedBytes + this.cache.initialUploadBytes + this.rendering.initialUploadBytes; }
   get geometryTelemetry(): GeometryTelemetry {
     return { ...this.cache.telemetry, ...this.latest, geometryMode: this.mode,
+      ...(this.initializationLease ? { initializationProviderGpuReservedBytes: this.initializationLease.amounts.gpuBufferBytes,
+        initializationProviderGpuRequestedBytes: this.resources.bytes } : {}),
       cameraPath: this.cameraMode === 'coverage' ? 'terrain-coverage-v1' : 'terrain-tour-v1',
       uniqueCompiledBytes: this.manifest.pages.length * this.manifest.pageBytes,
       sourceSeed: this.manifest.source.seed, sourceTriangleCount: this.manifest.source.triangleCount,
@@ -251,7 +542,8 @@ export class GpuGeometry implements RasterGeometryProvider {
         slot.busy = false; slot.pending = null;
       }
     };
-    const pending = complete(); if (slot.busy) slot.pending = pending;
+    const pending = complete(); this.disposalSettlement.track(pending);
+    if (slot.busy) slot.pending = pending;
   }
 
   cancelFrame(): void {
@@ -270,11 +562,18 @@ export class GpuGeometry implements RasterGeometryProvider {
     } finally { clearTimeout(timer); }
   }
 
+  /** Resolves after actual disposal and all cache/feedback operations settle.
+   * Unlike flushFeedback(), disposal never bypasses this lifetime barrier. */
+  whenDisposedAndSettled(): Promise<void> { return this.disposalSettlement.promise; }
+
   dispose(): void {
     if (this.disposed) return;
     this.cancelFrame(); this.disposed = true; this.cache.dispose(); this.rendering.dispose();
+    this.disposalSettlement.track(this.cache.whenDisposedAndSettled());
     for (const slot of this.feedback) { if (slot.busy) this.droppedFeedback++; slot.busy = false; }
     for (const buffer of this.resources.buffers) buffer.destroy();
+    this.initializationLease?.release();
     this.rasterBindings = undefined; this.shadowBindings = undefined;
+    this.disposalSettlement.end();
   }
 }

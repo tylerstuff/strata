@@ -131,3 +131,13 @@ outside the repository.
 The new stdio connection passed its CPU lifecycle, transport and packed-consumer
 checks. Independent frozen review and browser validation remain pending. The
 earlier preview API/one-shot CLI result does not establish its transport behavior.
+
+The separate `strata-project` binary and `@strata-engine/preview/project` Node
+export initialize, inspect, validate and build saved procedural projects. Build
+pins an inspected input revision and publishes a new static site with a complete
+Core distribution and a completion receipt. The browser app imports Core alone;
+it does not install authoring or preview code. Consumers receive precompiled WASM
+and need no Rust tools. Imported assets and cooking remain unsupported by this
+profile. See the [saved-project guide](https://github.com/tylerstuff/strata/blob/main/docs/project.md)
+for commands, output ownership, cancellation and validation limits. Generated-app
+browser/GPU acceptance remains pending.

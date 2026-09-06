@@ -301,8 +301,17 @@ GPU errors stop the session; reload to recreate its engine.
 
 CPU catalog, timing and lifecycle checks use generated data and mocked engine
 operations; they do not establish rendering correctness. Current-pose framing
-has CPU bounds and lifecycle coverage; its actual browser behavior remains
-unverified. The separate
+also passed a bounded browser check at frozen `b636c31` on Apple M2 / Metal 3,
+Chrome 152.0.7977.82. The [run2 receipt and independent offline audit](https://github.com/tylerstuff/strata/issues/33#issuecomment-5552138620)
+record fixed-pose before/after captures, preserved viewing direction and noncamera settings,
+resumed playback, cancellation before measurement, model replacement and cleanup,
+with unchanged source/build/assets. CPU tests cover interruption during longer
+scans. Run1 remains failed on an unclassified texture `net::ERR_ABORTED`; run2
+did not reproduce it and does not relabel that failure. This is one-shot framing
+evidence; it does not establish general clarity or lighting quality, continuous
+camera following, or compositor presentation-frame identity.
+
+The separate
 `tests/browser/gallery-assertions.mjs` helper requires actual Strata WebGPU
 submissions, two generated lit models and a visibly moving animation. It checks
 model/lighting/clip pixel changes, Core-reported source and animation, fixed-size
@@ -312,11 +321,14 @@ the downloaded collection. Actual-model captures require a separately scheduled
 local hardware run, with results kept external.
 
 Core's [lighting and estimator checks](imported-lighting.md#validation-scope) and
-the earlier native-resolution/DPR gallery proof cover separate parts of this
-system. They do not establish the combined browser behavior of the gallery's
-material, environment and texture controls. Track validation of the exact gallery
-revision in [issue #33](https://github.com/tylerstuff/strata/issues/33); no
-performance or whole-VRAM guarantee follows from those functional checks.
+the native-resolution/DPR gallery proof cover separate parts of this system.
+The later [combined controls receipt at frozen `43a4946`](https://github.com/tylerstuff/strata/issues/33#issuecomment-5551105110)
+records authored/relit materials, environment and texture controls on Apple M2 /
+Metal 3 with Chrome 152.0.7977.82. These dated receipts retain their exact source
+and scope; they are not a fresh seven-model validation of current main.
+[Further gallery polish and promotion are paused](https://github.com/tylerstuff/strata/issues/33#issuecomment-5552382037).
+The useful inspection workflow does not establish general visual quality,
+performance, whole-VRAM use or superiority over another renderer.
 
 Progressive preview acceptance requires Core's generated/public-browser checks,
 combined gallery validation, and an actual-house witness with a fixed interior camera, verified source
