@@ -4,6 +4,8 @@ import type { RasterControls } from './raster-types.js';
 /** Providers draw into one shared camera, shadow map and MRT set. At most one owns selection timestamps. */
 export interface RasterGeometryGroup {
   readonly providers: readonly RasterGeometryProvider[];
+  drawBackground?(pass: GPURenderPassEncoder, camera: CameraFrame, width: number, height: number,
+    jitter: readonly [number, number], controls: RasterControls): { drawCalls: number; uploadBytes: number };
   readonly halfExtent: number;
   readonly lightMatrix: Float32Array<ArrayBuffer>;
   /** Linear HDR clear color; the existing raster fixture keeps its default. */

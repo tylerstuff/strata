@@ -320,12 +320,14 @@ export class RasterRenderer {
       { view: targets.views.motion, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
     ], depthStencilAttachment: { view: targets.views.depth, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
     ...(timestamps.raster ? { timestampWrites: timestamps.raster } : {}) });
+    const background = this.geometry && 'drawBackground' in this.geometry
+      ? this.geometry.drawBackground?.(raster, camera, width, height, jitter, settings) : undefined;
     drawGeometry(raster, 'raster');
     let resolved = targets.views.hdr;
-    let drawCalls = prepared.reduce((sum, value) => sum + (value?.drawCalls ?? 2), 0) + 1;
+    let drawCalls = (background?.drawCalls ?? 0) + prepared.reduce((sum, value) => sum + (value?.drawCalls ?? 2), 0) + 1;
     let dispatchCalls = prepared.reduce((sum, value) => sum + (value?.dispatchCalls ?? 0), 0) + (giPrepared?.dispatchCalls ?? 0);
-    let uploadBytes = frameUniformBytes + presentationUniformBytes + prepared.reduce((sum, value) => sum + (value?.uploadBytes ?? 0), 0) + (giPrepared?.uploadBytes ?? 0);
-    let triangles = prepared.reduce((sum, value) => sum + (value?.triangles ?? this.instanceCount * 24), 0) + 1;
+    let uploadBytes = (background?.uploadBytes ?? 0) + frameUniformBytes + presentationUniformBytes + prepared.reduce((sum, value) => sum + (value?.uploadBytes ?? 0), 0) + (giPrepared?.uploadBytes ?? 0);
+    let triangles = (background?.drawCalls ?? 0) + prepared.reduce((sum, value) => sum + (value?.triangles ?? this.instanceCount * 24), 0) + 1;
     let skippedGpuPasses: readonly RasterPassName[] | undefined;
     if (this.gi?.active) {
       const composed = this.gi.compose(encoder, targets.views, camera, width, height, timeSeconds, settings, timestamps);

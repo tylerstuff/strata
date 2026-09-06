@@ -1,3 +1,5 @@
+import { createImportedSky, importedSkyUniformBytes } from './imported-sky.js';
+import type { RasterControls } from '../rendering/raster-types.js';
 import { blockBytes } from './imported-compression.js';
 import { snapshotMeshTransforms } from '../meshes/mesh-transforms.js';
 import { StrataError } from '../errors.js';
@@ -26,7 +28,7 @@ export const importedDefaults = {
   lighting: { directionToLight: [0.35, 0.8, 0.4] as ImportedVec3, color: [1, .95, .875] as ImportedVec3, intensity: 4, ambient: [.06, .06, .06] as ImportedVec3 },
   presentation: 'model-only' as const, background: [.02, .035, .055] as ImportedVec3,
 };
-type Settings = { camera: NonNullable<ImportedControls['camera']>; lighting: NonNullable<ImportedControls['lighting']>; presentation: 'model-only' | 'ground'; background: ImportedVec3; shading?: 'authored' | 'relit' };
+type Settings = { skybox?: boolean; camera: NonNullable<ImportedControls['camera']>; lighting: NonNullable<ImportedControls['lighting']>; presentation: 'model-only' | 'ground'; background: ImportedVec3; shading?: 'authored' | 'relit' };
 function fail(message: string): never { throw new StrataError('INVALID_OPTIONS', `Invalid imported scene: ${message}`); }
 function checkSignal(signal?: AbortSignal): void { if (signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Imported scene creation was cancelled.'); }
 function vector(value: unknown, label: string, maximum: number, minimum = -maximum): asserts value is ImportedVec3 {
@@ -55,7 +57,9 @@ function snapshot(controls: ImportedControls, current: Settings): Settings {
   const shading = controls.shading === undefined ? current.shading ?? 'authored' : controls.shading;
   if (shading !== 'authored' && shading !== 'relit') fail('shading must be authored or relit.');
   const environment = snapshotEnvironment(lighting.environment);
-  return { camera: { eye: [...camera.eye], target: [...camera.target], verticalFov: camera.verticalFov },
+  const skybox = controls.skybox === undefined ? current.skybox ?? false : controls.skybox;
+  if (typeof skybox !== 'boolean' || (skybox && !environment)) fail('skybox must be boolean and needs a lighting environment.');
+  return { skybox, camera: { eye: [...camera.eye], target: [...camera.target], verticalFov: camera.verticalFov },
     lighting: { directionToLight: controls.lighting === undefined ? [...lighting.directionToLight] : normalize(lighting.directionToLight), color: [...lighting.color], intensity: lighting.intensity, ambient: [...lighting.ambient], environment }, presentation, background: [...background], shading };
 }
 
@@ -133,7 +137,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   private constructor(private readonly device: GPUDevice, asset: ImportedAsset, private readonly owned: Owned,
     private readonly materials: readonly Material[], private readonly meshes: readonly Mesh[], private readonly lightBuffer: GPUBuffer,
     readonly textureRecords: ImportedTelemetry['textures'], private readonly evaluator: ReturnType<typeof createImportedPoseEvaluator>, private readonly palettes: readonly Palette[],
-    private readonly environment: ReturnType<typeof createEnvironmentResources>) {
+    private readonly environment: ReturnType<typeof createEnvironmentResources>, private readonly sky: Awaited<ReturnType<typeof createImportedSky>>) {
     this.acceptsTransforms = !!asset.rig?.nodes.length && asset.rig.nodes.length <= 4096 && asset.rig.nodes.every(node => node.parent === null) && asset.rig.skins.length === 0 && asset.primitives.every(p => p.deformation && p.deformation.skin === undefined);
     const reflectedRoots = Array<boolean>(asset.rig?.nodes.length ?? 0).fill(true);
     for (const primitive of asset.primitives) {
@@ -315,8 +319,15 @@ export class ImportedGeometry implements RasterGeometryGroup {
       owned.textureBytes += environmentTextureBytes; owned.bufferBytes += environmentUniformBytes;
       owned.initialUploadBytes += environmentTextureBytes + environmentUniformBytes;
       checkSignal(signal);
-      return new ImportedGeometry(device, asset, owned, materials, meshes, lightBuffer, textureRecords, evaluator, palettes, environment);
+      const sky = await createImportedSky(device); owned.buffers.push(sky.uniform); owned.bufferBytes += importedSkyUniformBytes;
+      checkSignal(signal);
+      return new ImportedGeometry(device, asset, owned, materials, meshes, lightBuffer, textureRecords, evaluator, palettes, environment, sky);
     } catch (cause) { for (const resource of [...owned.buffers, ...owned.textures]) resource.destroy(); throw cause; }
+  }
+  drawBackground(pass: GPURenderPassEncoder, camera: CameraFrame, width: number, height: number, jitter: readonly [number, number], controls: RasterControls) {
+    if (!this.settings.skybox || !['final', 'direct'].includes(controls.debugView ?? 'final')) return { drawCalls: 0, uploadBytes: 0 };
+    this.sky.draw(pass, camera, width, height, jitter, snapshotEnvironment(this.settings.lighting.environment)!);
+    return { drawCalls: 1, uploadBytes: importedSkyUniformBytes };
   }
   get background(): ImportedVec3 { return this.settings.background; }
   get lightMatrix(): Float32Array<ArrayBuffer> { return this.light; }
@@ -362,7 +373,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     this.pendingAnimation = { clipId: pose.clipId, timeSeconds: pose.timeSeconds, loop: pose.loop }; this.animation = { ...animation };
     const changedLighting = JSON.stringify(next.lighting) !== JSON.stringify(this.settings.lighting);
     const changedShading = next.shading !== this.settings.shading;
-    const cut = changedLighting || changedShading || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
+    const cut = changedLighting || changedShading || next.skybox !== this.settings.skybox || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
     this.environmentDirty ||= changedShading || JSON.stringify(next.lighting.environment) !== JSON.stringify(this.settings.lighting.environment);
     this.settings = next; this.lightDirty ||= changedLighting;
     this.visibleBounds = fit.bounds; this.light = fit.matrix; return cut || animationCut;

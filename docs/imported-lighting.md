@@ -222,3 +222,11 @@ authored unlit invariance, explicit matte relighting, unchanged source PBR and
 metal illumination without a direct light. These are functional controls, not
 performance evidence. The launcher saves results outside the repository; any
 real-model visual captures must follow the external asset policy as well.
+
+## Visible environment skybox
+
+`engine.render({ imported: { skybox: true, lighting: { ...lighting, environment: { preset: 'sky', intensity: .65 } } } })` draws the incident environment behind imported geometry. It requires an active `sky` or `studio` environment and defaults off. The display uses the same analytic radiance source as the baked illumination and tracer, including environment intensity and inverse-yaw rotation; it does not apply diffuse convolution to the visible background. Camera rotation and FOV affect the view, while translation does not. This is a procedural environment, not an HDRI loader, cloud/weather simulation or atmospheric scattering model.
+
+The background shares linear HDR exposure/tone mapping with the model. It writes no depth and zero normal/material/motion guides, so it cannot occlude geometry or create false surfaces for tracing. Sky and studio are smooth analytic backgrounds: they bypass temporal history and compensate projection jitter before final presentation. Raw diagnostics retain the ordinary clear background. Toggling the skybox resets history. One extra raster draw and 80 uploaded uniform bytes are counted for each enabled final/direct frame; the imported owner retains an 80-byte uniform and its pipeline even when disabled, and disposes the buffer with the scene. Enabling the skybox does not add scene occlusion or bounced light.
+
+`npm run test:imported-sky` compares public-package pixels with the independent CPU environment source, including sky/studio, rotation, camera translation, temporal jitter, foreground preservation, raw diagnostics and disposal. The Blender Cycles comparison is tracked in issue #57; models and rendered comparison images remain external.

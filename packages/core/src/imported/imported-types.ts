@@ -170,6 +170,8 @@ export interface ImportedControls {
     readonly environment?: ImportedEnvironment | null;
   };
   readonly presentation?: 'model-only' | 'ground';
+  /** Display the lighting environment at infinity. Requires a non-null environment; defaults off. */
+  readonly skybox?: boolean;
   readonly background?: ImportedVec3;
   /** Explicit deterministic clip time; the host owns play/pause and scheduling. Null selects rest pose. */
   readonly animation?: { readonly clipId: string | null; readonly timeSeconds: number; readonly loop: boolean };
