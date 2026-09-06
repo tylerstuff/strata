@@ -12,21 +12,21 @@ it('preserves every triangle and winding, leaves vertices untouched, and bounds 
   }
   const snapshot = vertices.slice();
   const result = partitionImportedIndices(vertices, indices, { min: [-10, -10, -10], max: [10, 10, 10] });
-  expect(vertices).toEqual(snapshot); expect(result.ranges.length).toBeLessThanOrEqual(64);
+  expect(vertices.every((v, i) => v === snapshot[i])).toBe(true); expect(result.ranges.length).toBeLessThanOrEqual(64);
   expect(result.ranges.length).toBeGreaterThan(1);
-  const found = new Set<number>(); let end = 0;
+  const found = new Set<number>(); let end = 0; let windingValid = true, boundsValid = true;
   for (const range of result.ranges) {
     expect(range.firstIndex).toBe(end); end += range.indexCount;
     for (let i = range.firstIndex; i < end; i += 3) {
       const first = result.indices[i]!; found.add(first);
-      expect([...result.indices.subarray(i, i + 3)]).toEqual([first, first + 1, first + 2]);
+      windingValid &&= first % 3 === 0 && result.indices[i + 1] === first + 1 && result.indices[i + 2] === first + 2;
       for (let c = 0; c < 3; c++) for (let axis = 0; axis < 3; axis++) {
         const v = vertices[result.indices[i + c]! * 16 + axis]!;
-        expect(v).toBeGreaterThanOrEqual(range.bounds.min[axis]!); expect(v).toBeLessThanOrEqual(range.bounds.max[axis]!);
+        boundsValid &&= v >= range.bounds.min[axis]! && v <= range.bounds.max[axis]!;
       }
     }
   }
-  expect(found.size).toBe(9000); expect(end).toBe(indices.length);
+  expect(windingValid).toBe(true); expect(boundsValid).toBe(true); expect(found.size).toBe(9000); expect(end).toBe(indices.length);
 });
 
 it('uses WebGPU near/far planes and keeps edge intersections including camera-enclosing bounds', () => {
