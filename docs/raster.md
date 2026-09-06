@@ -65,3 +65,14 @@ STRATA_TEST_BROWSER_CHANNEL=chrome STRATA_TEST_HEADED=1 npm run test:raster
 The benchmark retains fixed 720p/1080p, seed, orbit, warm-up and capture duration. The [initial M2 raster report](benchmarks/2026-09-05-m2-raster.md) records the first matched measurements. The raster workload ID distinguishes its added motion/materials from the diffuse baseline. Reports include named shadow/raster/temporal/presentation samples and percentiles, plus their per-frame sum, callback intervals, CPU submission and allocations. Pass sums exclude gaps, presentation/compositing and other GPU activity. `timedFrameCount` counts complete timed frames; `capturedPassSampleCount` and dropped/pending counters count individual pass samples. The legacy `capturedGpuSamples` field remains an alias of timed frame count for schema-v1 readers. Complete frame groups are retained or dropped together.
 
 Unit checks cover camera/light matrices, motion conventions, reset rules, resource ownership and failed submissions. Browser checks execute the production GGX function numerically and exercise actual temporal WGSL with signed fractional motion, analytic cubic reconstruction, foreign-depth rejection and partial support. A generated detail harness reports separate point-sample and pixel-box reference errors for static textures, translation, zoom and a slanted edge; its correctness checks alone do not accept visual quality. Browser checks also capture every required debug view and exercise toggles, resize, renderer replacement and disposal. These checks verify the supported foundation; they do not establish a representative game's 60 FPS result. All fixture imagery is procedural, and browser reports/captures remain outside Git and CI artifacts.
+
+Imported scenes can opt into `shadowFilter: 'receiver-plane'` at scene creation.
+This uses a 4-by-4 tent filter with receiver depth evaluated at each shadow texel
+center, and disables caster slope bias. It retains close self-shadows that the
+legacy fixed comparison bias can erase in a large scene. The default remains
+`'pcf'`. The corrected mode uses sixteen depth loads per shaded fragment and the
+same depth-map allocation. It still has a single scene-sized directional shadow
+map: it does not add cascades, contact rays, variable penumbrae, or local ambient
+occlusion. Degenerate receiver projections fall back to zero depth gradient.
+The browser raster check executes both production filters against independent
+flat and sloped depth fixtures, including a close occluder erased by legacy bias.

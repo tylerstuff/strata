@@ -5,7 +5,7 @@ import type { ProceduralSceneOptions } from './scene-data.js';
 import type { SceneFrameStats } from './scene-renderer.js';
 import { cameraJitter, createLightMatrix, createMaterialTextures, createRasterCamera } from './raster-math.js';
 import type { CameraFrame } from './raster-math.js';
-import { presentationShader, rasterShader } from './raster-shaders.js';
+import { presentationShader, rasterShader, receiverPlaneRasterShader } from './raster-shaders.js';
 import { TemporalResolve } from './temporal-resolve.js';
 import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from './raster-types.js';
 import type { RasterGeometryProvider, RasterGeometryGroup } from './geometry-provider.js';
@@ -101,7 +101,7 @@ export class RasterRenderer {
     private readonly shadowSize = 2048,
   ) { this.lightMatrix = geometry?.lightMatrix ?? createLightMatrix(halfExtent); }
 
-  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider | RasterGeometryGroup, gi?: RasterGiProvider, requestedShadowSize?: number): Promise<RasterRenderer> {
+  static async create(device: GPUDevice, format: GPUTextureFormat, options: ProceduralSceneOptions = {}, geometry?: RasterGeometryProvider | RasterGeometryGroup, gi?: RasterGiProvider, requestedShadowSize?: number, receiverPlaneShadows = false): Promise<RasterRenderer> {
     const shadowSize = validateShadowMapSize(requestedShadowSize, device.limits.maxTextureDimension2D);
     const providers = geometry ? ('providers' in geometry ? [...geometry.providers] : [geometry]) : [];
     if (geometry && (!providers.length || new Set(providers).size !== providers.length || providers.filter(provider => provider.selectionPass).length > 1
@@ -145,7 +145,7 @@ export class RasterRenderer {
         primitive: { topology: 'triangle-list' },
       });
       const pipelinePairsPromise = Promise.all((providers.length ? providers : [undefined]).map(async provider => {
-        const module = device.createShaderModule({ label: 'Strata PBR and shadow shader', code: rasterShader + (provider?.shaderSource ?? '') });
+        const module = device.createShaderModule({ label: 'Strata PBR and shadow shader', code: (receiverPlaneShadows ? receiverPlaneRasterShader : rasterShader) + (provider?.shaderSource ?? '') });
         const [rasterPipeline, shadowPipeline] = await Promise.all([
           device.createRenderPipelineAsync({
             label: 'Strata PBR MRT pipeline', layout: 'auto',
@@ -161,7 +161,7 @@ export class RasterRenderer {
             vertex: { module, entryPoint: provider?.shadowEntryPoint ?? 'shadowMain', buffers: provider ? provider.vertexBuffers ?? [] : vertexBuffers },
             ...(provider?.shadowFragmentEntryPoint ? { fragment: { module, entryPoint: provider.shadowFragmentEntryPoint, targets: [] } } : {}),
             primitive: { topology: 'triangle-list', cullMode: provider?.cullMode ?? 'back', frontFace: 'ccw' },
-            depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
+            depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: receiverPlaneShadows ? 0 : 2 },
           }),
         ]);
         return { provider, rasterPipeline, shadowPipeline };
@@ -194,7 +194,7 @@ export class RasterRenderer {
           ...(provider?.usesMaterialTextures === false ? [] : [
             { binding: 1, resource: baseTexture.createView() }, { binding: 2, resource: mrTexture.createView() },
             { binding: 3, resource: materialSampler },
-          ]), { binding: 4, resource: shadowView }, { binding: 5, resource: shadowSampler },
+          ]), { binding: 4, resource: shadowView }, ...(receiverPlaneShadows ? [] : [{ binding: 5, resource: shadowSampler }]),
         ] });
         return { provider, rasterPipeline, shadowPipeline, rasterBindings, shadowBindings };
       });

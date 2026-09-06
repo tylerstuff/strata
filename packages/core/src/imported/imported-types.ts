@@ -122,6 +122,8 @@ export interface ImportedSceneOptions {
   readonly renderer: 'imported';
   /** Directional shadow edge; default 2048. 4096 uses 64 MiB of depth storage. */
   readonly shadowMapSize?: 1024 | 2048 | 4096;
+  /** Opt-in receiver-plane depth correction for close self-shadows; default pcf. */
+  readonly shadowFilter?: 'pcf' | 'receiver-plane';
   /** CPU data remains caller-owned and reusable; do not mutate it during scene creation. */
   readonly asset: ImportedAsset;
   readonly signal?: AbortSignal;

@@ -107,6 +107,7 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   if (importedMaterial.alpha.y > 0.5 && alpha < importedMaterial.alpha.x) { discard; }
 }
 @fragment fn importedFragment(input: ImportedVertexOutput, @builtin(front_facing) front: bool) -> GBufferOutput {
+  let shadow = shadowVisibility(input.world);
   let baseSample = textureSample(importedBase, importedBaseSampler, input.uv);
   let mr = textureSample(importedMr, importedMrSampler, input.uv);
   let normalSample = textureSample(importedNormal, importedNormalSampler, input.uv).xyz * 2.0 - 1.0;
@@ -125,7 +126,6 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let mapped = normalize(vec3f(normalSample.xy * importedMaterial.factors.z, normalSample.z));
   // glTF flips the shaded normal on a double-sided backface, including normal mapping.
   let normal = select(n, normalize(mat3x3f(t, b, n) * mapped), importedMaterial.alpha.z > 0.5 && !relit) * select(-1.0, 1.0, front);
-  let shadow = shadowVisibility(input.world);
   let view = normalize(frame.eyeTime.xyz - input.world);
   let direct = evaluateDirectLight(base.rgb, roughness, metallic, normal,
     view, importedLight.direction.xyz, importedLight.radiance.rgb) * shadow;
