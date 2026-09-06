@@ -21,7 +21,7 @@ await copyFile(
 );
 await build({
   absWorkingDir: root,
-  entryPoints: ['packages/core/src/index.ts', 'packages/core/src/worker.ts', 'packages/core/src/gltf.ts'],
+  entryPoints: ['packages/core/src/index.ts', 'packages/core/src/worker.ts', 'packages/core/src/gltf.ts', 'packages/core/src/gameplay.ts'],
   outdir: fileURLToPath(dist),
   bundle: true,
   splitting: true,

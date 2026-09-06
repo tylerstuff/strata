@@ -35,7 +35,7 @@
     "test:geometry:regions": "node scripts/test-region-initialization.mjs",
     "test:gi": "node scripts/test-gi.mjs",
     "test:gi-motion": "node scripts/test-gi-motion.mjs --smoke",
-    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run test:trace-updates:launcher && npm run test:trace-performance:unit && npm run test:trace-phase:unit && npm run test:gallery:unit && npm run build && npm run test:consumers && npm run test:gallery && npm run benchmark:smoke && npm run test:raster && npm run test:imported && npm run test:compressed-textures && npm run test:imported-sky && npm run test:imported-baked && npm run test:hybrid-baked && npm run test:point-shadow && npm run test:lighting-lab && npm run test:imported-indirect && npm run test:imported-spatial && npm run test:geometry && npm run test:gi && npm run test:probe-volume && npm run test:gi-motion && npm run test:reflections && npm run test:integrated && npm run test:authored-boxes && npm run test:authored-motion && npm run check:authoring && npm run check:preview && npm run test:preview:processes && npm run test:preview:browser && npm run test:preview:connection:browser",
+    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run test:trace-updates:launcher && npm run test:trace-performance:unit && npm run test:trace-phase:unit && npm run test:gallery:unit && npm run build && npm run test:consumers && npm run test:gallery && npm run benchmark:smoke && npm run test:raster && npm run test:imported && npm run test:compressed-textures && npm run test:imported-sky && npm run test:imported-baked && npm run test:hybrid-baked && npm run test:point-shadow && npm run test:lighting-lab && npm run test:imported-indirect && npm run test:imported-spatial && npm run test:geometry && npm run test:gi && npm run test:probe-volume && npm run test:gi-motion && npm run test:reflections && npm run test:integrated && npm run test:authored-boxes && npm run test:authored-motion && npm run check:authoring && npm run check:preview && npm run test:preview:processes && npm run test:preview:browser && npm run test:preview:connection:browser && npm run test:character",
     "example": "node scripts/serve-example.mjs",
     "test:reflections": "node --test scripts/reflection-image-reference.test.mjs scripts/reflection-motion-reference.test.mjs && node scripts/test-reflections.mjs",
     "test:integrated": "node scripts/test-integrated.mjs",
@@ -67,7 +67,8 @@
     "test:hybrid-baked": "node scripts/test-hybrid-baked.mjs",
     "test:point-shadow": "node scripts/test-point-shadow.mjs",
     "bake:shadow-layer": "node scripts/bake-shadow-layer.mjs",
-    "bake:probes": "node scripts/bake-probes.mjs"
+    "bake:probes": "node scripts/bake-probes.mjs",
+    "test:character": "node scripts/test-character.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
