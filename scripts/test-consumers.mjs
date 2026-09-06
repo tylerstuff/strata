@@ -308,7 +308,10 @@ try {
   // Contributor-side fixture generation; the installed runtime has no Rust/build dependency.
   run('cargo', ['run', '--locked', '--release', '--quiet', '--package', 'strata-geometry-cooker', '--',
     '--output', integratedFixture, '--tiles', '4', '--cells', '64', '--seed', '1337', '--trace-proxy'], root);
-  const [packed] = JSON.parse(run('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temporary], join(root, 'packages', 'core')));
+  const packResult = JSON.parse(run('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temporary], join(root, 'packages', 'core')));
+  const packed = Array.isArray(packResult) ? packResult.find(item => item.name === '@strata-engine/core')
+    : packResult['@strata-engine/core'];
+  assert.ok(packed?.filename && Array.isArray(packed.files), 'npm pack must return the Core archive and file list');
   const files = new Set(packed.files.map((file) => file.path));
   for (const required of ['dist/index.js', 'dist/index.d.ts', 'dist/gltf.js', 'dist/gltf.d.ts', 'dist/worker.js', 'dist/strata_runtime.wasm']) {
     assert.ok(files.has(required), `Packed package is missing ${required}`);
