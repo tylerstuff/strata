@@ -127,12 +127,18 @@ export class ImportedGeometry implements RasterGeometryGroup {
   private pendingAnimation: ImportedTelemetry['animation'] = { clipId: null, timeSeconds: 0, loop: false };
   private posePrepared = false;
   private readonly acceptsTransforms: boolean;
+  private readonly reflectedRoots: readonly boolean[];
   private readonly summary: Pick<ImportedTelemetry, 'sourceUrl' | 'triangles' | 'primitives' | 'warnings'>;
   private constructor(private readonly device: GPUDevice, asset: ImportedAsset, private readonly owned: Owned,
     private readonly materials: readonly Material[], private readonly meshes: readonly Mesh[], private readonly lightBuffer: GPUBuffer,
     readonly textureRecords: ImportedTelemetry['textures'], private readonly evaluator: ReturnType<typeof createImportedPoseEvaluator>, private readonly palettes: readonly Palette[],
     private readonly environment: ReturnType<typeof createEnvironmentResources>) {
     this.acceptsTransforms = !!asset.rig?.nodes.length && asset.rig.nodes.length <= 4096 && asset.rig.nodes.every(node => node.parent === null) && asset.rig.skins.length === 0 && asset.primitives.every(p => p.deformation && p.deformation.skin === undefined);
+    const reflectedRoots = Array<boolean>(asset.rig?.nodes.length ?? 0).fill(true);
+    for (const primitive of asset.primitives) {
+      if (primitive.deformation && !asset.materials[primitive.material]!.doubleSided) reflectedRoots[primitive.deformation.node] = false;
+    }
+    this.reflectedRoots = reflectedRoots;
     this.summary = { sourceUrl: asset.sourceUrl, triangles: asset.stats.triangles, primitives: asset.primitives.length, warnings: [...asset.warnings] };
     const batches: ImportedBatch[] = [];
     for (const mode of ['static', 'rigid', 'skin'] as const) for (const doubleSided of [false, true]) {
@@ -323,7 +329,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const pose = this.evaluator.evaluate(animation);
     if (controls.transforms !== undefined && (!this.acceptsTransforms || pose.clipId !== null)) fail('transforms require independent rigid roots without skins or active clips.');
     const sources = controls.transforms === undefined ? [pose.nodeMatrices, ...pose.skinMatrices]
-      : [snapshotMeshTransforms(controls.transforms, pose.nodeMatrices.length / 16)];
+      : [snapshotMeshTransforms(controls.transforms, pose.nodeMatrices.length / 16, this.reflectedRoots)];
     // The evaluator reuses its arrays. Validate the entire candidate before copying any
     // palette or publishing controls/telemetry, so an out-of-range pose is atomic.
     const fit = this.fitLightMatrix(next, sources);

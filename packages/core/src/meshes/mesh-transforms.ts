@@ -1,7 +1,7 @@
 import { StrataError } from '../errors.js';
 
 /** Complete root-world palette. Validate before retaining or uploading any matrix. */
-export function snapshotMeshTransforms(input: unknown, count: number): Float32Array<ArrayBuffer> {
+export function snapshotMeshTransforms(input: unknown, count: number, reflectedRoots: readonly boolean[] = []): Float32Array<ArrayBuffer> {
   const fail = (): never => { throw new StrataError('INVALID_OPTIONS', 'Mesh transforms require one finite, invertible column-major affine matrix per root mesh (maximum 4096).'); };
   if (!Number.isInteger(count) || count < 1 || count > 4096
     || (!(input instanceof Float32Array) && !(input instanceof Float64Array))
@@ -14,6 +14,9 @@ export function snapshotMeshTransforms(input: unknown, count: number): Float32Ar
     const determinant = m[0]! * (m[5]! * m[10]! - m[9]! * m[6]!)
       - m[4]! * (m[1]! * m[10]! - m[9]! * m[2]!) + m[8]! * (m[1]! * m[6]! - m[5]! * m[2]!);
     if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-8) fail();
+    if (determinant < 0 && reflectedRoots[offset / 16] !== true) {
+      throw new StrataError('INVALID_OPTIONS', 'Reflected mesh roots require double-sided materials on every attached primitive.');
+    }
   }
   return result;
 }

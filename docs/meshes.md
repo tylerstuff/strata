@@ -22,7 +22,8 @@ Pass a complete `Float32Array` or `Float64Array` as
 `engine.render({ imported: { transforms } })`. It contains one column-major 4×4
 object-to-world matrix per root. Matrices use final scene coordinates, bypass
 asset normalization, and must be finite and affine, with absolute f32 determinant
-at least 1e-8. Reflected and nonuniform scales are supported. Values are copied
+at least 1e-8. Nonuniform scales are supported. Reflected roots require every attached primitive
+to use a double-sided material; single-sided reflections reject before submission. Values are copied
 synchronously before palette upload; callers can reuse their buffer after render.
 Shared-memory input palettes are rejected. Omission selects the normal rest or
 animation pose for that frame; it does not retain the last application palette.

@@ -27,9 +27,10 @@ describe('conventional mesh data boundary', () => {
       const m = mesh(); corrupt(m); expect(() => createMeshAsset({ meshes: [m], materials: [material] })).toThrow();
     }
   });
-  it('accepts reflected affine transforms and rejects incomplete, singular or nonfinite palettes', () => {
+  it('accepts explicitly permitted reflections and rejects unsupported or invalid palettes', () => {
     const m = identity(); m[0] = -2; m[12] = 4;
-    const snapshot = snapshotMeshTransforms(m, 1); m[12] = 99; expect(snapshot[12]).toBe(4);
+    expect(() => snapshotMeshTransforms(m, 1)).toThrow(/double-sided/);
+    const snapshot = snapshotMeshTransforms(m, 1, [true]); m[12] = 99; expect(snapshot[12]).toBe(4);
     expect(() => snapshotMeshTransforms(snapshot, 2)).toThrow();
     for (const [index, value] of [[0, 0], [3, .1], [15, 0], [12, Infinity]]) {
       const bad = identity(); bad[index!] = value!; expect(() => snapshotMeshTransforms(bad, 1)).toThrow();

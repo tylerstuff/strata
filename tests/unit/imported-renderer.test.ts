@@ -285,3 +285,20 @@ describe('application mesh transform submission', () => {
     geometry.dispose(); geometry.dispose(); expect(g.buffers.every(b => b.destroy.mock.calls.length === 1)).toBe(true);
   });
 });
+
+
+it('rejects reflected roots atomically when any attached primitive is single-sided', async () => {
+  for (const doubleSided of [false, true]) {
+    const g = gpu(), source = asset();
+    const created = createMeshAsset({ meshes: source.primitives, materials: [{ ...material, doubleSided }] });
+    const geometry = await ImportedGeometry.create(g.device, created);
+    const before = geometry.telemetry, writes = g.writes.length;
+    const matrix = new Float32Array([-1,0,0,0,0,1,0,0,0,0,1,0,2,0,0,1]);
+    if (doubleSided) { geometry.update({ transforms: matrix }); geometry.prepare(true, false); }
+    else {
+      expect(() => geometry.update({ transforms: matrix, background: [1,0,0] })).toThrow(/double-sided/);
+      expect(geometry.telemetry).toEqual(before); expect(g.writes.length).toBe(writes);
+    }
+    geometry.dispose();
+  }
+});
