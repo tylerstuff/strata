@@ -102,7 +102,7 @@ describe('imported scene resource and temporal contracts', () => {
     const geometry = await ImportedGeometry.create(g.device, textured());
     expect(geometry.telemetry.textures).toHaveLength(2);
     expect(geometry.telemetry.textures.map(t => [t.uploadWidth, t.uploadHeight, t.colorSpace, t.mipLevels])).toEqual([[4, 2, 'srgb', 3], [4, 2, 'linear', 3]]);
-    expect(geometry.gpuTextureBytes).toBe(96 + environmentTextureBytes); // Texture role copies, white fallbacks, fixed generated environment.
+    expect(geometry.gpuTextureBytes).toBe(120 + environmentTextureBytes); // Texture role copies, white fallbacks, fixed generated environment.
     expect(g.raw.queue.copyExternalImageToTexture).toHaveBeenCalledTimes(2);
     expect(g.raw.queue.submit).toHaveBeenCalledTimes(2);
     for (const b of bitmaps) expect(b.close).toHaveBeenCalledOnce();
@@ -136,7 +136,7 @@ describe('imported scene resource and temporal contracts', () => {
       for (const [d] of g.raw.createSampler.mock.calls) if ((d?.maxAnisotropy ?? 1) > 1) {
         expect([d!.magFilter, d!.minFilter, d!.mipmapFilter]).toEqual(['linear', 'linear', 'linear']);
       }
-      expect(geometry.gpuTextureBytes).toBe(352 + environmentTextureBytes); // Authored mip chains, white fallbacks and fixed environment textures.
+      expect(geometry.gpuTextureBytes).toBe(376 + environmentTextureBytes); // Authored mip chains, white fallbacks and fixed environment textures.
       geometry.dispose();
     });
   it('preflights aggregate color-role texture memory before decoding or allocating', async () => {
@@ -422,5 +422,40 @@ it('rejects probe controls without a loaded volume before changing the pose or a
     expect(geometry.telemetry).toEqual(before);
     expect(g.buffers.length).toBe(allocations);
   }
+  geometry.dispose();
+});
+
+it('caches all six point faces independently of camera cuts and restores moving casters', async () => {
+  const g = gpu(); const environment = asset();
+  const actor = createMeshAsset({meshes:[{name:'actor',vertices:new Float32Array([[-.2,0,0],[.2,0,0],[0,.4,0]].flatMap(p=>[...p,0,0,1,0,0,1,0,0,1,1,1,1,1])),indices:new Uint32Array([0,1,2]),material:0}],materials:[material]});
+  // Use the established generated actor fixture's 16-float vertex format.
+  const pointLight = {id:'lamp',position:[0,3,0] as readonly [number,number,number],color:[1,.5,.1] as const,intensity:1,range:10};
+  const renderer = await ImportedRenderer.create(g.device,'rgba8unorm',{renderer:'imported',asset:combineImportedAssets(environment,actor,{localLighting:true}),pointLight});
+  const frame = (cameraCut=false,point=pointLight) => renderer.encode(g.encoder,{} as GPUTextureView,64,64,0,{temporal:false,cameraCut,imported:{pointLight:point}});
+  const first=frame();renderer.submitted(1);const second=frame(true);renderer.submitted(2);
+  expect(second.skippedGpuPasses).toContain('point-shadow-static');
+  expect(first.drawCalls-second.drawCalls).toBeGreaterThanOrEqual(6);
+  expect(g.raw.createCommandEncoder).toBeDefined();
+  const pointWrites=g.writes.filter(w=>w.label.startsWith('Strata point face'));
+  expect(pointWrites).toHaveLength(6);expect(new Set(pointWrites.map(w=>JSON.stringify([...w.data]))).size).toBe(6);
+  const off=frame(false,{...pointLight,intensity:0});renderer.submitted(3);
+  expect(off.skippedGpuPasses).toContain('point-shadow');
+  frame(false,{...pointLight,position:[1,3,0]});renderer.submitted(4);
+  expect(g.writes.filter(w=>w.label.startsWith('Strata point face'))).toHaveLength(12);
+  renderer.dispose();for(const resource of [...g.buffers,...g.textures])expect(resource.destroy).toHaveBeenCalledOnce();
+});
+
+it('rejects double-counted local lighting and preserves point state after invalid frames', async () => {
+  const g=gpu(), source=asset(); const point={id:'lamp',position:[0,3,0] as const,color:[1,1,1] as const,intensity:1,range:10};
+  await expect(ImportedGeometry.create(g.device,{...source,materials:[{...material,localLighting:true}]})).rejects.toThrow(/scene point/);
+  const probes={version:1 as const,revision:'unit',origin:[-1,-1,-1] as const,spacing:[2,2,2] as const,counts:[2,2,2] as const,irradiance:Array(144).fill(1),visibility:Array(2048).fill(4),valid:Array(8).fill(1)};
+  const receiver={...source,materials:[{...material,localLighting:true,bakedProbeLighting:true}]};
+  await expect(ImportedGeometry.create(g.device,receiver,undefined,probes,point)).rejects.toThrow(/indirect-only/);
+  const geometry=await ImportedGeometry.create(g.device,receiver,undefined,{...probes,transport:'indirect'},point);
+  const revision=geometry.pointShadowPlan!.revision;
+  expect(()=>geometry.update({pointLight:{...point,id:'wrong'}})).toThrow();
+  expect(()=>geometry.update({pointLight:{...point,position:[1,3,0]},camera:{eye:[0,0,0],target:[0,0,0],verticalFov:1}})).toThrow();
+  expect(geometry.pointShadowPlan!.revision).toBe(revision);
+  expect(()=>geometry.update({bakedVertexLighting:{intensity:1}})).toThrow();
   geometry.dispose();
 });

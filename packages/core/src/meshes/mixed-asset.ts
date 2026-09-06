@@ -6,7 +6,7 @@ import type { ImportedAsset, ImportedMaterial } from '../imported/imported-types
  * Animation/placement controls address the actor; camera coordinates address the environment.
  */
 export function combineImportedAssets(environment: ImportedAsset, actor: ImportedAsset,
-  options: { readonly bakedProbeLighting?: boolean } = {}): ImportedAsset {
+  options: { readonly bakedProbeLighting?: boolean; readonly localLighting?: boolean } = {}): ImportedAsset {
   if (!environment || !actor || environment.version !== 1 || actor.version !== 1
     || environment.primitives.some(p => p.deformation) || environment.clips.length
     || !actor.rig || actor.primitives.some(p => !p.deformation)) {
@@ -16,7 +16,7 @@ export function combineImportedAssets(environment: ImportedAsset, actor: Importe
   const roles = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'occlusionTexture', 'emissiveTexture', 'lightmapTexture'] as const;
   const materials = actor.materials.map(m => {
     if (m.lightmapTexture) throw new StrataError('INVALID_OPTIONS', 'Moving actors cannot use static lightmaps.');
-    const result: ImportedMaterial = { ...m, ...(options.bakedProbeLighting && !m.unlit ? { bakedProbeLighting: true } : {}) };
+    const result: ImportedMaterial = { ...m, ...(options.localLighting && !m.unlit ? { localLighting: true } : {}), ...(options.bakedProbeLighting && !m.unlit ? { bakedProbeLighting: true } : {}) };
     return { ...result, ...Object.fromEntries(roles.flatMap(role => m[role] ? [[role, { ...m[role], image: m[role].image + offset }]] : [])) };
   });
   const primitives = [...environment.primitives, ...actor.primitives.map(p => ({ ...p, material: p.material + environment.materials.length }))];

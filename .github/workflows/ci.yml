@@ -175,7 +175,7 @@ jobs:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
       - name: Validate generated hybrid actor lighting and cached shadows
-        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:hybrid-baked
+        run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:hybrid-baked && xvfb-run -a npm run test:point-shadow
         env:
           STRATA_TEST_SOFTWARE_GPU: '1'
           STRATA_TEST_HEADED: '1'
