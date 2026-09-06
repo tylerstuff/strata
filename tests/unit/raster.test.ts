@@ -148,6 +148,23 @@ describe('raster frame orchestration and ownership', () => {
     } satisfies RasterGeometryProvider;
   }
 
+  it('reuses opted-in static shadows, accounts skipped work, and invalidates changes/cancellation', async () => {
+    const gpu = fixture();
+    const p = provider('static', false, {triangles:20,drawCalls:2,dispatchCalls:0,uploadBytes:0});
+    const group = {providers:[p],halfExtent:4,lightMatrix:p.lightMatrix,camera:p.camera,shadowCache:{revision:0,drawCalls:1,triangles:10}};
+    const renderer = await RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm', {}, group);
+    const draw = (t:number, cameraCut=false) => renderer.encode(gpu.encoder as unknown as GPUCommandEncoder, {} as GPUTextureView,640,360,t/60,{temporal:false,cameraCut});
+    const first=draw(0), reused=draw(1);
+    expect(reused.skippedGpuPasses).toEqual(['shadow']);
+    expect(reused.drawCalls).toBe(first.drawCalls-1);expect(reused.triangles).toBe(first.triangles-10);
+    expect(p.draw.mock.calls.map(([,phase])=>phase)).toEqual(['shadow','raster','raster']);
+    group.shadowCache.revision++;expect(draw(2).skippedGpuPasses).toBeUndefined();
+    expect(draw(3).skippedGpuPasses).toEqual(['shadow']);
+    renderer.invalidateShadowCache();expect(draw(4).skippedGpuPasses).toBeUndefined();
+    expect(draw(5,true).skippedGpuPasses).toBeUndefined();
+    renderer.dispose();
+  });
+
   it('passes the signed camera jitter to final presentation and zeroes diagnostic/bypass offsets', async () => {
     const gpu = fixture();
     const renderer = await RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm');

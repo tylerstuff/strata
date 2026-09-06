@@ -186,6 +186,6 @@ export class ImportedRenderer {
     catch (cause) { this.cancelFrame(); throw cause; }
   }
   submitted(frameId: number): void { this.indirect?.submitted(frameId); this.geometry.submitted(); this.forceReset = false; }
-  cancelFrame(): void { this.indirect?.cancelFrame(); this.geometry.cancelFrame(); this.forceReset = true; }
+  cancelFrame(): void { this.raster.invalidateShadowCache(); this.indirect?.cancelFrame(); this.geometry.cancelFrame(); this.forceReset = true; }
   dispose(): void { if (this.disposed) return; this.disposed = true; this.raster.dispose(); }
 }

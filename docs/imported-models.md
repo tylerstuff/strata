@@ -171,3 +171,9 @@ The optional `@strata-engine/core/gltf` entry exports `parseDdsMipChain(bytes, {
 BC1/BC3 color roles use sRGB formats; packed material roles remain linear. BC5 is restricted to normal maps, reconstructs positive Z, and defaults to an upward green channel. Set `normalY: 'down'` for DirectX conventions. Small images or caps that cannot form a valid block-compressed base level use the fallback. Native mip selection never enlarges a source image or exceeds the requested cap.
 
 This is bounded static texture residency, not demand streaming or texture transcoding. `loadGltf` still loads fallback bytes, and attaching variants adds source memory. The generated `npm run test:compressed-textures` fixture validates fallback, mip selection, alpha masking, BC5 orientation and disposal in a WebGPU browser; it records unavailable compression support explicitly.
+
+## Static shadow reuse
+
+Immutable imported scenes reuse the scene-owned directional shadow map while the camera moves. The imported geometry group supplies a revision plus explicit shadow draw/triangle counts. Direction or ground-presentation changes invalidate it; camera cuts, history resets and cancelled frames also force a refresh. Animated or root-transformed geometry does not opt into this cache. The full source geometry remains resident and is still rasterized each frame: this is not frustum culling, LOD or streaming.
+
+Reused frames omit the shadow pass from GPU timing resolution and subtract the actual skipped draw/triangle work from frame telemetry. No synthetic zero-duration or stale shadow sample is published. The first frame and invalidated frames retain normal shadow work. This reduces redundant static work without reducing shadow resolution.

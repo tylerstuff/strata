@@ -103,6 +103,7 @@ export async function createBenchmarkServer({ port = 0, assetRoot = process.env.
   const roots = [
     ['/packages/core/dist/', resolve(canonicalRepository, 'packages/core/dist')],
     ['/benchmarks/browser/', resolve(canonicalRepository, 'benchmarks/browser')],
+    ['/lighting-lab/', resolve(canonicalRepository, 'examples/lighting-lab'), new Set(['index.html', 'app.js'])],
     ['/gallery/', resolve(canonicalRepository, 'examples/gallery'), new Set(['index.html', 'gallery.css', 'app.js', 'app.js.map'])],
   ];
   // Canonicalizing the allowed roots prevents a symlink in a served file from

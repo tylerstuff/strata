@@ -162,7 +162,7 @@ export async function validateImportedProgressive() {
     for (let submitted = 1; submitted <= limits.maxSamples; submitted++) {
       const checkpoint = [1, 8, 32, 64].includes(submitted);
       const value = await frame(engine, canvas, onOptions, checkpoint ? `sky-${submitted}` : undefined);
-      require(value.metrics.drawCalls === 3 && value.metrics.dispatchCalls === 2, 'Enabled progressive path must execute trace+compose, without requested TAA.');
+      require(value.metrics.drawCalls === 2 && value.metrics.dispatchCalls === 2, 'Enabled progressive path must reuse the immutable shadow map and execute trace+compose without requested TAA.');
       const measured = counters(engine, submitted * 16 * 16);
       if (checkpoint) {
         captures.push(value.capture!);

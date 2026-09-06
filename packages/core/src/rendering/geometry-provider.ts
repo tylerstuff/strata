@@ -3,6 +3,8 @@ import type { RasterControls } from './raster-types.js';
 
 /** Providers draw into one shared camera, shadow map and MRT set. At most one owns selection timestamps. */
 export interface RasterGeometryGroup {
+  /** Defined only when all shadow casters are immutable between revision changes. */
+  readonly shadowCache?: { readonly revision: number; readonly drawCalls: number; readonly triangles: number } | undefined;
   readonly providers: readonly RasterGeometryProvider[];
   drawBackground?(pass: GPURenderPassEncoder, camera: CameraFrame, width: number, height: number,
     jitter: readonly [number, number], controls: RasterControls): { drawCalls: number; uploadBytes: number };

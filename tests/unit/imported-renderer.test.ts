@@ -35,6 +35,16 @@ function gpu() {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('imported scene resource and temporal contracts', () => {
+  it('advertises static shadow reuse only for unchanged immutable casters and light direction', async () => {
+    const g=gpu(), geometry=await ImportedGeometry.create(g.device,asset());
+    const initial=geometry.shadowCache?.revision;
+    geometry.update({camera:{eye:[2,2,4],target:[0,1,0],verticalFov:1}});
+    expect(geometry.shadowCache?.revision).toBe(initial);
+    geometry.update({lighting:{...geometry.lighting,intensity:2}});expect(geometry.shadowCache?.revision).toBe(initial);
+    geometry.update({lighting:{...geometry.lighting,directionToLight:[1,1,0]}});expect(geometry.shadowCache?.revision).toBe(initial!+1);
+    geometry.update({presentation:'ground'});expect(geometry.shadowCache?.revision).toBe(initial!+2);
+    geometry.dispose();
+  });
   it('validates skybox controls atomically and resets history when toggled', async () => {
     const g = gpu(), geometry = await ImportedGeometry.create(g.device, asset());
     expect(() => geometry.update({ skybox: true })).toThrow(/lighting environment/);
