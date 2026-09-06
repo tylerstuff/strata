@@ -210,26 +210,38 @@ describe('local preview controller: existing session ownership and result identi
   });
 
   it('faults on an uncooperative pending capture with unknown outcome, without claiming rollback or reopening admission', async () => {
-    const { value, session } = await connection(new Session(), { timeoutMs: 20, cleanupTimeoutMs: 20 });
-    await value.request(load(1));
-    const pending = deferred<CapturePublication>(); session.onCapture = () => pending.promise;
-    const capture = value.request(request(2, 'capture', tokens));
-    expect(await capture).toMatchObject({ ok: false, error: { code: 'CONNECTION_UNSETTLED', details: { outcomeUnknown: true } } });
-    expect(value.closing).toBe(true);
-    expect(await value.request(load(3))).toMatchObject({ ok: false });
-    pending.resolve(publication(outputRoot));
-    await value.close().catch(() => {});
-    expect(session.disposed).toBe(1);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { value, session } = await connection(new Session(), { timeoutMs: 20, cleanupTimeoutMs: 20 });
+      expect(await value.request(load(1))).toMatchObject({ ok: true });
+      const pending = deferred<CapturePublication>(), entered = deferred<void>();
+      session.onCapture = () => { entered.resolve(); return pending.promise; };
+      const capture = value.request(request(2, 'capture', tokens));
+      // Filesystem setup must finish before advancing the operation's clock.
+      await entered.promise; await vi.advanceTimersByTimeAsync(40);
+      expect(await capture).toMatchObject({ ok: false, error: { code: 'CONNECTION_UNSETTLED', details: { outcomeUnknown: true } } });
+      expect(value.closing).toBe(true);
+      expect(await value.request(load(3))).toMatchObject({ ok: false });
+      pending.resolve(publication(outputRoot));
+      await value.close().catch(() => {});
+      expect(session.disposed).toBe(1);
+    } finally { vi.useRealTimers(); }
   });
 
   it('bounds one pending inspection and reports unknown cleanup when observation never settles', async () => {
-    const { value, session } = await connection(new Session(), { timeoutMs: 20, cleanupTimeoutMs: 20 });
-    await value.request(load(1));
-    const observed = deferred<void>(); session.onObserve = () => observed.promise;
-    const first = value.request(request(2, 'inspect'));
-    expect(await value.request(request(3, 'inspect'))).toMatchObject({ ok: false, error: { code: 'CONNECTION_BUSY' } });
-    expect(await first).toMatchObject({ ok: false, error: { code: 'CONNECTION_UNSETTLED' } });
-    observed.resolve(); await value.close().catch(() => {});
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { value, session } = await connection(new Session(), { timeoutMs: 20, cleanupTimeoutMs: 20 });
+      expect(await value.request(load(1))).toMatchObject({ ok: true });
+      const observed = deferred<void>(), entered = deferred<void>();
+      session.onObserve = () => { entered.resolve(); return observed.promise; };
+      const first = value.request(request(2, 'inspect'));
+      await entered.promise;
+      expect(await value.request(request(3, 'inspect'))).toMatchObject({ ok: false, error: { code: 'CONNECTION_BUSY' } });
+      await vi.advanceTimersByTimeAsync(40);
+      expect(await first).toMatchObject({ ok: false, error: { code: 'CONNECTION_UNSETTLED' } });
+      observed.resolve(); await value.close().catch(() => {});
+    } finally { vi.useRealTimers(); }
   });
 
   it('limits status retention and does not return historical full request payloads', async () => {
