@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const port = Number(process.env.PORT ?? 4173);
 const mimeTypes = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm', '.css': 'text/css', '.map': 'application/json' };
-const allowedDirectories = ['examples/minimal', 'packages/core/dist'].map(path => `${resolve(root, path)}${sep}`);
+const allowedDirectories = ['examples/minimal', 'examples/meshes', 'packages/core/dist'].map(path => `${resolve(root, path)}${sep}`);
 
 try {
   await stat(resolve(root, 'packages/core/dist/index.js'));
@@ -19,7 +19,7 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, 'http://localhost');
     const path = decodeURIComponent(url.pathname === '/' ? '/examples/minimal/index.html' : url.pathname);
-    if (!path.startsWith('/examples/minimal/') && !path.startsWith('/packages/core/dist/')) {
+    if (!path.startsWith('/examples/minimal/') && !path.startsWith('/examples/meshes/') && !path.startsWith('/packages/core/dist/')) {
       response.writeHead(404).end();
       return;
     }

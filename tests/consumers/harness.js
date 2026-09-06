@@ -1,5 +1,5 @@
 // Shared by independently installed, packed-package consumer fixtures.
-export function installHarness(createEngine) {
+export function installHarness(createEngine, createMeshAsset) {
   const canvas = document.querySelector('canvas');
   let engine;
   let animationFrame;
@@ -60,6 +60,30 @@ export function installHarness(createEngine) {
       // Give GPU validation/error delivery a browser turn without imposing a frame-rate assertion.
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       return { metrics, telemetry: engine.getTelemetry() };
+    },
+    async exerciseMeshes() {
+      const vertices = new Float32Array([[-1,0,0],[1,0,0],[0,2,0]].flatMap(p => [...p,0,0,1,0,0,1,0,0,1,1,1,1,1]));
+      const material = { name: 'Generated matte', baseColorFactor: [.8,.15,.05,1], metallicFactor: 0, roughnessFactor: .7,
+        emissiveFactor: [0,0,0], emissiveStrength: 1, normalScale: 1, occlusionStrength: 1, alphaMode: 'OPAQUE', alphaCutoff: .5, doubleSided: true };
+      const asset = createMeshAsset({ meshes: [{ name: 'Generated triangle', vertices, indices: new Uint32Array([0,1,2]), material: 0 }], materials: [material] });
+      const receipt = await engine.setScene({ renderer: 'imported', asset });
+      const transforms = new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+      engine.resize(128,96);
+      const first = engine.render({ temporal: false, imported: { transforms } });
+      transforms[12] = 1;
+      const moved = engine.render({ temporal: true, imported: { transforms, camera: { eye: [2,2,5], target: [1,1,0], verticalFov: Math.PI/3 } } });
+      transforms[12] = Infinity;
+      let rejected;
+      try { engine.render({ imported: { transforms } }); } catch (error) { rejected = error.code; }
+      const afterRejected = engine.getTelemetry();
+      transforms[12] = 2;
+      engine.resize(160,120);
+      const resized = engine.render({ temporal: false, imported: { transforms } });
+      await engine.waitForIdle();
+      const telemetry = engine.getTelemetry();
+      await engine.setScene(null);
+      const cleared = engine.getTelemetry();
+      return { receipt, first, moved, rejected, afterRejected, resized, telemetry, cleared };
     },
     dispose() {
       cancelAnimationFrame(animationFrame);

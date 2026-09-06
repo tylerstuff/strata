@@ -1,3 +1,4 @@
+import { snapshotMeshTransforms } from '../meshes/mesh-transforms.js';
 import { StrataError } from '../errors.js';
 import type { RasterGeometryGroup, RasterGeometryProvider } from '../rendering/geometry-provider.js';
 import { multiplyMatrices, orthographicMatrix } from '../rendering/raster-math.js';
@@ -125,11 +126,13 @@ export class ImportedGeometry implements RasterGeometryGroup {
   private committedAnimation: ImportedTelemetry['animation'] | undefined;
   private pendingAnimation: ImportedTelemetry['animation'] = { clipId: null, timeSeconds: 0, loop: false };
   private posePrepared = false;
+  private readonly acceptsTransforms: boolean;
   private readonly summary: Pick<ImportedTelemetry, 'sourceUrl' | 'triangles' | 'primitives' | 'warnings'>;
   private constructor(private readonly device: GPUDevice, asset: ImportedAsset, private readonly owned: Owned,
     private readonly materials: readonly Material[], private readonly meshes: readonly Mesh[], private readonly lightBuffer: GPUBuffer,
     readonly textureRecords: ImportedTelemetry['textures'], private readonly evaluator: ReturnType<typeof createImportedPoseEvaluator>, private readonly palettes: readonly Palette[],
     private readonly environment: ReturnType<typeof createEnvironmentResources>) {
+    this.acceptsTransforms = !!asset.rig?.nodes.length && asset.rig.nodes.length <= 4096 && asset.rig.nodes.every(node => node.parent === null) && asset.rig.skins.length === 0 && asset.primitives.every(p => p.deformation && p.deformation.skin === undefined);
     this.summary = { sourceUrl: asset.sourceUrl, triangles: asset.stats.triangles, primitives: asset.primitives.length, warnings: [...asset.warnings] };
     const batches: ImportedBatch[] = [];
     for (const mode of ['static', 'rigid', 'skin'] as const) for (const doubleSided of [false, true]) {
@@ -318,7 +321,9 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (controls.animation !== undefined && (!controls.animation || typeof controls.animation !== 'object' || Array.isArray(controls.animation))) fail('animation controls must be an object.');
     const animation = controls.animation === undefined ? this.animation : controls.animation;
     const pose = this.evaluator.evaluate(animation);
-    const sources = [pose.nodeMatrices, ...pose.skinMatrices];
+    if (controls.transforms !== undefined && (!this.acceptsTransforms || pose.clipId !== null)) fail('transforms require independent rigid roots without skins or active clips.');
+    const sources = controls.transforms === undefined ? [pose.nodeMatrices, ...pose.skinMatrices]
+      : [snapshotMeshTransforms(controls.transforms, pose.nodeMatrices.length / 16)];
     // The evaluator reuses its arrays. Validate the entire candidate before copying any
     // palette or publishing controls/telemetry, so an out-of-range pose is atomic.
     const fit = this.fitLightMatrix(next, sources);

@@ -1,0 +1,9 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Strata · Application meshes</title>
+<style>body{margin:0;background:#111820;color:#e3eaf1;font:16px system-ui}main{max-width:1100px;margin:32px auto;padding:0 20px}h1{font-size:26px}p{color:#a8bacb;line-height:1.5}canvas{width:100%;aspect-ratio:16/9;display:block;background:#19232e;border-radius:10px}select,button{font:inherit;background:#223344;color:#fff;border:1px solid #4a6074;border-radius:5px;padding:8px;margin:0 8px 16px 0}pre{white-space:pre-wrap;color:#a8bacb}#error{color:#ff9999}</style>
+<main><h1>Application-owned meshes. Strata-owned rendering.</h1>
+<p>Generated geometry with a moving root transform, directional shadows, PBR and shared motion history. No model download, glTF conversion or scene reload during animation.</p>
+<button id="pause">Pause animation</button><select id="view" aria-label="Render view"><option value="final">Lit scene</option><option value="direct">Direct lighting</option><option value="shadow">Shadows</option><option value="normal">Normals</option><option value="motion">Motion</option></select>
+<canvas width="960" height="540"></canvas><p id="error"></p><pre id="stats"></pre>
+<p>This is the first fixed-topology opaque/masked mesh slice. Dynamic vertices, transparency, arbitrary hierarchies, general GI and scene-traced reflections are not supported here.</p></main>
+<script type="module" src="./main.js"></script></html>

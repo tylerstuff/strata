@@ -1,3 +1,4 @@
+import { createMeshAsset } from '../../packages/core/src/meshes/mesh-asset.js';
 import { ImportedRenderer } from '../../packages/core/src/imported/imported-renderer.js';
 import { loadGltf } from '../../packages/core/src/imported/gltf-loader.js';
 import { validateImportedEnvironment } from './imported-environment-validation.js';
@@ -302,6 +303,28 @@ export async function validateImportedRendering() {
         require(phase ? samples[1]!.hdr[3]! < 0.1 : samples[1]!.hdr[3]! > 0.9, 'Animated skinned caster must move its shadow onto the fixed receiver witness.');
         skinFrames.push({ phase, stats, samples, telemetry: skinRenderer.importedTelemetry });
       }
+      // An application palette must produce the same independently checked
+      // depth, normal, shadow and prior-pose motion as the known affine case.
+      const application = await ImportedRenderer.create(device, 'rgba8unorm', { renderer: 'imported',
+        asset: createMeshAsset({ meshes: [quad(0, -0.5), local], materials: skinBase.materials }) });
+      try {
+        const frames = [];
+        for (let phase = 0; phase < 2; phase++) {
+          const transforms = new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1,
+            phase ? 1.25 : 1,0,0,0,0,phase ? .75 : 1,0,0,0,0,phase ? 1.5 : 1,0,0,0,phase ? .25 : 0,1]);
+          const { animation: _animation, ...lighting } = skinControls(phase);
+          const encoder = device.createCommandEncoder();
+          const stats = application.encode(encoder, target.createView(), size, size, phase/60, { temporal: false, imported: { ...lighting, transforms } });
+          device.queue.submit([encoder.finish()]); application.submitted(phase+1); await device.queue.onSubmittedWorkDone();
+          const samples = await sample(device, application.outputs!, [[128,128], pixel([-.9,1,-.5])]);
+          for (let i = 0; i < samples.length; i++) {
+            for (const field of ['normal', 'motion', 'hdr'] as const) near(samples[i]![field], skinFrames[phase]!.samples[i]![field], .003, 'Application world palette '+field);
+            near([samples[i]!.depth], [skinFrames[phase]!.samples[i]!.depth], .001, 'Application world depth');
+          }
+          frames.push({ phase, stats, samples });
+        }
+        cases.push({ name: 'application-mesh-palette-shared-normal-depth-shadow-motion', frames });
+      } finally { application.dispose(); }
       const cancelled = device.createCommandEncoder(); skinRenderer.encode(cancelled, target.createView(), size, size, 2 / 60, { temporal: false, imported: skinControls(0.5) }); skinRenderer.cancelFrame();
       const retry = device.createCommandEncoder(); skinRenderer.encode(retry, target.createView(), size, size, 2 / 60, { temporal: false, imported: skinControls(1) });
       device.queue.submit([retry.finish()]); skinRenderer.submitted(3); await device.queue.onSubmittedWorkDone();
