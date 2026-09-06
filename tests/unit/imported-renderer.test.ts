@@ -228,6 +228,21 @@ describe('imported scene resource and temporal contracts', () => {
     renderer.dispose(); renderer.dispose(); for (const r of [...g.buffers, ...g.textures]) expect(r.destroy).toHaveBeenCalledOnce();
     expect(renderer.gpuBufferBytes).toBe(0); expect(renderer.gpuTextureBytes).toBe(0);
   });
+  it('culls offscreen static raster work while retaining its shadow and cached-shadow accounting', async () => {
+    const g = gpu(), renderer = await ImportedRenderer.create(g.device, 'rgba8unorm', { renderer: 'imported', asset: asset() });
+    const imported = { camera: { eye: [0, 1, 3] as const, target: [0, 1, 6] as const, verticalFov: 1 } };
+    const first = renderer.encode(g.encoder, {} as GPUTextureView, 128, 128, 0, { temporal: false, imported }); renderer.submitted(1);
+    expect(first.triangles).toBe(2); // offscreen caster + fullscreen presentation
+    expect(g.pass.drawIndexed).toHaveBeenCalledTimes(1);
+    g.pass.drawIndexed.mockClear();
+    const second = renderer.encode(g.encoder, {} as GPUTextureView, 128, 128, .016, { temporal: false, imported }); renderer.submitted(2);
+    expect(second.triangles).toBe(1); expect(second.drawCalls).toBe(1);
+    expect(g.pass.drawIndexed).not.toHaveBeenCalled();
+    const visible = renderer.encode(g.encoder, {} as GPUTextureView, 128, 128, .032, { temporal: false,
+      imported: { camera: { ...imported.camera, target: [0, 1, 0] } } });
+    expect(visible.triangles).toBe(2); expect(g.pass.drawIndexed).toHaveBeenCalledTimes(1);
+    renderer.dispose();
+  });
   it('updates the shadow transform coherently for a vertical light and contains all posed bounds', async () => {
     const g = gpu(); const geometry = await ImportedGeometry.create(g.device, asset()); const before = geometry.lightMatrix.slice();
     expect(geometry.update({ lighting: { directionToLight: [0, 1, 0], color: [1, 1, 1], intensity: 2, ambient: [0, 0, 0] } })).toBe(true);
