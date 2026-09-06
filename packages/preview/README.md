@@ -128,9 +128,11 @@ adapter. The linked record identifies the executed source and archive hashes;
 later documentation edits are outside that checkpoint. Captures and reports stay
 outside the repository.
 
-The new stdio connection passed its CPU lifecycle, transport and packed-consumer
-checks. Independent frozen review and browser validation remain pending. The
-earlier preview API/one-shot CLI result does not establish its transport behavior.
+The stdio connection passed CPU lifecycle, transport and packed-consumer checks,
+plus separate installed-connection browser acceptance. The
+[connection validation record](https://github.com/tylerstuff/strata/blob/main/docs/preview-connection.md#validation-boundary)
+distinguishes Linux CI checkpoint `1d627b0` from the Darwin launcher correction
+tested on Apple M2 hardware at `f60c3b5`.
 
 The separate `strata-project` binary and `@strata-engine/preview/project` Node
 export initialize, inspect, validate and build saved procedural projects. Build
@@ -139,5 +141,6 @@ Core distribution and a completion receipt. The browser app imports Core alone;
 it does not install authoring or preview code. Consumers receive precompiled WASM
 and need no Rust tools. Imported assets and cooking remain unsupported by this
 profile. See the [saved-project guide](https://github.com/tylerstuff/strata/blob/main/docs/project.md)
-for commands, output ownership, cancellation and validation limits. Generated-app
-browser/GPU acceptance remains pending.
+for commands, output ownership, cancellation and validation limits. Separate
+generated-app browser acceptance passed for two frozen procedural scenes; it does
+not establish general scene support or rendering performance.

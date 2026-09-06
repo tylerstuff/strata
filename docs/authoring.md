@@ -332,9 +332,10 @@ complete check.
 
 The separate [preview workflow](preview.md) supplies browser readiness and
 revision-linked captures for procedural boxes. The [local connection
-implementation](preview-connection.md) reuses those operations; its CPU checks
-passed and its browser behavior remains unverified. General asset
-cooking/import in this workflow, ordinary-browser application building and broader
-scene authoring remain issue #8 work. Coordinate precision and large-world
+implementation](preview-connection.md) reuses those operations; its CPU and
+restricted installed-browser checks passed. The [saved-project builder](project.md)
+also passed separate generated-app browser checks for this procedural profile.
+General asset cooking/import, broader application building and broader scene
+authoring remain issue #8 work. Coordinate precision and large-world
 contracts continue under #18. These bounded tools do not satisfy the full issue
 acceptance criteria or establish graphics performance.

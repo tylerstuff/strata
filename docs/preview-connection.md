@@ -2,9 +2,8 @@
 
 Tracked in [issue #8](https://github.com/tylerstuff/strata/issues/8). This bounded
 slice adds a persistent, process-owned stdio connection to the optional preview
-package. The implementation checkpoint passed CPU checks, including its isolated
-packed consumer. Independent review of the frozen candidate and browser acceptance
-remain pending. It does not complete the wider authoring issue.
+package. CPU and installed-connection browser checks passed for the checkpoints
+listed below. It does not complete the wider authoring issue.
 
 ## Boundary and transport
 
@@ -222,14 +221,15 @@ identity metadata, and reports omitted acquisition/dependent rows with their
 counts. It never includes raw status files, argv, environment or scene payloads.
 Returned cleanup receipts do not change when late I/O eventually settles.
 
-This candidate-confirmation and diagnostic work is a CPU-only checkpoint; new
-Linux and browser acceptance remain pending. It does not explain or reclassify
-the earlier failed CI result. None of this changes the runtime package or
-establishes browser, GPU or performance acceptance.
+The narrow candidate-confirmation path passed a controlled Node 24 Linux probe;
+the process suite also passed under Node 22 on Linux. The
+[retained validation record](https://github.com/tylerstuff/strata/issues/8#issuecomment-5555747211)
+separates those checks from earlier failed browser attempts. They do not explain
+or reclassify the original failed CI result or establish graphics performance.
 
 ## Validation boundary
 
-`npm run check:preview` passed for this implementation checkpoint: 325 CPU tests,
+`npm run check:preview` passed at integrated checkpoint `1d627b0`: 436 CPU tests,
 strict type/declaration checks, the package build, and both isolated packed CPU
 consumers. These tests use the existing session/driver seams and real temporary
 project/output directories. They cover framing, byte limits/backpressure, monotonic IDs, discovery,
@@ -245,8 +245,25 @@ actual settlement or report uncertainty. Rust/browser sentinels and an
 empty browser-install location keep this a CPU workflow. Fixtures are generated in
 temporary directories and removed afterward.
 
-No connection browser/GPU run or full `npm run check` was executed for this
-checkpoint. The prior API/one-shot capture browser proof covers a separate entry
-point. A frozen candidate and evidence will be independently reviewed before any
-scheduled connection browser validation. No GPU, quality or performance claim
-follows from these CPU tests.
+The full [GitHub Actions run 34000991394](https://github.com/tylerstuff/strata/actions/runs/34000991394)
+passed on `1d627b0`, including the installed connection workflow on Ubuntu with
+Xvfb and software WebGPU. Earlier billing-blocked runs remain failed historical
+attempts; local validation was recorded separately, not presented as CI success.
+
+The [subsequent Darwin launcher corrections](https://github.com/tylerstuff/strata/issues/8#issuecomment-5555831492)
+were tested at
+`f60c3b5d810f65aef202f503018ecd880ed55755`: 180 process tests passed with one
+Linux-only skip, and one fresh installed-connection browser run passed using
+Node 22.23.0/npm 12.0.2, headed Chrome 152.0.7977.82, Apple M2 and the nonfallback
+`apple/metal-3` adapter. It submitted exactly ten frames and captured five PNGs
+through one browser lifetime. The outer process, workflow and installed CLI
+exited successfully; cleanup recorded no identity mismatches, uncertainty,
+fallback signals or remaining owned processes. Source/build/input verification
+passed after the run. The external report is
+`2026-09-06T00-33-05-179Z-packed-preview-connection-47724/report.json`, SHA-256
+`e5017bfc818d41f24ddacebb404dc27bdd1c5c4b4c27a2e9ab96c6d300c785de`, under
+`~/Downloads/Strata-Preview-Checks/`. Earlier Darwin attempts remain failed.
+
+These checks cover the restricted procedural-box transport, visible edits,
+revision/generation guards, resize and disposal. They do not establish general
+authoring support, cross-device image determinism, graphics quality or performance.

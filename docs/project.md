@@ -4,7 +4,7 @@ Tracked in [issue #8](https://github.com/tylerstuff/strata/issues/8). The option
 preview package can initialize, inspect, validate and build a saved procedural
 project. Its generated website consumes Core alone and includes precompiled
 WASM. Building requires no browser or Rust tooling when using installed packages.
-Browser rendering acceptance remains pending for this generated-app entry point.
+The generated-app entry passed the restricted browser checks documented below.
 
 ## Create and build
 
@@ -91,3 +91,17 @@ reporting failure, 2 for usage, 3 for invalid inputs, 4 for revision/output
 conflicts, and 5 for input/output I/O failures. Use `strata-project --help` or
 `discover` for structured command discovery. CPU tests and installed-package
 delivery checks do not establish browser, graphics-quality or performance results.
+
+## Browser validation
+
+The [PR #46 generated-app acceptance](https://github.com/tylerstuff/strata/issues/8#issuecomment-5555631668)
+passed on Apple M2 with headed Chrome 152.0.7977.82 and hardware WebGPU. Frozen
+`prepared-04` evidence covers two submitted frames and two PNGs from separately
+built A/B applications, independent pixel regions, stale-revision rejection,
+payload-tamper rejection before worker creation, immutable application A after
+editing project B, loaded Core/worker/WASM identities and disposal. Its manifest
+SHA-256 is `636a0fc35d3e252bdc0edea1ec8d8fbf606f36f468ebb2951cf2535d25f38cb8`.
+The [full local validation record](https://github.com/tylerstuff/strata/issues/8#issuecomment-5555698298)
+records the separate package and repository checks, including earlier CI billing
+limitations. This is procedural base-color correctness evidence, not a PBR,
+depth, general project-building or performance result. Captures remain external.
