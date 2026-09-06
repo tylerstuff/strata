@@ -1,0 +1,7 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Strata · Playable character course</title>
+<style>body{margin:0;background:#101923;color:#e4edf4;font:16px system-ui}main{max-width:1100px;margin:24px auto;padding:0 20px}h1{font-size:26px}p{color:#adbdcb;line-height:1.5}canvas{width:100%;aspect-ratio:16/9;display:block;background:#19232e;border-radius:12px;outline:none}canvas:focus{box-shadow:0 0 0 2px #eead55}button{font:inherit;background:#29445a;color:#fff;border:1px solid #617b8d;border-radius:6px;padding:8px 14px}#stats{font:14px ui-monospace,monospace}#error{color:#ff9292}</style>
+<main><h1>A first playable Strata course</h1><p>Click the scene · WASD / arrows to move · Space to jump · R to reset. Walk onto the orange steps, slide along the walls and jump onto the low platform.</p>
+<canvas width="960" height="540" tabindex="0" aria-label="Playable collision course"></canvas>
+<p id="stats">Loading…</p><button id="reset">Reset character</button><button id="pause">Pause</button><p id="error"></p>
+<p>Fixed 60 Hz simulation with swept box collision. The articulated character is generated geometry. Slopes, imported collision, skinned animation blending and camera obstruction are upcoming milestones.</p></main><script type="module" src="./main.js"></script></html>
