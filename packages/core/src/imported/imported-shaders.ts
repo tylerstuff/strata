@@ -117,7 +117,9 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   }
   let occlusion = mix(1.0, textureSample(importedOcclusion, importedOcclusionSampler, input.uv).r, importedMaterial.factors.w);
   let emission = textureSample(importedEmissive, importedEmissiveSampler, input.uv).rgb * importedMaterial.emissive.rgb * importedMaterial.emissive.a;
-  let base = baseSample * importedMaterial.base * input.color;
+  let bakedMode = importedEnvironmentSettings.modes.y > 0.5;
+  let vertexAlbedo = vec4f(select(input.color.rgb, vec3f(1.0), bakedMode), input.color.a);
+  let base = baseSample * importedMaterial.base * vertexAlbedo;
   if (importedMaterial.alpha.y > 0.5 && base.a < importedMaterial.alpha.x) { discard; }
   let shadow = shadowVisibilityPrepared(input.world, shadowGradient);
   let relit = importedMaterial.alpha.w > 0.5 && importedEnvironmentSettings.modes.x > 0.5;
@@ -138,8 +140,9 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let materialAo = select(occlusion, 1.0, relit);
   let fill = base.rgb * (1.0 - metallic) * importedLight.ambient.rgb * materialAo;
   let environment = importedEnvironmentLight(base.rgb, roughness, metallic, normal, view, materialAo);
+  let baked = select(vec3f(0.0), base.rgb * (1.0 - metallic) * input.color.rgb * importedEnvironmentSettings.modes.z, bakedMode);
   var output: GBufferOutput;
-  output.hdr = vec4f(select(direct + fill + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
+  output.hdr = vec4f(select(direct + fill + baked + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
   output.normal = vec4f(select(normal, n * select(-1.0, 1.0, front), unlit), roughness);
   output.material = vec4f(base.rgb, metallic);
   let currentUv = input.currentClip.xy / input.currentClip.w * vec2f(0.5, -0.5) + vec2f(0.5);

@@ -18,10 +18,11 @@ export function snapshotEnvironment(value: ImportedEnvironment | null | undefine
 }
 
 /** World-to-environment rotation is inverse yaw; all diffuse/specular samples use it. */
-export function environmentUniform(environment: EnvironmentSettings, shading: 'authored' | 'relit'): Float32Array<ArrayBuffer> {
+export function environmentUniform(environment: EnvironmentSettings, shading: 'authored' | 'relit', bakedIntensity: number | null = null): Float32Array<ArrayBuffer> {
   const data = new Float32Array(environmentUniformBytes / 4), rotation = environment?.rotationRadians ?? 0;
   data.set([environment?.intensity ?? 0, Math.cos(rotation), Math.sin(rotation), environment?.preset === 'sky' ? 1 : 0]);
   data[4] = Number(shading === 'relit');
+  data[5] = Number(bakedIntensity !== null); data[6] = bakedIntensity ?? 0;
   if (environment) environmentMetadata.environments[environment.preset].sh.forEach((coefficient, index) => data.set(coefficient, 8 + index * 4));
   return data;
 }

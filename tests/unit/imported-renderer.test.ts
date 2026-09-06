@@ -35,6 +35,19 @@ function gpu() {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('imported scene resource and temporal contracts', () => {
+  it('validates static baked intensity and preserves it across partial updates', async () => {
+    const g=gpu(), geometry=await ImportedGeometry.create(g.device,asset());
+    expect(()=>geometry.update({bakedVertexLighting:{intensity:NaN}})).toThrow(/intensity/);
+    expect(()=>geometry.update({bakedVertexLighting:{intensity:-1}})).toThrow(/intensity/);
+    expect(geometry.update({bakedVertexLighting:{intensity:2}})).toBe(true);
+    geometry.prepare(true,false);
+    expect(g.writes.at(-1)!.data.slice(5,7)).toEqual(new Float32Array([1,2]));
+    expect(geometry.update({bakedVertexLighting:{intensity:2}})).toBe(false);
+    expect(()=>geometry.update({presentation:'ground'})).toThrow(/model-only/);
+    geometry.useIndirectBaseline();
+    expect(()=>geometry.update({})).toThrow(/without progressive GI/);
+    geometry.update({bakedVertexLighting:null});geometry.dispose();
+  });
   it('advertises static shadow reuse only for unchanged immutable casters and light direction', async () => {
     const g=gpu(), geometry=await ImportedGeometry.create(g.device,asset());
     const initial=geometry.shadowCache?.revision;

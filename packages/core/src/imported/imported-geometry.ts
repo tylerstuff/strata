@@ -28,7 +28,7 @@ export const importedDefaults = {
   lighting: { directionToLight: [0.35, 0.8, 0.4] as ImportedVec3, color: [1, .95, .875] as ImportedVec3, intensity: 4, ambient: [.06, .06, .06] as ImportedVec3 },
   presentation: 'model-only' as const, background: [.02, .035, .055] as ImportedVec3,
 };
-type Settings = { skybox?: boolean; camera: NonNullable<ImportedControls['camera']>; lighting: NonNullable<ImportedControls['lighting']>; presentation: 'model-only' | 'ground'; background: ImportedVec3; shading?: 'authored' | 'relit' };
+type Settings = { bakedVertexLighting?: { readonly intensity: number } | null; skybox?: boolean; camera: NonNullable<ImportedControls['camera']>; lighting: NonNullable<ImportedControls['lighting']>; presentation: 'model-only' | 'ground'; background: ImportedVec3; shading?: 'authored' | 'relit' };
 function fail(message: string): never { throw new StrataError('INVALID_OPTIONS', `Invalid imported scene: ${message}`); }
 function checkSignal(signal?: AbortSignal): void { if (signal?.aborted) throw new StrataError('SCENE_LOAD_ABORTED', 'Imported scene creation was cancelled.'); }
 function vector(value: unknown, label: string, maximum: number, minimum = -maximum): asserts value is ImportedVec3 {
@@ -59,7 +59,10 @@ function snapshot(controls: ImportedControls, current: Settings): Settings {
   const environment = snapshotEnvironment(lighting.environment);
   const skybox = controls.skybox === undefined ? current.skybox ?? false : controls.skybox;
   if (typeof skybox !== 'boolean' || (skybox && !environment)) fail('skybox must be boolean and needs a lighting environment.');
-  return { skybox, camera: { eye: [...camera.eye], target: [...camera.target], verticalFov: camera.verticalFov },
+  const baked = controls.bakedVertexLighting === undefined ? current.bakedVertexLighting ?? null : controls.bakedVertexLighting;
+  if (baked !== null && (typeof baked !== 'object' || Array.isArray(baked) || !Number.isFinite(baked.intensity) || baked.intensity < 0 || baked.intensity > 65536)) fail('bakedVertexLighting intensity must be finite in [0, 65536].');
+  if (baked !== null && presentation !== 'model-only') fail('bakedVertexLighting requires model-only presentation.');
+  return { bakedVertexLighting: baked === null ? null : { intensity: baked.intensity }, skybox, camera: { eye: [...camera.eye], target: [...camera.target], verticalFov: camera.verticalFov },
     lighting: { directionToLight: controls.lighting === undefined ? [...lighting.directionToLight] : normalize(lighting.directionToLight), color: [...lighting.color], intensity: lighting.intensity, ambient: [...lighting.ambient], environment }, presentation, background: [...background], shading };
 }
 
@@ -365,6 +368,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   update(controls: ImportedControls = {}): boolean {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
     const next = snapshot(controls, this.settings);
+    if (next.bakedVertexLighting && (this.indirectBaseline || this.meshes.some(mesh => mesh.mode !== 'static'))) fail('bakedVertexLighting requires immutable geometry without progressive GI.');
     if (controls.animation !== undefined && (!controls.animation || typeof controls.animation !== 'object' || Array.isArray(controls.animation))) fail('animation controls must be an object.');
     const animation = controls.animation === undefined ? this.animation : controls.animation;
     const pose = this.evaluator.evaluate(animation);
@@ -378,7 +382,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const animationCut = this.committedAnimation !== undefined && pose.clipId !== this.committedAnimation.clipId;
     this.pendingAnimation = { clipId: pose.clipId, timeSeconds: pose.timeSeconds, loop: pose.loop }; this.animation = { ...animation };
     const changedLighting = JSON.stringify(next.lighting) !== JSON.stringify(this.settings.lighting);
-    const changedShading = next.shading !== this.settings.shading;
+    const changedShading = next.shading !== this.settings.shading || JSON.stringify(next.bakedVertexLighting) !== JSON.stringify(this.settings.bakedVertexLighting);
     const cut = changedLighting || changedShading || next.skybox !== this.settings.skybox || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
     this.environmentDirty ||= changedShading || JSON.stringify(next.lighting.environment) !== JSON.stringify(this.settings.lighting.environment);
     if (next.presentation !== this.settings.presentation || JSON.stringify(next.lighting.directionToLight) !== JSON.stringify(this.settings.lighting.directionToLight)) this.shadowVersion++;
@@ -416,7 +420,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
       this.device.queue.writeBuffer(this.lightBuffer, 0, data); this.lightDirty = false; uploadBytes += lightBytes;
     }
     if (this.environmentDirty) {
-      this.device.queue.writeBuffer(this.environment.uniform, 0, environmentUniform(this.indirectBaseline ? null : snapshotEnvironment(this.settings.lighting.environment), this.settings.shading ?? 'authored'));
+      this.device.queue.writeBuffer(this.environment.uniform, 0, environmentUniform(this.indirectBaseline ? null : snapshotEnvironment(this.settings.lighting.environment), this.settings.shading ?? 'authored', this.settings.bakedVertexLighting?.intensity ?? null));
       this.environmentDirty = false; uploadBytes += environmentUniformBytes;
     }
     if (this.meshes.some(mesh => mesh.mode !== 'static')) for (const palette of this.palettes) {
