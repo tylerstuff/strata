@@ -159,3 +159,36 @@ material subset includes architectural surfaces, pavement and selected furniture
 while excluding foliage. Closed doors are static geometry, not interactive doors.
 Camera obstruction, production collision simplification/streaming, and broader
 route acceptance remain #71 work. This does not complete the entire M4 milestone.
+
+### Lossless snapshot transport
+
+Use `npm run cook:collision -- --input /external/scene.gltf --output /external/new-dir --gzip`
+to write `world.bin.gz` instead of the raw snapshot. The final manifest includes
+`transport` metadata with compressed/decoded lengths and SHA256 hashes. Omitting
+`--gzip` preserves the original raw output. Both encoded and decoded snapshots
+are limited to 256 MiB.
+
+`decodeCollisionSnapshot(encodedBytes, manifest.transport, signal?)`, exported
+from the optional gameplay entry, verifies the encoded hash, bounds streamed
+output to its declared length, verifies the decoded hash and returns the raw
+snapshot for `createCapsuleController`. It snapshots input and metadata before
+awaiting. Cancellation rejects and releases the reader. A corrupt/truncated file,
+length mismatch or over-budget output rejects before physics-world creation.
+The host must provide Web Crypto and `DecompressionStream`; these APIs work in
+the tested ordinary localhost browser deployment. No cross-origin isolation or
+server-side automatic decompression is required. The manifest describes stored
+compressed bytes, so an HTTP server must not silently decode them while keeping
+that metadata.
+
+This changes transport size only. Physics triangles, spatial index and native
+world memory remain unchanged; decoding also needs temporary buffers. The local
+Bistro snapshot is 218,849,397 bytes raw and 90,749,434 bytes gzip (58.5% fewer
+transferred bytes). Its decoded SHA256 exactly matches the original. This is not
+a measured load-time, frame-time or native-memory improvement.
+
+`npm run test:collision:transport` runs the packed capsule course through the
+public gzip decoder on software WebGPU. The cooker test compares decoded output
+against the raw snapshot byte-for-byte; unit tests cover corruption, truncation,
+size limits, cancellation and mutation isolation. Geometry simplification remains
+separate work: the smaller experimental Bistro meshes failed route-preservation
+checks and were not activated.

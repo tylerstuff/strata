@@ -23,7 +23,7 @@ try{
  server=await serveConsumer(temporary);
  browser=await chromium.launch({headless:true,...(process.env.STRATA_TEST_BROWSER_CHANNEL?{channel:process.env.STRATA_TEST_BROWSER_CHANNEL}:{}),args:['--enable-unsafe-webgpu','--use-angle=swiftshader','--enable-features=Vulkan','--disable-vulkan-surface']});
  const page=await browser.newPage({viewport:{width:1000,height:800}}),errors=[];page.on('pageerror',e=>errors.push(String(e)));
- await page.goto(server.url+'/course/index.html'+(capsuleMode?'?capsule':''));await page.waitForFunction(()=>window.characterCourse?.ready,{},{timeout:60000});
+ await page.goto(server.url+'/course/index.html'+(capsuleMode?'?capsule'+(process.argv.includes('--gzip')?'&gzip':''):''));await page.waitForFunction(()=>window.characterCourse?.ready,{},{timeout:60000});
  await page.waitForFunction(()=>window.characterCourse.metrics(),{},{timeout:60000});
  const initial=await page.evaluate(()=>({state:characterCourse.snapshot(),metrics:characterCourse.metrics(),telemetry:characterCourse.telemetry()}));
  await page.locator('canvas').focus();await page.keyboard.down('KeyW');
