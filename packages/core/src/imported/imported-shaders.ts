@@ -10,6 +10,7 @@ struct ImportedMaterial {
   emissive: vec4f,
   factors: vec4f,
   alpha: vec4f,
+  lightmap: vec4f,
 };
 struct ImportedLight { direction: vec4f, radiance: vec4f, ambient: vec4f, };
 @group(1) @binding(0) var<uniform> importedMaterial: ImportedMaterial;
@@ -24,12 +25,26 @@ struct ImportedLight { direction: vec4f, radiance: vec4f, ambient: vec4f, };
 @group(1) @binding(9) var importedEmissive: texture_2d<f32>;
 @group(1) @binding(10) var importedEmissiveSampler: sampler;
 @group(1) @binding(11) var<uniform> importedLight: ImportedLight;
+@group(1) @binding(16) var importedLightmap: texture_2d<f32>;
+fn lightmapTexel(p: vec2i) -> vec3f {
+  let extent = vec2i(textureDimensions(importedLightmap));
+  let encoded = textureLoad(importedLightmap, clamp(p, vec2i(0), extent - vec2i(1)), 0);
+  return encoded.rgb * encoded.a * importedMaterial.lightmap.x;
+}
+fn lightmapDiffuse(uv: vec2f) -> vec3f {
+  let p = clamp(uv, vec2f(0.0), vec2f(1.0)) * vec2f(textureDimensions(importedLightmap)) - vec2f(0.5);
+  let cell = vec2i(floor(p)); let f = fract(p);
+  // Decode before interpolation: RGBM components cannot be filtered as linear radiance.
+  return mix(mix(lightmapTexel(cell), lightmapTexel(cell + vec2i(1, 0)), f.x),
+    mix(lightmapTexel(cell + vec2i(0, 1)), lightmapTexel(cell + vec2i(1, 1)), f.x), f.y);
+}
 struct ImportedVertexInput {
   @location(0) position: vec3f,
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,
   @location(3) tangent: vec4f,
   @location(4) color: vec4f,
+  @location(7) lightmapUv: vec2f,
 };
 struct ImportedVertexOutput {
   @builtin(position) position: vec4f,
@@ -41,6 +56,7 @@ struct ImportedVertexOutput {
   @location(5) viewDepths: vec2f,
   @location(6) tangent: vec4f,
   @location(7) color: vec4f,
+  @location(8) lightmapUv: vec2f,
 };
 struct ImportedShadowOutput {
   @builtin(position) position: vec4f,
@@ -53,7 +69,7 @@ fn importedVertex(input: ImportedVertexInput, current: vec3f, previous: vec3f, n
   output.previousClip = frame.previousViewProjection * vec4f(previous, 1.0);
   output.position = output.currentClip; output.world = current;
   output.normal = normal; output.tangent = tangent;
-  output.uv = input.uv; output.color = input.color;
+  output.uv = input.uv; output.color = input.color; output.lightmapUv = input.lightmapUv;
   output.viewDepths = vec2f(-(frame.view * vec4f(current, 1.0)).z, -(frame.previousView * vec4f(previous, 1.0)).z);
   return output;
 }
@@ -140,9 +156,11 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let materialAo = select(occlusion, 1.0, relit);
   let fill = base.rgb * (1.0 - metallic) * importedLight.ambient.rgb * materialAo;
   let environment = importedEnvironmentLight(base.rgb, roughness, metallic, normal, view, materialAo);
+  var lightmapped = vec3f(0.0);
+  if (importedMaterial.lightmap.x > 0.0) { lightmapped = base.rgb * (1.0 - metallic) * lightmapDiffuse(input.lightmapUv); }
   let baked = select(vec3f(0.0), base.rgb * (1.0 - metallic) * input.color.rgb * importedEnvironmentSettings.modes.z, bakedMode);
   var output: GBufferOutput;
-  output.hdr = vec4f(select(direct + fill + baked + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
+  output.hdr = vec4f(select(direct + fill + baked + lightmapped + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
   output.normal = vec4f(select(normal, n * select(-1.0, 1.0, front), unlit), roughness);
   output.material = vec4f(base.rgb, metallic);
   let currentUv = input.currentClip.xy / input.currentClip.w * vec2f(0.5, -0.5) + vec2f(0.5);

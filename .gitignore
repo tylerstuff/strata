@@ -52,3 +52,5 @@ Strata-Benchmark-Assets/
 
 /benchmarks/browser/imported-sky-validation.js
 /benchmarks/browser/imported-baked-validation.js
+
+/scripts/__pycache__/

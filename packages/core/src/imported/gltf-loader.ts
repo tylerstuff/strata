@@ -8,7 +8,7 @@ import type { ImportedAnimationClip, ImportedAsset, ImportedImage, ImportedMater
 
 const maximumItems = 16384;
 const text = (value: unknown, fallback: string): string => typeof value === 'string' ? value.slice(0, 1024) : fallback;
-const requiredExtensions = new Set(['KHR_materials_emissive_strength', 'KHR_materials_unlit']);
+const requiredExtensions = new Set(['KHR_materials_emissive_strength', 'KHR_materials_unlit', 'EXT_strata_lightmap']);
 const boolean = (value: unknown, fallback: boolean): boolean => { if (value === undefined) return fallback; if (typeof value !== 'boolean') gltfError('Expected a boolean.'); return value; };
 
 class SourceBudget {
@@ -109,9 +109,9 @@ function materialData(document: GltfObject): ImportedMaterial[] {
   const choose = <T extends number>(value: unknown, fallback: T, values: readonly T[]): T => {
     const result = value ?? fallback; if (!values.includes(result as T)) gltfError('Unsupported texture sampler enum.'); return result as T;
   };
-  const texture = (info: unknown): ImportedTexture | undefined => {
+  const texture = (info: unknown, coordinate = 0): ImportedTexture | undefined => {
     if (info === undefined) return undefined; const value = object(info, 'textureInfo');
-    if (integer(value.texCoord ?? 0, 'textureInfo.texCoord') !== 0) throw new StrataError('UNSUPPORTED_FEATURE', 'This glTF path supports referenced TEXCOORD_0 only.');
+    if (integer(value.texCoord ?? 0, 'textureInfo.texCoord') !== coordinate) throw new StrataError('UNSUPPORTED_FEATURE', 'This glTF path supports referenced TEXCOORD_0 only.');
     if (value.extensions !== undefined && object(value.extensions, 'textureInfo.extensions').KHR_texture_transform !== undefined) throw new StrataError('UNSUPPORTED_FEATURE', 'Texture transforms are not supported.');
     const source = indexed(textures, value.index, 'texture.index'); const image = integer(source.source, 'texture.source', 0, images.length - 1);
     const sampler = source.sampler === undefined ? {} : indexed(samplers, source.sampler, 'texture.sampler');
@@ -135,9 +135,11 @@ function materialData(document: GltfObject): ImportedMaterial[] {
       alphaCutoff: scalar(material.alphaCutoff ?? 0.5, 'alphaCutoff', 0), doubleSided: boolean(material.doubleSided, false),
       ...(extensions.KHR_materials_unlit === undefined ? {} : { unlit: true }),
     };
+    const lm = extensions.EXT_strata_lightmap === undefined ? undefined : object(extensions.EXT_strata_lightmap, 'EXT_strata_lightmap');
+    if (lm && (lm.version !== 1 || lm.encoding !== 'rgbm' || object(lm.texture, 'lightmap.texture').texCoord !== 1)) gltfError('Lightmaps require version 1 RGBM on TEXCOORD_1.');
     const bindings = { baseColorTexture: texture(pbr.baseColorTexture), metallicRoughnessTexture: texture(pbr.metallicRoughnessTexture), normalTexture: texture(material.normalTexture),
       occlusionTexture: texture(material.occlusionTexture), emissiveTexture: texture(material.emissiveTexture) };
-    return { ...result, ...Object.fromEntries(Object.entries(bindings).filter(([, value]) => value !== undefined)) };
+    return { ...result, ...(lm ? { lightmapTexture: texture(lm.texture, 1)!, lightmapRange: scalar(lm.range, 'lightmap.range', 0.000001, 65536) } : {}), ...Object.fromEntries(Object.entries(bindings).filter(([, value]) => value !== undefined)) };
   });
 }
 
@@ -284,6 +286,8 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
         const normal = await read('NORMAL', [3], [5126]); const tangent = await read('TANGENT', [4], [5126]);
         if (tangent && !normal) gltfError('TANGENT requires a NORMAL attribute.');
         const uv = await read('TEXCOORD_0', [2], [5121, 5123, 5126]); const color = await read('COLOR_0', [3, 4], [5121, 5123, 5126]);
+        const lightmap = materials[material]!.lightmapTexture ? await read('TEXCOORD_1', [2], [5121, 5123, 5126]) : undefined;
+        if (materials[material]!.lightmapTexture && (!lightmap || retain)) gltfError('Static lightmaps require TEXCOORD_1 and no deformation.');
         const joints = await read('JOINTS_0', [4], [5121, 5123], false); const weights = await read('WEIGHTS_0', [4], [5121, 5123, 5126]);
         if (joints?.normalized) gltfError('Joint indices cannot be normalized.');
         if (attributes.JOINTS_1 !== undefined || attributes.WEIGHTS_1 !== undefined) throw new StrataError('UNSUPPORTED_FEATURE', 'More than four skin influences are unsupported.');
@@ -293,7 +297,7 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
         if (indexData && (indexData.type !== 'SCALAR' || ![5121, 5123, 5125].includes(indexData.componentType) || indexData.normalized)) gltfError('Indices must be unsigned scalars.');
         const indexCount = indexData?.count ?? position.count; if (indexCount % 3) gltfError('Triangle index count is not divisible by three.');
         const count = normal ? position.count : indexCount;
-        reserve(count * 64 + indexCount * 4 + (retain ? count * 64 + (skin === undefined ? 0 : count * 32) : 0));
+        reserve(count * (lightmap ? 72 : 64) + indexCount * 4 + (retain ? count * 64 + (skin === undefined ? 0 : count * 32) : 0));
         // Transformed positions must not enter a float32 buffer until the whole
         // asset has been centered/scaled. Charge the temporary 24 bytes/vertex
         // before allocating it, including expanded flat-shaded vertices.
@@ -311,10 +315,13 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
           if (index % 4096 === 0) await checkpoint(index, options.signal);
           indices[index] = normal ? sourceIndex(index) : index;
         }
+        if (lightmap && !lightmap.values.every(v => Number.isFinite(v) && v >= 0 && v <= 1)) gltfError('Lightmap UVs must be in [0, 1].');
+        const lightmapUvs = lightmap ? new Float32Array(count * 2) : undefined;
         const signs = new Int8Array(count); const rigidNormal = skin === undefined ? normalMatrix(graph.worlds[node]!) : undefined;
         for (let vertex = 0; vertex < count; vertex++) {
           if (vertex % 4096 === 0) await checkpoint(vertex, options.signal);
           const sourceVertex = normal ? vertex : sourceIndex(vertex); const at = vertex * 16;
+          if (lightmapUvs) lightmapUvs.set(lightmap!.values.subarray(sourceVertex * 2, sourceVertex * 2 + 2), vertex * 2);
           local.set(position.values.subarray(sourceVertex * 3, sourceVertex * 3 + 3), at);
           local.set(normal?.values.subarray(sourceVertex * 3, sourceVertex * 3 + 3) ?? [0, 1, 0], at + 3);
           local.set(uv?.values.subarray(sourceVertex * 2, sourceVertex * 2 + 2) ?? [0, 0], at + 6);
@@ -367,7 +374,7 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
         if (!tangent) { budget.reserve(count * 6 * 8 * 2); await generateTangents(local, indices, options.signal); if (materials[material]!.normalTexture) warnings.add('Missing tangents use UV-derived tangents; exact MikkTSpace parity is not guaranteed.'); }
         if (!baked.every(Number.isFinite) || !local.every(Number.isFinite)) gltfError('Flattened geometry exceeds finite float32.');
         vertices += count; triangles += indexCount / 3;
-        primitives.push({ name: text(mesh.name, `node-${node}`) + `/primitive-${index}`, vertices: baked, indices, material,
+        primitives.push({ name: text(mesh.name, `node-${node}`) + `/primitive-${index}`, vertices: baked, indices, material, ...(lightmapUvs ? { lightmapUvs } : {}),
           ...(retain ? { deformation: { node, vertices: local, ...(skin === undefined ? {} : { skin, joints: retainedJoints!, weights: retainedWeights! }) } } : {}) });
         worldPositions.push(precisePositions);
         missingAttributes.push({ normal: !normal, tangent: !tangent });
@@ -418,7 +425,7 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
       normalization: { scale, translation }, maxTextureDimension, warnings: [...warnings], clips,
       ...(retain ? { rig: { nodes: graph.nodes, skins } } : {}),
       stats: { meshInstances, primitives: primitives.length, vertices, triangles, materials: materials.length, images: images.length, encodedBytes: budget.encoded,
-        geometryBytes: primitives.reduce((sum, primitive) => sum + primitive.vertices.byteLength + primitive.indices.byteLength, 0), skinnedMeshInstances, animationClips: clips.length } };
+        geometryBytes: primitives.reduce((sum, primitive) => sum + primitive.vertices.byteLength + primitive.indices.byteLength + (primitive.lightmapUvs?.byteLength ?? 0), 0), skinnedMeshInstances, animationClips: clips.length } };
   } catch (cause) {
     abort(options.signal); if (cause instanceof StrataError) throw cause;
     throw new StrataError('SCENE_LOAD_FAILED', 'glTF loading failed.', { cause });
