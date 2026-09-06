@@ -64,12 +64,98 @@ performance result. Unit tests cover collision and time/input boundaries.
 
 ## Remaining milestone work
 
-This is a bounded box-proxy checkpoint. It does not provide capsule/triangle
-collision, slope handling, a broadphase for dense imported scenes, moving
+The original box controller is a bounded box-proxy checkpoint. Its interface does
+not provide capsule/triangle collision, slope handling, a broadphase for dense imported scenes, moving
 platforms, rigid-body simulation, skinned clip blending or camera obstruction.
 The following camera can intersect walls, and the course has an open boundary;
 falling off requires reset. Colliders must be authored separately and agree with
 rendered geometry. Bistro's normalized render coordinates need an explicit unit
 conversion and offline collision preparation before gameplay integration. Never
-scan its millions of render triangles every simulation tick. Those capabilities
-and the imported-asset code/CLI authoring workflow remain tracked in #71/#8.
+scan its millions of render triangles every simulation tick. The optional capsule path below addresses static triangle collision and slopes;
+the broader imported-asset code/CLI authoring workflow remains tracked in #71/#8.
+
+## Capsule collision for static imported geometry
+
+The optional gameplay entry now also exports asynchronous `cookStaticCollision`
+and `createCapsuleController`. These initialize the pinned Rapier 0.20.0
+precompiled Rust/WASM backend internally. Its roughly 2.8 MB uncompressed JS/WASM
+chunk loads only when one of these APIs is used. Core and the original box
+controller do not initialize it. The package includes Rapier's Apache-2.0 license.
+
+```ts
+import { cookStaticCollision, createCapsuleController } from '@strata-engine/core/gameplay';
+// Normally run this at asset preparation time, not during gameplay.
+const collision = await cookStaticCollision({ positions, indices });
+const character = await createCapsuleController({
+  collision, position: [0, 0.02, 0], radius: 0.3, height: 1.8,
+  stepHeight: 0.3, slopeLimitRadians: Math.PI / 4,
+});
+const state = character.advance(1 / 60, { x: 0, z: -1 });
+character.dispose();
+```
+
+`positions` are packed XYZ Float32 values in application units, with Uint32
+triangle indices. Source arrays are snapshotted before asynchronous initialization;
+shared buffers, invalid indices/nonfinite positions and oversized meshes reject.
+The current envelope is 128 MiB of source arrays, three million triangles,
+coordinates within ±8192, and a cooked snapshot no larger than 256 MiB. This is an
+admission ceiling, not a recommended production budget. Preparation creates a
+static triangle collider with internal-edge correction and serializes its spatial
+index. Loading restores that index, so each tick does not scan every triangle in
+JavaScript. A tick batches movement/query work through WASM.
+
+The version-1 collision contract names the exact `rapier3d-0.20.0` backend and
+contains the snapshot and triangle count. Re-cook on backend upgrades; snapshot
+compatibility across versions is not promised. Loading owns a separate world and
+one kinematic capsule. It verifies the restored world contains a single static
+solid triangle collider. Keep cooked content trusted and integrity-checked when
+loaded from a server; the local Bistro adapter verifies the manifest SHA256.
+
+`createCapsuleController` accepts the same speed/gravity/jump and bounded fixed
+step conventions as the box controller. Its collision body is a vertical capsule
+with a 0.01-unit contact offset. Slopes above the configured angle cannot be
+climbed; downhill sliding and ground snapping follow that policy. Steps need
+headroom and at least 0.1 units of free width. Collision is surface-based; this is
+not a solid-volume inside/outside classifier for arbitrary triangle soups.
+Spawns and teleports reject surface penetration exceeding 0.001 units.
+`groundHeight(origin, distance)` queries the first downward surface for spawn
+inspection. Use `dispose` explicitly; repeat disposal is safe and later simulation
+calls reject. `diagnostics` reports owned worlds and snapshot size. The shared
+WASM module retains its high-water linear memory after worlds are freed; zero
+owned worlds does not mean zero process memory.
+
+AbortSignal is checked before/after initialization and before publication during
+cooking. The synchronous native restore/cook operation cannot be interrupted
+mid-call. The current implementation has no worker cooking or streamed collision
+cells. Dense mesh memory and load latency need further optimization.
+
+### Offline glTF cooker
+
+After building, run:
+
+```sh
+npm run cook:collision -- --input /external/scene.gltf --output /external/new-collision-directory
+```
+
+The output directory must be new and outside the repository. The cooker reads
+static local glTF triangle geometry, applies node world transforms, ignores
+textures, removes degenerate triangles and writes `world.bin` plus a final
+`collision.json` success manifest. It records selected materials, exclusions,
+source hashes, output hash, size and cook duration. `--include-material REGEXP`
+allows an explicit collision subset. It does not generate simplified proxies.
+Sparse/deformed/skinned geometry is unsupported. Keep imported files and all
+cooked outputs external. Output snapshots are large and never belong in CI assets.
+
+`/examples/character/index.html?capsule` uses the generated course with triangle
+collision and an added shallow ramp. `STRATA_TEST_CAPSULE=1 npm run test:character`
+validates this mode through the real packed package on software WebGPU.
+`npm run test:collision:cook` exercises a generated transformed glTF and restores
+the result, checking output isolation and no-overwrite behavior.
+
+The local Bistro example now has a `playable` mode, converting metre-scale
+simulation into the scene's render normalization. It keeps the existing skin and
+walk clip; idle/jump do not yet blend to distinct clips. Its explicit collision
+material subset includes architectural surfaces, pavement and selected furniture,
+while excluding foliage. Closed doors are static geometry, not interactive doors.
+Camera obstruction, production collision simplification/streaming, and broader
+route acceptance remain #71 work. This does not complete the entire M4 milestone.

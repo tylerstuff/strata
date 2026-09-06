@@ -6,8 +6,16 @@
     "noEmit": false,
     "declaration": true,
     "emitDeclarationOnly": true,
-    "types": []
+    "types": [],
+    "lib": [
+      "ES2022",
+      "ESNext.Disposable",
+      "DOM",
+      "DOM.Iterable"
+    ]
   },
-  "include": ["src/**/*.ts"],
+  "include": [
+    "src/**/*.ts"
+  ],
   "exclude": []
 }

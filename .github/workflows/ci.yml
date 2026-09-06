@@ -50,6 +50,8 @@ jobs:
           STRATA_TEST_HEADED: '1'
       - name: Validate packed playable character course
         run: npm run test:character
+      - name: Validate collision cooker and packed capsule course
+        run: npm run test:collision:cook && npm run test:character:capsule
       - name: Validate authored scenes, large-coordinate precision, and scene receipts
         run: xvfb-run -a -s '-screen 0 1920x1200x24' npm run test:authored-boxes
         env:
