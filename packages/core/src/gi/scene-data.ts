@@ -70,22 +70,27 @@ export function giBoxToWorld(box: GiBox, local: GiVec3): GiVec3 {
 /** Exact outward-CCW faces. Float32 positions keep the CPU source identical to GPU input. */
 export function triangulateGiScene(scene: GiSceneData): readonly GiTriangle[] {
   const result: GiTriangle[] = [];
-  for (const box of scene.boxes) {
-    for (let axis = 0; axis < 3; axis++) {
-      const u = (axis + 1) % 3; const v = (axis + 2) % 3;
-      for (const sign of [-1, 1]) {
-        const points = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => {
-          const point = [0, 0, 0]; point[axis] = sign * box.halfSize[axis]!;
-          point[u] = a! * box.halfSize[u]!; point[v] = b! * box.halfSize[v]!;
-          return giBoxToWorld(box, point as unknown as GiVec3);
-        });
-        const localNormal = [0, 0, 0]; localNormal[axis] = sign;
-        const c = Math.cos(box.yaw); const s = Math.sin(box.yaw);
-        const normal = vector(Math.fround(c * localNormal[0]! + s * localNormal[2]!), localNormal[1]!, Math.fround(-s * localNormal[0]! + c * localNormal[2]!));
-        const order = sign > 0 ? [0, 1, 2, 0, 2, 3] : [0, 2, 1, 0, 3, 2];
-        for (let i = 0; i < 6; i += 3) result.push(Object.freeze({ id: result.length, boxId: box.id, materialId: box.materialId,
-          p0: points[order[i]!]!, p1: points[order[i + 1]!]!, p2: points[order[i + 2]!]!, normal }));
-      }
+  for (const box of scene.boxes) result.push(...triangulateGiBox(box, result.length));
+  return Object.freeze(result);
+}
+
+/** The fixed twelve-triangle source interval of one box, shared by full and dirty packing. */
+export function triangulateGiBox(box: GiBox, firstTriangleId = box.id * 12): readonly GiTriangle[] {
+  const result: GiTriangle[] = [];
+  for (let axis = 0; axis < 3; axis++) {
+    const u = (axis + 1) % 3; const v = (axis + 2) % 3;
+    for (const sign of [-1, 1]) {
+      const points = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => {
+        const point = [0, 0, 0]; point[axis] = sign * box.halfSize[axis]!;
+        point[u] = a! * box.halfSize[u]!; point[v] = b! * box.halfSize[v]!;
+        return giBoxToWorld(box, point as unknown as GiVec3);
+      });
+      const localNormal = [0, 0, 0]; localNormal[axis] = sign;
+      const c = Math.cos(box.yaw); const s = Math.sin(box.yaw);
+      const normal = vector(Math.fround(c * localNormal[0]! + s * localNormal[2]!), localNormal[1]!, Math.fround(-s * localNormal[0]! + c * localNormal[2]!));
+      const order = sign > 0 ? [0, 1, 2, 0, 2, 3] : [0, 2, 1, 0, 3, 2];
+      for (let i = 0; i < 6; i += 3) result.push(Object.freeze({ id: firstTriangleId + result.length, boxId: box.id, materialId: box.materialId,
+        p0: points[order[i]!]!, p1: points[order[i + 1]!]!, p2: points[order[i + 2]!]!, normal }));
     }
   }
   return Object.freeze(result);

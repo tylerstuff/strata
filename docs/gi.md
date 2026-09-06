@@ -48,6 +48,8 @@ The selected implementation is a deterministic median-split triangle BVH with at
 
 An analytic oriented-box SDF is retained as a comparison candidate on the exact same box source. It uses at most 128 sphere-tracing steps, a 0.2 mm surface threshold, and a conservative 0.9 step multiplier. Grazing rays can consume the complete budget; the result then remains an explicit exhaustion. This simple candidate has neither a spatial SDF hierarchy nor a baked distance-field volume, and its results do not establish the limits of all SDF methods.
 
+Current trace maintenance regenerates changed boxes and refits their leaf/ancestor closure on the existing topology. Material-value and light-only edits update their own records. [Incremental trace updates](incremental-trace-updates.md) defines the conservative source/packed-edge bounds, bounded write ranges, failure recovery and `trace`-prefixed GI counters. The GPU buffer layout and lighting-history rules are unchanged. The earlier browser measurements below predate this maintenance change.
+
 ## Observed tracing correctness and cost
 
 The clean 2026-09-05 browser validation used Chrome 152.0.7977.82 on an Apple M2 host with 16 GiB system memory; WebGPU reported vendor `apple`, architecture `metal-3`, and a non-fallback adapter. Each door state used 4,096 identical input rays for BVH closest-hit, BVH any-hit, and SDF tracing: 1,024 each of coherent, incoherent, grazing, and axis-aligned/finite-interval rays.

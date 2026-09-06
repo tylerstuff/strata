@@ -4,12 +4,14 @@ import type { RasterGiProvider } from '../rendering/gi-provider.js';
 import type { CameraFrame } from '../rendering/raster-math.js';
 import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } from '../rendering/raster-types.js';
 import { validateGiControls } from '../gi/gi-renderer.js';
-import { buildGiTraceData, refitGiTraceData } from '../gi/trace-data.js';
+import { buildGiTraceData } from '../gi/trace-data.js';
 import type { GiTraceData } from '../gi/trace-data.js';
+import { GiTraceUpdater } from '../gi/trace-updates.js';
 import type { GiTriangle } from '../gi/scene-data.js';
 import { ProbeCache } from '../gi/probe-cache.js';
 import type { ProbeBindings } from '../gi/probe-cache.js';
 import type { GiControls, GiTelemetry } from '../gi/gi-types.js';
+import { giTraceUpdateFields } from '../gi/gi-types.js';
 import { createReflectionScene } from './reflection-scene.js';
 import type { ReflectionSceneData } from './reflection-scene.js';
 import type { ReflectionSceneOptions as ReflectionFixtureOptions } from './reflection-scene.js';
@@ -30,12 +32,14 @@ export class ReflectionEffect implements RasterGiProvider {
   private revision = 1;
   private diffuseInvalidationRevision = 1;
   private frames = 0;
-  private traceDirty = false;
+  private pendingTraceUpdateCount: number | undefined;
+  private lastSubmittedUpdateCount = 0;
+  private lastSubmittedTraceFrameId: number | null = null;
   private resetPending = false;
   private pendingProbes: ProbeBindings | undefined;
   private disposed = false;
 
-  private constructor(private readonly device: GPUDevice, readonly traceData: GiTraceData,
+  private constructor(private readonly device: GPUDevice, readonly traceData: GiTraceData, private readonly traceUpdater: GiTraceUpdater,
     private readonly traceBuffers: readonly GPUBuffer[], readonly probeCache: ProbeCache,
     readonly reflectionCache: ReflectionCache, readonly composer: ReflectionComposer, private scene: ReflectionSceneData,
     private readonly sceneFactory: (options: ReflectionFixtureOptions) => ReflectionSceneData) {
@@ -43,7 +47,7 @@ export class ReflectionEffect implements RasterGiProvider {
   }
   static async create(device: GPUDevice, scene: ReflectionSceneData, options: Omit<ReflectionSceneOptions, 'renderer' | 'cameraMode'>,
     source: { sceneFactory?: (options: ReflectionFixtureOptions) => ReflectionSceneData; staticTriangles?: readonly GiTriangle[] } = {}): Promise<ReflectionEffect> {
-    const data = buildGiTraceData(scene, source.staticTriangles); const buffers: GPUBuffer[] = [];
+    const data = buildGiTraceData(scene, source.staticTriangles); const updater = new GiTraceUpdater(data); const buffers: GPUBuffer[] = [];
     let probes: ProbeCache | undefined; let reflections: ReflectionCache | undefined; let composer: ReflectionComposer | undefined;
     try {
       for (const [index, bytes] of traceArrays(data).entries()) {
@@ -63,8 +67,8 @@ export class ReflectionEffect implements RasterGiProvider {
         ...(options.maxRaysPerFrame === undefined ? {} : { maxRaysPerFrame: options.maxRaysPerFrame }),
       });
       composer = await ReflectionComposer.create(device, entries, reflections.samplingLayout);
-      return new ReflectionEffect(device, data, buffers, probes, reflections, composer, scene, source.sceneFactory ?? createReflectionScene);
-    } catch (cause) { composer?.dispose(); reflections?.dispose(); probes?.dispose(); for (const buffer of buffers) buffer.destroy(); throw cause; }
+      return new ReflectionEffect(device, data, updater, buffers, probes, reflections, composer, scene, source.sceneFactory ?? createReflectionScene);
+    } catch (cause) { composer?.dispose(); reflections?.dispose(); probes?.dispose(); updater.dispose(); for (const buffer of buffers) buffer.destroy(); throw cause; }
   }
   get active(): boolean { return this.giEnabled || this.controls.mode !== 'off'; }
   get currentScene(): ReflectionSceneData { return this.scene; }
@@ -78,7 +82,9 @@ export class ReflectionEffect implements RasterGiProvider {
   get preparePassNames(): readonly RasterPassName[] { return this.giEnabled ? ['gi-trace', 'gi-update'] : []; }
   get composePassNames(): readonly RasterPassName[] { return [...(this.controls.mode === 'world' ? ['reflection-trace', 'reflection-resolve'] as const : []), 'gi-shade']; }
   get giTelemetry(): GiTelemetry {
-    return { ...this.probeCache.telemetry, enabled: this.giEnabled, worldRevision: this.revision,
+    return { ...this.probeCache.telemetry,
+      ...giTraceUpdateFields(this.traceUpdater.telemetry, this.lastSubmittedUpdateCount, this.lastSubmittedTraceFrameId),
+      enabled: this.giEnabled, worldRevision: this.revision,
       objectMotionRollingRefresh: true,
       doorOpen: this.scene.state.doorOpen, wallColor: this.scene.state.wallColor, lightIntensity: this.scene.state.lightIntensity,
       traceRepresentation: 'triangle-bvh-v1', traceGeometryBytes: this.traceData.gpuBufferBytes,
@@ -89,8 +95,11 @@ export class ReflectionEffect implements RasterGiProvider {
     };
   }
   get reflectionTelemetry(): ReflectionTelemetry {
-    const tracing = this.controls.mode === 'world';
-    return { ...this.reflectionCache.telemetry, mode: this.controls.mode, roughness: this.controls.roughness,
+    const tracing = this.controls.mode === 'world'; const trace = this.traceUpdater.telemetry;
+    return { ...this.reflectionCache.telemetry,
+      traceUpdateCount: trace.updateCount, traceQueuedUpdateCount: trace.queuedUpdateCount,
+      traceLastSubmittedUpdateCount: this.lastSubmittedUpdateCount, traceLastSubmittedFrameId: this.lastSubmittedTraceFrameId,
+      mode: this.controls.mode, roughness: this.controls.roughness,
       maxDistance: this.controls.maxDistance, updateEvery: this.controls.updateEvery, objectOffset: this.controls.objectOffset,
       worldRevision: this.revision, giEnabled: this.giEnabled, traceRepresentation: 'triangle-bvh-v1',
       traceGeometryBytes: this.traceData.gpuBufferBytes, composeBufferBytes: this.composer.gpuBufferBytes,
@@ -123,7 +132,7 @@ export class ReflectionEffect implements RasterGiProvider {
       const next = this.sceneFactory({ doorOpen: gi.doorOpen ?? state.doorOpen,
         wallColor: gi.wallColor ?? state.wallColor, lightIntensity: gi.lightIntensity ?? state.lightIntensity,
         objectOffset: controls.objectOffset, roughness: controls.roughness });
-      refitGiTraceData(this.traceData, next); this.scene = next; this.traceDirty = true;
+      this.traceUpdater.update(next); this.scene = next;
     }
     if (resetWorld) this.revision++;
     // A rigid object's continuous motion refits tracing and resets reflection/TAA history,
@@ -131,14 +140,13 @@ export class ReflectionEffect implements RasterGiProvider {
     if (resetDiffuse) this.diffuseInvalidationRevision++;
     this.controls = controls; this.giEnabled = giEnabled;
     this.resetPending ||= Boolean(resetWorld || toggled || settingsChanged || input.cameraCut || controls.resetHistory);
+    // When both effects are disabled, prepare is omitted and this frame uses the prior queued source.
+    this.pendingTraceUpdateCount = this.traceUpdater.telemetry.queuedUpdateCount;
     return Boolean(resetWorld || toggled || settingsChanged || controls.resetHistory);
   }
   prepare(encoder: GPUCommandEncoder, _camera: CameraFrame, _width: number, _height: number, _time: number, timestamps: RasterTimestamps) {
-    let uploadBytes = 0;
-    if (this.traceDirty) {
-      for (const [index, bytes] of traceArrays(this.traceData).entries()) this.device.queue.writeBuffer(this.traceBuffers[index]!, 0, bytes);
-      uploadBytes += this.traceData.gpuBufferBytes; this.traceDirty = false;
-    }
+    const { uploadBytes } = this.traceUpdater.flush(this.device.queue, this.traceBuffers);
+    this.pendingTraceUpdateCount = this.traceUpdater.telemetry.queuedUpdateCount;
     if (!this.giEnabled) { this.pendingProbes = this.probeCache.bindings; return { uploadBytes, dispatchCalls: 0 }; }
     const result = this.probeCache.encode(encoder, { revision: this.revision, invalidationRevision: this.diffuseInvalidationRevision, frameIndex: this.frames,
       timestamps: { ...(timestamps['gi-trace'] ? { trace: timestamps['gi-trace'] } : {}), ...(timestamps['gi-update'] ? { update: timestamps['gi-update'] } : {}) },
@@ -162,11 +170,16 @@ export class ReflectionEffect implements RasterGiProvider {
   submitted(frameId: number): void {
     this.probeCache.submitted(frameId); this.reflectionCache.submitted(frameId); this.pendingProbes = undefined;
     this.frames++; this.resetPending = false;
+    if (this.pendingTraceUpdateCount !== undefined) {
+      this.lastSubmittedUpdateCount = this.pendingTraceUpdateCount; this.lastSubmittedTraceFrameId = frameId;
+    }
+    this.pendingTraceUpdateCount = undefined;
   }
-  cancelFrame(): void { this.probeCache.cancelFrame(); this.reflectionCache.cancelFrame(); this.pendingProbes = undefined; this.resetPending = true; }
+  cancelFrame(): void { this.probeCache.cancelFrame(); this.reflectionCache.cancelFrame(); this.pendingProbes = undefined; this.resetPending = true; this.pendingTraceUpdateCount = undefined; }
   dispose(): void {
     if (this.disposed) return; this.disposed = true;
-    this.composer.dispose(); this.reflectionCache.dispose(); this.probeCache.dispose(); for (const buffer of this.traceBuffers) buffer.destroy();
+    this.composer.dispose(); this.reflectionCache.dispose(); this.probeCache.dispose(); this.traceUpdater.dispose();
+    this.pendingTraceUpdateCount = undefined; for (const buffer of this.traceBuffers) buffer.destroy();
   }
 }
 

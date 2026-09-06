@@ -6,13 +6,15 @@ import type { RasterControls, RasterOutputs, RasterPassName, RasterTimestamps } 
 import type { SceneFrameStats } from '../rendering/scene-renderer.js';
 import { createGiScene } from './scene-data.js';
 import type { GiSceneData } from './scene-data.js';
-import { buildGiTraceData, refitGiTraceData } from './trace-data.js';
+import { buildGiTraceData } from './trace-data.js';
 import type { GiTraceData } from './trace-data.js';
+import { GiTraceUpdater } from './trace-updates.js';
 import { ProbeCache } from './probe-cache.js';
 import type { ProbeBindings } from './probe-cache.js';
 import { GiComposer } from './gi-composer.js';
 import { RoomGeometry } from './room-geometry.js';
 import type { GiControls, GiSceneOptions, GiTelemetry } from './gi-types.js';
+import { giTraceUpdateFields } from './gi-types.js';
 
 export function validateGiControls(controls: GiControls | undefined): void {
   if (controls === undefined) return;
@@ -34,16 +36,18 @@ class GiEffect implements RasterGiProvider {
   active = true;
   private revision = 1;
   private frames = 0;
-  private traceDirty = false;
+  private pendingTraceUpdateCount: number | undefined;
+  private lastSubmittedUpdateCount = 0;
+  private lastSubmittedTraceFrameId: number | null = null;
   private pendingBindings: ProbeBindings | undefined;
   private disposed = false;
 
-  private constructor(private readonly device: GPUDevice, readonly traceData: GiTraceData,
+  private constructor(private readonly device: GPUDevice, readonly traceData: GiTraceData, private readonly traceUpdater: GiTraceUpdater,
     private readonly traceBuffers: readonly GPUBuffer[], readonly probeCache: ProbeCache, readonly composer: GiComposer,
     private scene: GiSceneData) {}
 
   static async create(device: GPUDevice, scene: GiSceneData, options: GiSceneOptions): Promise<GiEffect> {
-    const data = buildGiTraceData(scene); const buffers: GPUBuffer[] = [];
+    const data = buildGiTraceData(scene); const updater = new GiTraceUpdater(data); const buffers: GPUBuffer[] = [];
     let cache: ProbeCache | undefined; let composer: GiComposer | undefined;
     try {
       for (const [index, bytes] of traceArrays(data).entries()) {
@@ -59,15 +63,17 @@ class GiEffect implements RasterGiProvider {
         ...(options.raysPerProbe === undefined ? {} : { raysPerProbe: options.raysPerProbe }),
       });
       composer = await GiComposer.create(device, entries);
-      return new GiEffect(device, data, buffers, cache, composer, scene);
-    } catch (cause) { composer?.dispose(); cache?.dispose(); for (const buffer of buffers) buffer.destroy(); throw cause; }
+      return new GiEffect(device, data, updater, buffers, cache, composer, scene);
+    } catch (cause) { composer?.dispose(); cache?.dispose(); updater.dispose(); for (const buffer of buffers) buffer.destroy(); throw cause; }
   }
   get currentScene(): GiSceneData { return this.scene; }
   get gpuBufferBytes(): number { return this.disposed ? 0 : this.traceData.gpuBufferBytes + this.probeCache.gpuBufferBytes + this.composer.gpuBufferBytes; }
   get gpuTextureBytes(): number { return this.disposed ? 0 : this.probeCache.gpuTextureBytes + this.composer.gpuTextureBytes; }
   get initialUploadBytes(): number { return this.traceData.gpuBufferBytes + this.probeCache.initialUploadBytes; }
   get telemetry(): GiTelemetry {
-    return { ...this.probeCache.telemetry, enabled: this.active, worldRevision: this.revision,
+    return { ...this.probeCache.telemetry,
+      ...giTraceUpdateFields(this.traceUpdater.telemetry, this.lastSubmittedUpdateCount, this.lastSubmittedTraceFrameId),
+      enabled: this.active, worldRevision: this.revision,
       doorOpen: this.scene.state.doorOpen, wallColor: this.scene.state.wallColor, lightIntensity: this.scene.state.lightIntensity,
       traceRepresentation: 'triangle-bvh-v1', traceGeometryBytes: this.traceData.gpuBufferBytes,
       cacheBufferBytes: this.probeCache.gpuBufferBytes, cacheTextureBytes: this.probeCache.gpuTextureBytes,
@@ -90,16 +96,15 @@ class GiEffect implements RasterGiProvider {
     if (changed) {
       const next = createGiScene({ doorOpen: controls.doorOpen ?? this.scene.state.doorOpen,
         wallColor: controls.wallColor ?? this.scene.state.wallColor, lightIntensity: controls.lightIntensity ?? this.scene.state.lightIntensity });
-      refitGiTraceData(this.traceData, next); this.scene = next; this.traceDirty = true;
+      this.traceUpdater.update(next); this.scene = next;
     }
+    // A disabled effect skips prepare and still submits against its previously queued trace source.
+    this.pendingTraceUpdateCount = this.traceUpdater.telemetry.queuedUpdateCount;
     return changed || Boolean(controls.resetCache) || toggled;
   }
   prepare(encoder: GPUCommandEncoder, _camera: CameraFrame, _width: number, _height: number, _time: number, timestamps: RasterTimestamps) {
-    let uploadBytes = 0;
-    if (this.traceDirty) {
-      for (const [index, bytes] of traceArrays(this.traceData).entries()) this.device.queue.writeBuffer(this.traceBuffers[index]!, 0, bytes);
-      uploadBytes += this.traceData.gpuBufferBytes; this.traceDirty = false;
-    }
+    const { uploadBytes } = this.traceUpdater.flush(this.device.queue, this.traceBuffers);
+    this.pendingTraceUpdateCount = this.traceUpdater.telemetry.queuedUpdateCount;
     const prepared = this.probeCache.encode(encoder, { revision: this.revision, frameIndex: this.frames,
       timestamps: { ...(timestamps['gi-trace'] ? { trace: timestamps['gi-trace'] } : {}), ...(timestamps['gi-update'] ? { update: timestamps['gi-update'] } : {}) },
     });
@@ -111,10 +116,17 @@ class GiEffect implements RasterGiProvider {
     if (!this.pendingBindings) throw new StrataError('RENDER_FAILED', 'GI cache was not prepared for composition.');
     return this.composer.encode(encoder, outputs, camera, width, height, controls, this.pendingBindings, timestamps['gi-shade']);
   }
-  submitted(frameId: number): void { this.probeCache.submitted(frameId); this.pendingBindings = undefined; this.frames++; }
-  cancelFrame(): void { this.probeCache.cancelFrame(); this.pendingBindings = undefined; }
+  submitted(frameId: number): void {
+    this.probeCache.submitted(frameId); this.pendingBindings = undefined; this.frames++;
+    if (this.pendingTraceUpdateCount !== undefined) {
+      this.lastSubmittedUpdateCount = this.pendingTraceUpdateCount; this.lastSubmittedTraceFrameId = frameId;
+    }
+    this.pendingTraceUpdateCount = undefined;
+  }
+  cancelFrame(): void { this.probeCache.cancelFrame(); this.pendingBindings = undefined; this.pendingTraceUpdateCount = undefined; }
   dispose(): void {
-    if (this.disposed) return; this.disposed = true; this.composer.dispose(); this.probeCache.dispose();
+    if (this.disposed) return; this.disposed = true; this.composer.dispose(); this.probeCache.dispose(); this.traceUpdater.dispose();
+    this.pendingTraceUpdateCount = undefined;
     for (const buffer of this.traceBuffers) buffer.destroy();
   }
 }

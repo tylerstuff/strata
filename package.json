@@ -35,7 +35,7 @@
     "test:geometry:regions": "node scripts/test-region-initialization.mjs",
     "test:gi": "node scripts/test-gi.mjs",
     "test:gi-motion": "node scripts/test-gi-motion.mjs --smoke",
-    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run test:gallery:unit && npm run build && npm run test:consumers && npm run test:gallery && npm run benchmark:smoke && npm run test:raster && npm run test:imported && npm run test:imported-indirect && npm run test:imported-spatial && npm run test:geometry && npm run test:gi && npm run test:probe-volume && npm run test:gi-motion && npm run test:reflections && npm run test:integrated && npm run test:authored-boxes && npm run test:authored-motion && npm run check:authoring && npm run check:preview && npm run test:preview:processes && npm run test:preview:browser && npm run test:preview:connection:browser",
+    "check": "npm run typecheck && npm run test:rust && npm run test:unit && npm run test:benchmark-server && npm run test:trace-updates:launcher && npm run test:trace-performance:unit && npm run test:trace-phase:unit && npm run test:gallery:unit && npm run build && npm run test:consumers && npm run test:gallery && npm run benchmark:smoke && npm run test:raster && npm run test:imported && npm run test:imported-indirect && npm run test:imported-spatial && npm run test:geometry && npm run test:gi && npm run test:probe-volume && npm run test:gi-motion && npm run test:reflections && npm run test:integrated && npm run test:authored-boxes && npm run test:authored-motion && npm run check:authoring && npm run check:preview && npm run test:preview:processes && npm run test:preview:browser && npm run test:preview:connection:browser",
     "example": "node scripts/serve-example.mjs",
     "test:reflections": "node --test scripts/reflection-image-reference.test.mjs scripts/reflection-motion-reference.test.mjs && node scripts/test-reflections.mjs",
     "test:integrated": "node scripts/test-integrated.mjs",
@@ -55,7 +55,10 @@
     "check:preview": "npm run build:authoring && npm run typecheck --workspace @strata-engine/preview && npm run test:preview && npm run build --workspace @strata-engine/preview && npm run test:preview:consumer && npm run test:preview:connection:consumer",
     "test:preview:processes": "node --test scripts/preview-process-cleanup.test.mjs scripts/preview-process-native.test.mjs scripts/preview-process-namespace.test.mjs scripts/preview-process-absence.test.mjs",
     "test:preview:browser": "node scripts/test-preview-browser.mjs",
-    "test:preview:connection:browser": "node scripts/test-preview-connection-browser.mjs"
+    "test:preview:connection:browser": "node scripts/test-preview-connection-browser.mjs",
+    "test:trace-updates:launcher": "node --test scripts/test-trace-updates.test.mjs",
+    "test:trace-performance:unit": "node --test scripts/trace-performance-bundles.test.mjs scripts/summarize-trace-performance.test.mjs",
+    "test:trace-phase:unit": "node --test scripts/phase-consumer-observer.test.mjs scripts/phase-consumer-admission.test.mjs scripts/phase-network-observer.test.mjs scripts/owned-browser-launch.test.mjs scripts/test-trace-gi-phase.test.mjs scripts/trace-gi-phase-comparison.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

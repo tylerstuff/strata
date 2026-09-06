@@ -9,6 +9,11 @@ import { chromium } from 'playwright';
 import { createBenchmarkServer } from './benchmark-server.mjs';
 import { validateBenchmarkReport } from './validate-benchmark.mjs';
 import { checkPower } from './benchmark-power.mjs';
+import { newExternalDirectory, finalizeProofReport, proofHash } from './test-trace-updates.mjs';
+import { assertTracePerformanceFrozen, frozenTraceRoute, loadTraceCorrectnessReceipt, loadTracePerformanceManifest,
+  parseTracePerformanceArguments, prepareTracePerformance, TRACE_CAPTURE_TIMES, TRACE_PERFORMANCE_OPTIONS,
+  TRACE_PERFORMANCE_RUNS, verifyTraceFile } from './trace-performance-bundles.mjs';
+import { summarizeTracePerformance } from './summarize-trace-performance.mjs';
 
 const exec = promisify(execFile);
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -251,6 +256,12 @@ async function captureDiagnostics(page, browserErrors) {
 }
 
 async function main() {
+  if (process.argv.some(value => value === '--trace-prepare-only' || value === '--trace-performance')) {
+    const args = parseTracePerformanceArguments(process.argv.slice(2));
+    if (args['trace-prepare-only']) console.log(JSON.stringify(await prepareTracePerformance({ commit: args.commit, assetRoot: args['asset-root'], output: args.output }), null, 2));
+    else await runTracePerformance(args);
+    return;
+  }
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
     console.log('Usage: npm run benchmark -- [--smoke | --sustained] [--duration seconds] [--warmup seconds] [--seed integer] [--instance-count integer] [--output external-directory] [--device-label label] [--renderer diffuse|raster|virtual] [--temporal on|off] [--debug-view view]');
@@ -428,4 +439,242 @@ async function main() {
   }
 }
 
-main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+const bounded = async (promise, label, milliseconds = 30000) => {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(Error(`${label} exceeded ${milliseconds} ms.`)), milliseconds); })]); }
+  finally { clearTimeout(timer); }
+};
+
+export function assertTracePower(snapshot, expected) {
+  const profile = checkPower(snapshot, expected);
+  if (!['AC Power', 'Battery Power'].includes(profile.source) || ![0, 1].includes(profile.lowPowerMode)) throw Error('This matched capture requires an observed power source and active Low Power Mode profile.');
+  const thermal = snapshot.thermal;
+  if (!thermal || thermal.noThermalWarningRecorded !== true || thermal.noPerformanceWarningRecorded !== true
+    || ['CPU_Scheduler_Limit', 'CPU_Speed_Limit', 'GPU_Speed_Limit'].some(key => thermal.limits[key] !== undefined && thermal.limits[key] < 100)
+    || (thermal.limits.Thermal_Level ?? 0) > 0) throw Error('Thermal/power indicators are unavailable or report a warning/limit; preserve this unmatched comparison for review.');
+  return profile;
+}
+/** Validate completed measured data while this run's later image evidence is still pending. */
+export function validatePendingTraceRun(report) {
+  const runs = report.runs.map((run, index) => {
+    if (index !== report.runs.length - 1) return run;
+    const { runner: _pendingImages, ...measured } = run; return measured;
+  });
+  validateBenchmarkReport({ ...report, runs });
+}
+export function completeTraceCaptureRecord(record) {
+  if (record.captures.length !== TRACE_CAPTURE_TIMES.length || record.captures.some((capture, i) =>
+    capture.timeSeconds !== TRACE_CAPTURE_TIMES[i] || capture.settleFrames !== 240 || capture.status !== 'complete'
+    || capture.admissionRequired !== (i === 0) || typeof capture.validation?.passed !== 'boolean'
+    || (i === 0 && capture.validation.passed !== true) || !/^[a-f0-9]{64}$/.test(capture.sha256 ?? '')
+    || !Number.isSafeInteger(capture.bytes) || capture.bytes < 24 || typeof capture.filename !== 'string' || !capture.filename.endsWith('.png')
+    || capture.validation.screenshotWidth !== record.width || capture.validation.screenshotHeight !== record.height)) {
+    throw Error('All five frozen captures must be complete with matching dimensions/time/settle count/hash; t0 must pass the original nonblank gate.');
+  }
+  const first = record.captures[0];
+  // Existing validator/tooling keeps its representative t0 fields; the full series remains explicit.
+  record.captureValidation = first.validation; record.captureFilename = first.filename;
+  record.captureTimeSeconds = first.timeSeconds; record.settleFrames = first.settleFrames;
+}
+/** Watchdog closes the actual browser on expiry; it never abandons a live GPU work promise. */
+export async function withTracePerformanceDeadline(work, forceTeardown, milliseconds) {
+  const ends = Date.now() + milliseconds;
+  let expired = false, teardown, teardownError;
+  const deadlineError = Error(`Frozen GPU window exceeded ${milliseconds} ms; forced browser teardown.`);
+  const expire = () => {
+    if (expired) return;
+    expired = true;
+    teardown = Promise.resolve().then(forceTeardown).catch(error => { teardownError = error; });
+  };
+  const live = () => { if (Date.now() >= ends) expire(); if (expired) throw deadlineError; };
+  const timer = setTimeout(expire, milliseconds);
+  try { const result = await work(live); live(); return result; }
+  catch (error) { throw expired ? deadlineError : error; }
+  finally {
+    clearTimeout(timer); await teardown;
+    if (teardownError) throw Error(`${deadlineError.message} Teardown failed: ${teardownError.message}`, { cause: teardownError });
+  }
+}
+
+/** The ordinary browser RAF/render/reset loop is reused without instrumentation. */
+async function runTracePerformance(args) {
+  if (process.env.STRATA_TEST_SOFTWARE_GPU === '1' || (process.env.CI && !['0', 'false'].includes(process.env.CI.toLowerCase()))) {
+    throw Error('The frozen trace comparison requires a local headed hardware session.');
+  }
+  const frozen = await loadTracePerformanceManifest({ manifestPath: args.manifest, manifestSha256: args['manifest-sha256'] });
+  const firstGuard = await assertTracePerformanceFrozen(frozen);
+  const receipt = await loadTraceCorrectnessReceipt(args, frozen.manifest);
+  // Guard canonical ancestors, including other worktrees. Source assets stay read-only.
+  const destination = await canonicalDestination(resolve(args.output));
+  if (within(frozen.manifest.assets.root, destination) || within(frozen.directory, destination)) throw Error('Capture output must be separate from assets and frozen preparation.');
+  const directory = await newExternalDirectory(destination);
+  const source = { commit: frozen.manifest.source.commit, tree: frozen.manifest.source.tree, dirty: false };
+  const report = { schemaVersion: 1, kind: 'strata-local-benchmark-session', comparisonKind: 'strata-trace-maintenance-performance',
+    createdAt: new Date().toISOString(), mode: 'performance', status: 'running', host: null, source, browser: null,
+    frozen: { manifestPath: frozen.manifestPath, manifestSha256: frozen.manifestSha256, source: frozen.manifest.source,
+      control: frozen.manifest.control, bundles: frozen.manifest.bundles, assets: frozen.manifest.assets },
+    correctnessReceipt: receipt, expectedRuns: TRACE_PERFORMANCE_RUNS, options: TRACE_PERFORMANCE_OPTIONS, gpuDeadlineMs: frozen.manifest.gpuDeadlineMs,
+    runs: [], browserErrors: [], requestFailures: [], guardChecks: [{ phase: 'admission', ...firstGuard }], cleanup: {} };
+  let server, browser, context, page, powerProfile;
+  const checkFrozen = async phase => {
+    const guard = await assertTracePerformanceFrozen(frozen);
+    await verifyTraceFile(receipt.report.path, receipt.report); await verifyTraceFile(receipt.manifest.path, receipt.manifest);
+    report.guardChecks.push({ phase, ...guard });
+  };
+  const errorCount = () => { if (report.browserErrors.length) throw Error(`Browser errors: ${report.browserErrors.join('; ')}`); };
+  try {
+    report.host = await hostMetadata(); // Once, outside every warmup/capture.
+    server = await createBenchmarkServer({ assetRoot: frozen.manifest.assets.root });
+    await withTracePerformanceDeadline(async live => {
+      live();
+      browser = await chromium.launch({ channel: 'chrome', headless: false, args: [], timeout: 30000 });
+      report.browser = { version: browser.version(), channel: 'chrome', headed: true, softwareGpu: false, launchArguments: [] };
+      console.log(`Frozen trace maintenance comparison: ${source.commit}; ${directory}`);
+      for (const [index, spec] of TRACE_PERFORMANCE_RUNS.entries()) {
+        live();
+        await checkFrozen(`run-${index}-before`);
+        live();
+        const name = `${index + 1}-${spec.arm}-${spec.width}x${spec.height}`;
+        const record = { index, ...spec, loaded: [], powerSamples: [], captures: [], cleanup: null };
+        const artifacts = new Map(), served = new Map();
+        // Package bytes are read and checked once BEFORE timing. Route handling never hashes.
+        for (const item of [...frozen.manifest.app.files, ...frozen.manifest.bundles[spec.arm].files]) {
+          artifacts.set(item.name, await verifyTraceFile(resolve(frozen.directory, item.name), item));
+        }
+        let disposed = false, closing = false, result;
+        live();
+        context = await browser.newContext({ viewport: { width: 1920, height: 1160 }, deviceScaleFactor: 1, serviceWorkers: 'block' });
+        await context.route('**/*', async route => {
+          const url = new URL(route.request().url());
+          if (url.origin === server.url && url.pathname === '/favicon.ico' && !url.search) return route.fulfill({ status: 204 });
+          const item = url.origin === server.url && !url.search && !url.hash ? frozenTraceRoute(frozen.manifest, spec.arm, url.pathname) : null;
+          if (!item || !['GET', 'HEAD'].includes(route.request().method())) {
+            report.browserErrors.push(`Unfrozen route in ${name}: ${route.request().url()}`); return route.abort('blockedbyclient');
+          }
+          const entry = served.get(item.url) ?? { url: item.url, kind: item.kind, sha256: item.sha256, bytes: item.bytes, requests: 0 };
+          entry.requests++; served.set(item.url, entry);
+          if (item.kind === 'asset') return route.continue(); // Original benchmark server/page fetching behavior.
+          const contentType = item.url.endsWith('.wasm') ? 'application/wasm' : item.url.endsWith('.map') ? 'application/json' : item.url === '/' ? 'text/html; charset=utf-8' : 'text/javascript; charset=utf-8';
+          return route.fulfill({ status: 200, contentType, headers: { 'Cache-Control': 'no-store' }, body: artifacts.get(item.name) });
+        });
+        context.on('requestfailed', request => {
+          const failure = { run: name, url: request.url(), error: request.failure()?.errorText ?? null,
+            expectedAbort: (closing || (request.url().includes('/external-assets/') && request.failure()?.errorText === 'net::ERR_ABORTED')) };
+          report.requestFailures.push(failure);
+          if (!failure.expectedAbort) report.browserErrors.push(`Request failed: ${failure.url}: ${failure.error}`);
+        });
+        context.on('response', response => { if (response.status() >= 400) report.browserErrors.push(`HTTP ${response.status()} ${response.url()}`); });
+        context.on('page', p => {
+          p.on('pageerror', error => report.browserErrors.push(`${name}: ${error.message}`));
+          p.on('crash', () => report.browserErrors.push(`${name}: page crashed`));
+          p.on('console', message => { if (message.type() === 'error') report.browserErrors.push(`${name}: ${message.text()}`); });
+        });
+        try {
+          live();
+          page = await context.newPage(); page.setDefaultTimeout(30000);
+          await page.goto(server.url); await page.bringToFront();
+          await page.waitForFunction(() => globalThis.strataBenchmark?.ready === true);
+          if (await page.evaluate(() => document.visibilityState !== 'visible')) throw Error('The hardware tab must be visible.');
+          record.preflightAdapter = await bounded(page.evaluate(async () => {
+            const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+            return adapter ? { vendor: adapter.info.vendor, architecture: adapter.info.architecture, device: adapter.info.device,
+              description: adapter.info.description, isFallbackAdapter: adapter.info.isFallbackAdapter ?? null } : null;
+          }), 'Hardware adapter admission');
+          if (record.preflightAdapter?.isFallbackAdapter !== false || isSoftwareAdapter(record.preflightAdapter)) throw Error('Hardware adapter admission failed before warmup.');
+          const startPower = await powerSnapshot(); record.powerSamples.push({ phase: 'before', ...startPower });
+          powerProfile = assertTracePower(startPower, powerProfile);
+          const metadata = { traceMaintenanceArm: spec.arm, traceMaintenanceRunIndex: index, source, host: report.host, browser: report.browser,
+            manifestSha256: frozen.manifestSha256, powerAtStart: startPower, geometryAsset: frozen.manifest.assets.geometryAsset };
+          let sampling, samplingError;
+          const interval = setInterval(() => {
+            console.log(`${name}: measuring/warming; ${record.powerSamples.length} power observations.`);
+            if (!sampling) sampling = powerSnapshot().then(sample => {
+              record.powerSamples.push({ phase: 'during', ...sample });
+              try { assertTracePower(sample, powerProfile); } catch (error) { samplingError ??= error; }
+            }).catch(error => { samplingError ??= error; }).finally(() => { sampling = null; });
+          }, 15000);
+          try {
+            result = await bounded(page.evaluate(options => globalThis.strataBenchmark.run(options),
+              { ...TRACE_PERFORMANCE_OPTIONS, width: spec.width, height: spec.height, metadata }), 'Warmup, capture and existing timing drain', 150000);
+          } finally { clearInterval(interval); await sampling; }
+          result.runner = record; report.runs.push(result); // Preserve all completed raw frames before later gates/captures.
+          record.powerSamples.push({ phase: 'after', ...await powerSnapshot() });
+          for (const sample of record.powerSamples) assertTracePower(sample, powerProfile);
+          if (samplingError) throw samplingError;
+          if (result.adapter?.isFallbackAdapter !== false || isSoftwareAdapter(result.adapter)) throw Error('Runtime did not positively identify a hardware adapter.');
+          if (result.allocations?.gpuErrorCount !== 0) throw Error('GPU errors were reported during the capture.');
+          for (const url of ['/packages/core/dist/index.js', '/packages/core/dist/worker.js', '/packages/core/dist/strata_runtime.wasm', ...frozen.manifest.bundles[spec.arm].updaterOutputs]) {
+            if (!served.has(url)) throw Error(`Required frozen runtime artifact was not requested: ${url}`);
+          }
+          if (result.assetTraffic?.giAtCaptureStart?.traceMetadataBytes !== (spec.arm === 'incremental' ? 150801 : 187185)) {
+            throw Error('The actual maintenance metadata allocation differs from the selected canonical arm.');
+          }
+          errorCount(); validatePendingTraceRun(report);
+          for (const timeSeconds of TRACE_CAPTURE_TIMES) {
+            live();
+            const capture = { timeSeconds, filename: `${name}-t${timeSeconds}.png`, debugView: 'final', temporal: true, admissionRequired: timeSeconds === 0,
+              brightnessScope: timeSeconds === 0 ? 'original nonblank admission gate' : 'diagnostic only; sun is intentionally off at t16',
+              method: 'existing held-time capture from reset; one reset submission followed by 240 held submissions, then waitForIdle; outside timing' };
+            record.captures.push(capture);
+            Object.assign(capture, await bounded(page.evaluate(time => globalThis.strataBenchmark.capture(time), timeSeconds), 'Post-timing held capture', 60000));
+            if (capture.settleFrames !== 240) throw Error('Held screenshot submission count differs from the frozen comparison.');
+            capture.validation = await captureEvidence(page, resolve(directory, capture.filename), 15000);
+            Object.assign(capture, await fileRecordForCapture(directory, capture.filename));
+            capture.status = 'complete';
+            if (capture.admissionRequired && !capture.validation.passed) throw Error(`Post-timing t0 image is blank: ${capture.filename}`);
+          }
+          completeTraceCaptureRecord(record); validateBenchmarkReport(report);
+          errorCount();
+        } finally {
+          record.loaded = [...served.values()];
+          if (page && !page.isClosed()) {
+            try {
+              record.cleanup = await bounded(page.evaluate(() => { globalThis.strataBenchmark.dispose(); return globalThis.strataBenchmark.diagnostics(); }), 'Explicit engine disposal', 15000);
+              const telemetry = record.cleanup.telemetry;
+              disposed = telemetry?.allocatedGpuBufferBytes === 0 && telemetry?.allocatedGpuTextureBytes === 0 && telemetry?.wasmMemoryBytes === 0 && telemetry?.gpuErrorCount === 0;
+            } catch (error) { report.browserErrors.push(`${name}: disposal failed: ${error.message}`); }
+          }
+          if (!disposed) report.browserErrors.push(`${name}: explicit disposal did not establish zero buffers/textures/WASM and zero GPU errors.`);
+          record.explicitDisposalPassed = disposed; closing = true;
+          try { await bounded(context.close(), 'Fresh context cleanup'); } finally { context = undefined; page = undefined; }
+          if (result) {
+            const runBytes = `${JSON.stringify(result)}\n`; const filename = `${name}.json`;
+            await writeFile(resolve(directory, filename), runBytes, { flag: 'wx' });
+            record.resultArtifact = { filename, bytes: Buffer.byteLength(runBytes), sha256: proofHash(runBytes) };
+          } else { report.failedRun = record; }
+        }
+        errorCount(); await checkFrozen(`run-${index}-after`);
+        console.log(`${name}: captured, five held-time images archived, engine and fresh context closed.`);
+      }
+      validateBenchmarkReport(report);
+      report.summary = summarizeTracePerformance(report, receipt.canonicalUpdate ? { canonicalUpdate: receipt.canonicalUpdate } : {});
+      live();
+      await bounded(browser.close(), 'Completed comparison browser cleanup');
+      live();
+      report.status = 'pass';
+    }, async () => {
+      report.deadlineExpiredAt = new Date().toISOString();
+      await bounded(browser?.close(), 'Deadline-forced browser teardown');
+      report.deadlineBrowserClosed = true;
+    }, frozen.manifest.gpuDeadlineMs);
+  } catch (error) { report.status = 'fail'; report.failure = { message: error.message, stack: error.stack }; }
+  finally {
+    await finalizeProofReport(report, directory, async () => {
+      const cleanup = await Promise.allSettled([bounded(context?.close(), 'Context cleanup'), bounded(browser?.close(), 'Browser cleanup'), bounded(server?.close(), 'Server cleanup')]);
+      report.cleanup = Object.fromEntries(['context', 'browser', 'server'].map((key, i) => [key, { status: cleanup[i].status,
+        ...(cleanup[i].status === 'rejected' ? { error: String(cleanup[i].reason) } : {}) }]));
+      if (cleanup.some(item => item.status === 'rejected')) throw Error('Comparison teardown failed.');
+      await checkFrozen('after-all-teardown');
+    });
+  }
+  console.log(`Trace comparison ${report.status}: ${resolve(directory, 'report.json')}`);
+  if (report.status !== 'pass') throw Error(report.failure?.message ?? report.finalizationFailure ?? 'Trace comparison failed.');
+}
+
+async function fileRecordForCapture(directory, filename) {
+  const bytes = await readFile(resolve(directory, filename)); return { bytes: bytes.byteLength, sha256: proofHash(bytes) };
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => { console.error(error.stack ?? error.message); process.exitCode = 1; });
+}
