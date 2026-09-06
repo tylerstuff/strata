@@ -49,3 +49,5 @@ Strata-Benchmark-Assets/
 /examples/gallery/app.js.map
 
 /benchmarks/browser/compressed-texture-validation.js
+
+/benchmarks/browser/imported-sky-validation.js

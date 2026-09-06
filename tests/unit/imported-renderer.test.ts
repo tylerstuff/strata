@@ -35,6 +35,19 @@ function gpu() {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('imported scene resource and temporal contracts', () => {
+  it('validates skybox controls atomically and resets history when toggled', async () => {
+    const g = gpu(), geometry = await ImportedGeometry.create(g.device, asset());
+    expect(() => geometry.update({ skybox: true })).toThrow(/lighting environment/);
+    expect(() => geometry.update({ skybox: 1 as unknown as boolean })).toThrow(/boolean/);
+    geometry.update({ lighting: { directionToLight: [0,1,0], color:[1,1,1], intensity:1,
+      ambient:[0,0,0], environment:{preset:'sky',intensity:1} } });
+    expect(geometry.update({ skybox:true })).toBe(true);
+    expect(geometry.update({ skybox:true })).toBe(false);
+    expect(() => geometry.update({ lighting:{...geometry.lighting,environment:null} })).toThrow();
+    expect(geometry.lighting.environment).not.toBeNull();
+    expect(geometry.update({ skybox:false })).toBe(true);
+    geometry.dispose(); for(const b of g.buffers)expect(b.destroy).toHaveBeenCalledOnce();
+  });
   it('borrows the same material resources and excludes unoccluded fill for both progressive comparison states', async () => {
     const g = gpu(), a = asset();
     const geometry = await ImportedGeometry.create(g.device, a);
