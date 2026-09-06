@@ -1,3 +1,4 @@
+import { prepareBakedProbes, type BakedProbeVolume } from './baked-probes.js';
 import { partitionImportedIndices, importedFrustumPlanes, importedBoundsVisible, type ImportedDrawRange } from './imported-visibility.js';
 import { createImportedSky, importedSkyUniformBytes } from './imported-sky.js';
 import type { RasterControls } from '../rendering/raster-types.js';
@@ -90,6 +91,8 @@ function validateMaterial(material: ImportedMaterial): void {
     if (!Array.isArray(value) || value.length !== length) fail(`${name} must contain exactly ${length} components.`);
     for (const component of value) factor(component, name, 0, 1);
   };
+  if (material.bakedProbeLighting !== undefined && typeof material.bakedProbeLighting !== 'boolean') fail('bakedProbeLighting must be boolean.');
+  if (material.bakedProbeLighting && (material.lightmapTexture || material.unlit)) fail('probe receivers must be lit without static lightmaps.');
   if (material.lightmapTexture !== undefined) {
     factor(material.lightmapRange, 'lightmapRange', 0.000001, 65536);
     if (material.unlit) fail('unlit materials cannot receive lightmaps.');
@@ -147,14 +150,16 @@ export class ImportedGeometry implements RasterGeometryGroup {
   private committedAnimation: ImportedTelemetry['animation'] | undefined;
   private pendingAnimation: ImportedTelemetry['animation'] = { clipId: null, timeSeconds: 0, loop: false };
   private posePrepared = false;
+  private probeDirty = false;
   private readonly acceptsTransforms: boolean;
   private readonly reflectedRoots: readonly boolean[];
   private readonly summary: Pick<ImportedTelemetry, 'sourceUrl' | 'triangles' | 'primitives' | 'warnings'>;
   private constructor(private readonly device: GPUDevice, asset: ImportedAsset, private readonly owned: Owned,
     private readonly materials: readonly Material[], private readonly meshes: readonly Mesh[], private readonly lightBuffer: GPUBuffer,
     readonly textureRecords: ImportedTelemetry['textures'], private readonly evaluator: ReturnType<typeof createImportedPoseEvaluator>, private readonly palettes: readonly Palette[],
-    private readonly environment: ReturnType<typeof createEnvironmentResources>, private readonly sky: Awaited<ReturnType<typeof createImportedSky>>) {
-    this.acceptsTransforms = !!asset.rig?.nodes.length && asset.rig.nodes.length <= 4096 && asset.rig.nodes.every(node => node.parent === null) && asset.rig.skins.length === 0 && asset.primitives.every(p => p.deformation && p.deformation.skin === undefined);
+    private readonly environment: ReturnType<typeof createEnvironmentResources>, private readonly sky: Awaited<ReturnType<typeof createImportedSky>>,
+    private readonly probes: { data: GPUBuffer; uniform: GPUBuffer; state: ReturnType<typeof prepareBakedProbes> }) {
+    this.acceptsTransforms = !!asset.rig?.nodes.length && asset.rig.nodes.length <= 4096 && asset.rig.nodes.every(node => node.parent === null) && asset.rig.skins.length === 0 && asset.primitives.filter(p => p.deformation).every(p => p.deformation!.skin === undefined);
     const reflectedRoots = Array<boolean>(asset.rig?.nodes.length ?? 0).fill(true);
     for (const primitive of asset.primitives) {
       if (primitive.deformation && !asset.materials[primitive.material]!.doubleSided) reflectedRoots[primitive.deformation.node] = false;
@@ -169,7 +174,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const fit = this.fitLightMatrix(this.settings, this.palettes.map(palette => palette.data));
     this.visibleBounds = fit.bounds; this.light = fit.matrix;
   }
-  static async create(device: GPUDevice, asset: ImportedAsset, signal?: AbortSignal): Promise<ImportedGeometry> {
+  static async create(device: GPUDevice, asset: ImportedAsset, signal?: AbortSignal, bakedProbes?: BakedProbeVolume): Promise<ImportedGeometry> {
     checkSignal(signal);
     if (!asset || asset.version !== 1 || !Array.isArray(asset.primitives) || !Array.isArray(asset.materials) || !Array.isArray(asset.images)
       || asset.primitives.length === 0 || asset.primitives.length > 4096 || asset.materials.length > 4096 || asset.images.length > 1024) fail('asset needs a bounded decoded glTF scene.');
@@ -177,6 +182,9 @@ export class ImportedGeometry implements RasterGeometryGroup {
     vector(asset.bounds.min, 'bounds min', 1024); vector(asset.bounds.max, 'bounds max', 1024);
     if (asset.bounds.min.some((v, i) => v > asset.bounds.max[i]!)) fail('bounds are inverted.');
     if (device.limits.maxSampledTexturesPerShaderStage < 9 || device.limits.maxSamplersPerShaderStage < 7 || device.limits.maxBindGroups < 2) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported PBR/environment needs nine sampled textures, seven samplers and two bind groups.');
+    const probeState = prepareBakedProbes(bakedProbes);
+    if (device.limits.maxStorageBuffersPerShaderStage < 1 || probeState.data.byteLength > device.limits.maxStorageBufferBindingSize || probeState.data.byteLength > device.limits.maxBufferSize) throw new StrataError('UNSUPPORTED_LIMIT', 'Baked probe storage exceeds device limits.');
+    if (asset.materials.some(m => m.bakedProbeLighting) && !bakedProbes) fail('probe receivers need a baked volume.');
     const evaluator = createImportedPoseEvaluator(asset);
     const initialPose = evaluator.evaluate();
     const initialPalettes = [initialPose.nodeMatrices, ...initialPose.skinMatrices];
@@ -299,7 +307,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
         const normalImage = m.normalTexture ? asset.images[m.normalTexture.image] : undefined;
         const normalPlan = m.normalTexture ? textureRequests.get(`${m.normalTexture.image}/false`) : undefined;
         const normalEncoding = normalPlan?.format === 'bc5-rg-unorm' ? (normalImage?.compressed?.normalY === 'down' ? 3 : 2) : Number(Boolean(m.normalTexture));
-        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), normalEncoding, Number(Boolean(m.unlit)), m.lightmapRange ?? 0, 0, 0, 0]);
+        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), normalEncoding, Number(Boolean(m.unlit)), m.lightmapRange ?? 0, Number(Boolean(m.bakedProbeLighting)), 0, 0]);
         if (data.byteLength !== materialBytes || !data.every(Number.isFinite)) fail('material factors must be finite.');
         return { buffer: buffer('Strata imported material', data, 0x40), textures: roles(m).map((ref, role) => ref ? gpuImages.get(`${ref.image}/${role === 0 || role === 4}`)! : fallbacks[Number(role === 0 || role === 4)]!), samplers: roles(m).map(sampler), doubleSided: m.doubleSided,
           definition: { ...m, baseColorFactor: [...m.baseColorFactor] as const, emissiveFactor: [...m.emissiveFactor] as const } };
@@ -341,7 +349,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
       checkSignal(signal);
       const sky = await createImportedSky(device); owned.buffers.push(sky.uniform); owned.bufferBytes += importedSkyUniformBytes;
       checkSignal(signal);
-      return new ImportedGeometry(device, asset, owned, materials, meshes, lightBuffer, textureRecords, evaluator, palettes, environment, sky);
+      return new ImportedGeometry(device, asset, owned, materials, meshes, lightBuffer, textureRecords, evaluator, palettes, environment, sky, { data: buffer('Strata baked probe data', probeState.data, 0x80), uniform: buffer('Strata baked probe settings', probeState.uniform, 0x40), state: probeState });
     } catch (cause) { for (const resource of [...owned.buffers, ...owned.textures]) resource.destroy(); throw cause; }
   }
   drawBackground(pass: GPURenderPassEncoder, camera: CameraFrame, width: number, height: number, jitter: readonly [number, number], controls: RasterControls) {
@@ -349,9 +357,11 @@ export class ImportedGeometry implements RasterGeometryGroup {
     this.sky.draw(pass, camera, width, height, jitter, snapshotEnvironment(this.settings.lighting.environment)!);
     return { drawCalls: 1, uploadBytes: importedSkyUniformBytes };
   }
+  get mixedShadowCache(): boolean { return this.meshes.some(m => m.mode === 'static' && !m.ground) && this.meshes.some(m => m.mode !== 'static'); }
   get shadowCache(): { revision: number; drawCalls: number; triangles: number } | undefined {
-    if (!this.meshes.every(mesh => mesh.mode === 'static')) return undefined;
-    const meshes = this.meshes.filter(mesh => !mesh.ground || this.settings.presentation === 'ground');
+    if (!this.mixedShadowCache && this.meshes.some(m => m.mode !== 'static')) return undefined;
+    const meshes = this.meshes.filter(mesh => mesh.mode === 'static' && (!mesh.ground || this.settings.presentation === 'ground'));
+    if (!meshes.length) return undefined;
     return { revision: this.shadowVersion, drawCalls: meshes.length, triangles: meshes.reduce((sum, mesh) => sum + mesh.indexCount / 3, 0) };
   }
   get background(): ImportedVec3 { return this.settings.background; }
@@ -385,14 +395,24 @@ export class ImportedGeometry implements RasterGeometryGroup {
   update(controls: ImportedControls = {}): boolean {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
     const next = snapshot(controls, this.settings);
-    if (next.bakedVertexLighting && this.materials.some(m => m.definition.lightmapTexture)) fail('vertex bakes cannot be combined with lightmaps.');
+    const probeControl = controls.bakedProbes;
+    if (probeControl !== undefined && (!probeControl || this.probes.state.revision === undefined || typeof probeControl.revision !== 'string' || probeControl.revision !== this.probes.state.revision || typeof probeControl.enabled !== 'boolean')) fail('baked probe revision must match the scene bake.');
+    if (next.bakedVertexLighting && this.materials.some(m => m.definition.lightmapTexture || m.definition.bakedProbeLighting)) fail('vertex bakes cannot be combined with lightmaps.');
     if (next.bakedVertexLighting && (this.indirectBaseline || this.meshes.some(mesh => mesh.mode !== 'static'))) fail('bakedVertexLighting requires immutable geometry without progressive GI.');
     if (controls.animation !== undefined && (!controls.animation || typeof controls.animation !== 'object' || Array.isArray(controls.animation))) fail('animation controls must be an object.');
     const animation = controls.animation === undefined ? this.animation : controls.animation;
     const pose = this.evaluator.evaluate(animation);
     if (controls.transforms !== undefined && (!this.acceptsTransforms || pose.clipId !== null)) fail('transforms require independent rigid roots without skins or active clips.');
-    const sources = controls.transforms === undefined ? [pose.nodeMatrices, ...pose.skinMatrices]
+    let sources = controls.transforms === undefined ? [pose.nodeMatrices, ...pose.skinMatrices]
       : [snapshotMeshTransforms(controls.transforms, pose.nodeMatrices.length / 16, this.reflectedRoots)];
+    if (controls.placement !== undefined) {
+      const placement = snapshotMeshTransforms(controls.placement, 1, [this.reflectedRoots.every(value => value !== false)]);
+      sources = sources.map(data => {
+        const placed = new Float32Array(data.length);
+        for (let offset = 0; offset < data.length; offset += 16) placed.set(multiplyMatrices(placement, data.subarray(offset, offset + 16)), offset);
+        return placed;
+      });
+    }
     // The evaluator reuses its arrays. Validate the entire candidate before copying any
     // palette or publishing controls/telemetry, so an out-of-range pose is atomic.
     const fit = this.fitLightMatrix(next, sources);
@@ -404,8 +424,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const cut = changedLighting || changedShading || next.skybox !== this.settings.skybox || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
     this.environmentDirty ||= changedShading || JSON.stringify(next.lighting.environment) !== JSON.stringify(this.settings.lighting.environment);
     if (next.presentation !== this.settings.presentation || JSON.stringify(next.lighting.directionToLight) !== JSON.stringify(this.settings.lighting.directionToLight)) this.shadowVersion++;
+    if (probeControl && this.probes.state.uniform[12] !== Number(probeControl.enabled)) { this.probes.state.uniform[12] = Number(probeControl.enabled); this.probeDirty = true; }
     this.settings = next; this.lightDirty ||= changedLighting;
-    this.visibleBounds = fit.bounds; this.light = fit.matrix; return cut || animationCut;
+    if (this.meshes.some(mesh => mesh.mode !== 'static') && fit.matrix.some((v, i) => v !== this.light[i])) this.shadowVersion++;
+    this.visibleBounds = fit.bounds; this.light = fit.matrix; return cut || animationCut || this.probeDirty;
   }
   private fitLightMatrix(settings: Settings, palettes: readonly Float32Array[]): { bounds: ImportedBounds; matrix: Float32Array<ArrayBuffer> } {
     const out = pointBounds();
@@ -433,6 +455,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   prepare(owner: boolean, reset: boolean): number {
     if (!owner) return 0;
     let uploadBytes = 0;
+    if (this.probeDirty) { this.device.queue.writeBuffer(this.probes.uniform, 0, this.probes.state.uniform); this.probeDirty = false; uploadBytes += 64; }
     if (this.lightDirty) {
       const data = new Float32Array(lightBytes / 4); data.set(this.settings.lighting.directionToLight); data.set(this.settings.lighting.color.map(v => v * this.settings.lighting.intensity), 4); data.set(this.indirectBaseline ? [0, 0, 0] : this.settings.lighting.ambient, 8);
       this.device.queue.writeBuffer(this.lightBuffer, 0, data); this.lightDirty = false; uploadBytes += lightBytes;
@@ -474,7 +497,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => i === 5 ? [{ binding: 16, resource: texture.createView() }] : [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } },
       { binding: 12, resource: this.environment.cube.createView({ dimension: '2d-array', arrayLayerCount: 12 }) },
       { binding: 13, resource: this.environment.dfg.createView() }, { binding: 14, resource: this.environment.sampler },
-      { binding: 15, resource: { buffer: this.environment.uniform } }] }));
+      { binding: 15, resource: { buffer: this.environment.uniform } }, { binding: 17, resource: { buffer: this.probes.data } }, { binding: 18, resource: { buffer: this.probes.uniform } }] }));
   }
   selectedMeshes(doubleSided: boolean, mode: DeformationMode): readonly Mesh[] { return this.meshes.filter(mesh => mesh.mode === mode && this.materials[mesh.material]!.doubleSided === doubleSided && (!mesh.ground || this.settings.presentation === 'ground')); }
   dispose(): void { if (this.disposed) return; this.disposed = true; for (const resource of [...this.owned.buffers, ...this.owned.textures]) resource.destroy(); this.current = undefined; }
@@ -488,6 +511,7 @@ class ImportedBatch implements RasterGeometryProvider {
   private bindings: { raster: readonly GPUBindGroup[]; shadow: readonly GPUBindGroup[] } | undefined;
   private deformation: { raster: ReadonlyMap<Mesh, GPUBindGroup>; shadow: ReadonlyMap<Mesh, GPUBindGroup> } | undefined;
   constructor(private readonly owner: ImportedGeometry, private readonly mode: DeformationMode, private readonly doubleSided: boolean, private readonly accountsResources: boolean) {}
+  get staticShadow(): boolean { return this.mode === 'static'; }
   get cullMode(): GPUCullMode { return this.doubleSided ? 'none' : 'back'; }
   get lightMatrix(): Float32Array<ArrayBuffer> { return this.owner.lightMatrix; }
   get gpuBufferBytes(): number { return this.accountsResources ? this.owner.gpuBufferBytes : 0; }

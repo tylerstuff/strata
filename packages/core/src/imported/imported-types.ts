@@ -1,3 +1,4 @@
+import type { BakedProbeVolume } from './baked-probes.js';
 import type { ImportedIndirectDenoise, ImportedIndirectOptions, ImportedIndirectProgress, ImportedIndirectReadback } from './imported-indirect-types.js';
 
 /** Optional glTF inspection path. No virtual geometry or scene-traced reflections. */
@@ -32,6 +33,8 @@ export interface ImportedImage {
   readonly height: number;
 }
 export interface ImportedMaterial {
+  /** Receive the scene baked probe volume; mutually exclusive with static lightmaps. */
+  readonly bakedProbeLighting?: boolean;
   readonly name: string;
   /** KHR_materials_unlit: base color bypasses lighting, metallic/roughness, normal, AO and emission. */
   readonly unlit?: boolean;
@@ -134,6 +137,7 @@ export interface LoadGltfOptions {
 }
 export interface ImportedSceneOptions {
   readonly renderer: 'imported';
+  readonly bakedProbes?: BakedProbeVolume;
   /** Directional shadow edge; default 2048. 4096 uses 64 MiB of depth storage. */
   readonly shadowMapSize?: 1024 | 2048 | 4096;
   /** Opt-in receiver-plane depth correction for close self-shadows; default pcf. */
@@ -153,6 +157,10 @@ export interface ImportedEnvironment {
   readonly rotationRadians?: number;
 }
 export interface ImportedControls {
+  /** Explicit revision must match the scene bake; omission retains the enable state. */
+  readonly bakedProbes?: { readonly revision: string; readonly enabled: boolean };
+  /** Whole-actor affine placement after animation/normalization; omission is identity. Static primitives are unaffected. */
+  readonly placement?: Float32Array<ArrayBuffer> | Float64Array<ArrayBuffer>;
   /** Complete column-major root-world matrices, one per node, consumed during render.
    * Root-only rigid scenes, no skins or active clips. Omission selects the normal
    * rest/animation pose for this frame. Matrices use final scene units, bypassing

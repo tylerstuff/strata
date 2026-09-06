@@ -1,3 +1,4 @@
+import { combineImportedAssets } from '../../packages/core/src/meshes/mixed-asset.js';
 import { createMeshAsset } from '../../packages/core/src/meshes/mesh-asset.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ImportedRenderer } from '../../packages/core/src/imported/imported-renderer.js';
@@ -21,7 +22,7 @@ function gpu() {
   const textures: { descriptor: GPUTextureDescriptor; destroy: ReturnType<typeof vi.fn>; createView: ReturnType<typeof vi.fn> }[] = [];
   const writes: { label: string; data: Float32Array }[] = [];
   const pass = { setPipeline: vi.fn(), setBindGroup: vi.fn(), setVertexBuffer: vi.fn(), setIndexBuffer: vi.fn(), drawIndexed: vi.fn(), draw: vi.fn(), end: vi.fn() };
-  const encoder = { beginRenderPass: vi.fn(() => pass), finish: vi.fn(() => ({})) };
+  const encoder = { copyTextureToTexture: vi.fn(), beginRenderPass: vi.fn(() => pass), finish: vi.fn(() => ({})) };
   const device = { features: new Set<GPUFeatureName>(), limits: { maxBufferSize: 512 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024, maxTextureDimension2D: 8192, maxBindGroups: 4, maxStorageBuffersPerShaderStage: 8, maxSampledTexturesPerShaderStage: 16, maxSamplersPerShaderStage: 16 },
     createShaderModule: vi.fn(() => ({})), createRenderPipelineAsync: vi.fn(async (descriptor: GPURenderPipelineDescriptor) => ({ label: descriptor.label, getBindGroupLayout: vi.fn((group: number) => ({ group })) })),
     createBuffer: vi.fn((d: GPUBufferDescriptor) => { const b = { label: d.label ?? '', size: d.size, destroy: vi.fn() }; buffers.push(b); return b; }),
@@ -243,6 +244,24 @@ describe('imported scene resource and temporal contracts', () => {
     expect(visible.triangles).toBe(2); expect(g.pass.drawIndexed).toHaveBeenCalledTimes(1);
     renderer.dispose();
   });
+  it('keeps static geometry cached while placed actor shadows update and stale silhouettes are restored away', async () => {
+    const g = gpu(), environment = asset();
+    const actor = createMeshAsset({ meshes: [{ name: 'actor', vertices: environment.primitives[0]!.vertices, indices: environment.primitives[0]!.indices, material: 0 }], materials: [material] });
+    const mixed = combineImportedAssets(environment, actor);
+    const renderer = await ImportedRenderer.create(g.device, 'rgba8unorm', { renderer: 'imported', asset: mixed });
+    const frame = (time: number, x: number) => renderer.encode(g.encoder, {} as GPUTextureView, 128, 128, time, { temporal: false,
+      imported: { placement: new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,0,0,1]) } });
+    frame(0, 0); renderer.submitted(1);
+    const cached = frame(.016, 0); renderer.submitted(2);
+    expect(cached.skippedGpuPasses).toEqual(['shadow-static']);
+    expect((g.encoder as unknown as {copyTextureToTexture: ReturnType<typeof vi.fn>}).copyTextureToTexture).toHaveBeenCalledTimes(2);
+    const prior = renderer.importedTelemetry.bounds;
+    expect(() => frame(.032, 9000)).toThrow(); expect(renderer.importedTelemetry.bounds).toEqual(prior);
+    const moved = frame(.032, .1); renderer.submitted(3);
+    expect(moved.skippedGpuPasses).toBeUndefined(); // fit changed/cancelled frame invalidates static depth too
+    expect(g.writes.filter(w => w.label === 'Strata imported current palette 0').at(-1)!.data[12]).toBeCloseTo(.1);
+    renderer.dispose(); for (const t of g.textures) expect(t.destroy).toHaveBeenCalledOnce();
+  });
   it('updates the shadow transform coherently for a vertical light and contains all posed bounds', async () => {
     const g = gpu(); const geometry = await ImportedGeometry.create(g.device, asset()); const before = geometry.lightMatrix.slice();
     expect(geometry.update({ lighting: { directionToLight: [0, 1, 0], color: [1, 1, 1], intensity: 2, ambient: [0, 0, 0] } })).toBe(true);
@@ -375,4 +394,33 @@ it('pairs receiver-plane filtering with zero caster slope bias and rejects inval
   await expect(ImportedRenderer.create(invalid.device, 'rgba8unorm', { renderer: 'imported', asset: asset(), shadowFilter: 'invalid' as 'pcf' })).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
   expect(invalid.raw.createBuffer).not.toHaveBeenCalled();
   expect(invalid.raw.createTexture).not.toHaveBeenCalled();
+});
+
+it('remaps actor textures without copying payloads and leaves static normalization independent', () => {
+  const environment = textured();
+  const rigid = createMeshAsset({ meshes: asset().primitives, materials: [material] });
+  const actor = { ...rigid, images: environment.images, materials: environment.materials,
+    normalization: { scale: 2, translation: [1,2,3] as const } };
+  const mixed = combineImportedAssets(environment, actor, { bakedProbeLighting: true });
+  expect(mixed.materials[1]!.baseColorTexture!.image).toBe(1);
+  expect(mixed.materials[1]!.emissiveTexture!.image).toBe(1);
+  expect(mixed.materials[1]!.bakedProbeLighting).toBe(true);
+  expect(mixed.materials[0]).toBe(environment.materials[0]);
+  expect(mixed.primitives[0]).toBe(environment.primitives[0]);
+  expect(mixed.primitives[1]!.vertices).toBe(actor.primitives[0]!.vertices);
+  expect(mixed.normalization).toBe(actor.normalization);
+  expect(environment.materials[0]!.baseColorTexture!.image).toBe(0);
+  expect(() => combineImportedAssets(rigid, actor)).toThrow();
+  expect(() => combineImportedAssets(environment, environment)).toThrow();
+});
+
+it('rejects probe controls without a loaded volume before changing the pose or allocations', async () => {
+  const g = gpu(), geometry = await ImportedGeometry.create(g.device, asset());
+  const before = geometry.telemetry, allocations = g.buffers.length;
+  for (const bakedProbes of [{enabled:true}, {revision:'missing',enabled:true}]) {
+    expect(() => geometry.update({bakedProbes} as never)).toThrow(/revision/);
+    expect(geometry.telemetry).toEqual(before);
+    expect(g.buffers.length).toBe(allocations);
+  }
+  geometry.dispose();
 });

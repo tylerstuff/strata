@@ -73,6 +73,8 @@ interface StaticResources {
   readonly frameUniform: GPUBuffer;
   readonly presentationUniform: GPUBuffer;
   readonly shadowView: GPUTextureView;
+  readonly shadowTexture: GPUTexture;
+  readonly staticShadowTexture: GPUTexture | undefined;
   readonly geometryPipelines: readonly GeometryPipeline[];
   readonly presentationPipeline: GPURenderPipeline;
   readonly bufferBytes: number;
@@ -184,7 +186,9 @@ export class RasterRenderer {
       const mrTexture = texture('Strata linear metallic-roughness fixture', materialSize, 'rgba8unorm', textureUsage.copyDestination | textureUsage.binding);
       device.queue.writeTexture({ texture: baseTexture }, material.baseColor, { bytesPerRow: materialSize * 4 }, [materialSize, materialSize]);
       device.queue.writeTexture({ texture: mrTexture }, material.metallicRoughness, { bytesPerRow: materialSize * 4 }, [materialSize, materialSize]);
-      const shadowTexture = texture('Strata directional shadow depth', shadowSize, 'depth32float', textureUsage.binding | textureUsage.attachment);
+      const mixedShadows = !!(geometry && 'mixedShadowCache' in geometry && geometry.mixedShadowCache);
+      const shadowTexture = texture('Strata directional shadow depth', shadowSize, 'depth32float', textureUsage.binding | textureUsage.attachment | (mixedShadows ? 0x2 : 0));
+      const staticShadowTexture = mixedShadows ? texture('Strata immutable shadow cache', shadowSize, 'depth32float', 0x10 | 0x1) : undefined;
       const shadowView = shadowTexture.createView();
       const materialSampler = device.createSampler({ label: 'Strata repeating material sampler', addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear' });
       const shadowSampler = device.createSampler({ label: 'Strata shadow comparison sampler', compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' });
@@ -205,7 +209,7 @@ export class RasterRenderer {
       const geometryBytes = data ? data.vertices.byteLength + data.indices.byteLength + data.instances.byteLength : 0;
       return new RasterRenderer(device, {
         buffers, textures, vertices, indices, instances, frameUniform, presentationUniform,
-        shadowView, geometryPipelines, presentationPipeline,
+        shadowView, shadowTexture, staticShadowTexture, geometryPipelines, presentationPipeline,
         bufferBytes: geometryBytes + frameUniformBytes + presentationUniformBytes,
         initialUploadBytes: geometryBytes + material.baseColor.byteLength + material.metallicRoughness.byteLength,
       }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry, gi, shadowSize);
@@ -220,7 +224,7 @@ export class RasterRenderer {
   get gpuBufferBytes(): number { return this.disposed ? 0 : this.resources.bufferBytes + this.temporal.gpuBufferBytes + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.gpuBufferBytes ?? 0), 0) + (this.gi?.gpuBufferBytes ?? 0); }
   get gpuTextureBytes(): number {
     if (this.disposed) return 0;
-    return this.shadowSize * this.shadowSize * 4 + materialSize * materialSize * 8
+    return this.shadowSize * this.shadowSize * (this.resources.staticShadowTexture ? 8 : 4) + materialSize * materialSize * 8
       + (this.targets ? this.targets.width * this.targets.height * 32 : 0) + this.temporal.gpuTextureBytes + (this.gi?.gpuTextureBytes ?? 0)
       + this.resources.geometryPipelines.reduce((sum, pair) => sum + (pair.provider?.gpuTextureBytes ?? 0), 0);
   }
@@ -233,7 +237,7 @@ export class RasterRenderer {
   passNames(controls: RasterControls = {}): readonly RasterPassName[] {
     const geometryPass: RasterPassName[] = this.resources.geometryPipelines.some(pair => pair.provider?.selectionPass) ? ['selection'] : [];
     return [
-      ...(this.gi?.active ? this.gi.preparePassNames ?? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, 'shadow', 'raster',
+      ...(this.gi?.active ? this.gi.preparePassNames ?? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, ...(this.resources.staticShadowTexture ? ['shadow-static'] as const : []), 'shadow', 'raster',
       ...(this.gi?.active ? this.gi.composePassNames ?? ['gi-shade'] as const : []),
       ...(normalizeRasterControls(controls).temporal ? ['temporal'] as const : []), 'presentation',
     ];
@@ -299,8 +303,9 @@ export class RasterRenderer {
     // History remains on the jittered raster grid; undo that phase only for display.
     new Float32Array(presentationData).set(jitter, 4);
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
-    const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow'): void => {
+    const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow', staticOnly?: boolean): void => {
       for (const pair of this.resources.geometryPipelines) {
+        if (staticOnly !== undefined && pair.provider?.staticShadow !== staticOnly) continue;
         pass.setPipeline(phase === 'shadow' ? pair.shadowPipeline : pair.rasterPipeline);
         pass.setBindGroup(0, phase === 'shadow' ? pair.shadowBindings : pair.rasterBindings);
         if (pair.provider) pair.provider.draw(pass, phase);
@@ -314,12 +319,25 @@ export class RasterRenderer {
     const shadowCache = this.geometry && 'shadowCache' in this.geometry ? this.geometry.shadowCache : undefined;
     const shadowRevision = shadowCache?.revision;
     const reuseShadow = !reset && shadowRevision !== undefined && shadowRevision === this.cachedShadowRevision;
-    if (!reuseShadow) {
+    const staticDepth = this.resources.staticShadowTexture;
+    if (staticDepth) {
+      if (!reuseShadow) {
+        const cached = encoder.beginRenderPass({ label: 'Strata immutable directional casters', colorAttachments: [],
+          depthStencilAttachment: { view: staticDepth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+          ...(timestamps['shadow-static'] ? { timestampWrites: timestamps['shadow-static'] } : {}) });
+        drawGeometry(cached, 'shadow', true); this.cachedShadowRevision = shadowRevision;
+      }
+      // Restore immutable depth first: prior dynamic silhouettes must never accumulate.
+      encoder.copyTextureToTexture({ texture: staticDepth }, { texture: this.resources.shadowTexture }, [this.shadowSize, this.shadowSize]);
+      const moving = encoder.beginRenderPass({ label: 'Strata moving directional casters', colorAttachments: [],
+        depthStencilAttachment: { view: this.resources.shadowView, depthLoadOp: 'load', depthStoreOp: 'store' },
+        ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
+      drawGeometry(moving, 'shadow', false);
+    } else if (!reuseShadow) {
       const shadow = encoder.beginRenderPass({ label: 'Strata directional shadow', colorAttachments: [],
         depthStencilAttachment: { view: this.resources.shadowView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
         ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
-      drawGeometry(shadow, 'shadow');
-      this.cachedShadowRevision = shadowRevision;
+      drawGeometry(shadow, 'shadow'); this.cachedShadowRevision = shadowRevision;
     }
     const raster = encoder.beginRenderPass({ label: 'Strata PBR and shared geometry outputs', colorAttachments: [
       { view: targets.views.hdr, clearValue: this.geometry?.background ? [...this.geometry.background, 1] : { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
@@ -341,7 +359,7 @@ export class RasterRenderer {
       drawCalls -= shadowCache!.drawCalls;
       triangles -= shadowCache!.triangles;
     }
-    let skippedGpuPasses: readonly RasterPassName[] | undefined = reuseShadow ? ['shadow'] : undefined;
+    let skippedGpuPasses: readonly RasterPassName[] | undefined = reuseShadow ? [staticDepth ? 'shadow-static' : 'shadow'] : undefined;
     if (this.gi?.active) {
       const composed = this.gi.compose(encoder, targets.views, camera, width, height, timeSeconds, settings, timestamps);
       resolved = composed.view; dispatchCalls += composed.dispatchCalls; uploadBytes += composed.uploadBytes;
