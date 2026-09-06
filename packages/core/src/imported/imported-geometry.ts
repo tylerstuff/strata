@@ -1,3 +1,4 @@
+import { importedEnvironmentUploadBytes } from './imported-limits.js';
 import { prepareBakedProbes, type BakedProbeVolume } from './baked-probes.js';
 import { partitionImportedIndices, importedFrustumPlanes, importedBoundsVisible, type ImportedDrawRange } from './imported-visibility.js';
 import { createImportedSky, importedSkyUniformBytes } from './imported-sky.js';
@@ -345,7 +346,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
       const environment = createEnvironmentResources(device);
       owned.textures.push(environment.cube, environment.dfg); owned.buffers.push(environment.uniform);
       owned.textureBytes += environmentTextureBytes; owned.bufferBytes += environmentUniformBytes;
-      owned.initialUploadBytes += environmentTextureBytes + environmentUniformBytes;
+      owned.initialUploadBytes += importedEnvironmentUploadBytes + environmentUniformBytes;
       checkSignal(signal);
       const sky = await createImportedSky(device); owned.buffers.push(sky.uniform); owned.bufferBytes += importedSkyUniformBytes;
       checkSignal(signal);

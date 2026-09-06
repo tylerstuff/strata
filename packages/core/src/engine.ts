@@ -303,7 +303,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
     }
     const profilingEnabled = options.profiling === true;
     const gpuTimestampAvailable = profilingEnabled && device.features.has('timestamp-query') && !timestampRequestFailed;
-    if (gpuTimestampAvailable) profiler = new GpuProfiler(device);
+    if (gpuTimestampAvailable) profiler = new GpuProfiler(device, 16);
     const adapterInfo = adapter.info;
     const info: EngineInfo = Object.freeze({
       format,
@@ -351,6 +351,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Engine
         wasmMemoryBytes: cpu?.info.memoryBytes ?? 0,
         pendingGpuSamples: profiler?.pendingSamples ?? 0,
         droppedGpuSamples: profiler?.droppedSamples ?? 0,
+        ...(profiler ? { gpuProfiling: profiler.diagnostics } : {}),
         gpuErrorCount, lastGpuError,
         ...(scene?.kind === 'virtual' || scene?.kind === 'integrated' ? { geometry: scene.value.geometryTelemetry } : {}),
         ...(scene?.kind === 'gi' || scene?.kind === 'reflections' || scene?.kind === 'integrated' ? { gi: scene.value.giTelemetry } : {}),

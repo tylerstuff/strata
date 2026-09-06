@@ -1,3 +1,5 @@
+import { uploadEnvironmentLevel, environmentAtlasWidth, environmentAtlasHeight } from './imported-environment-atlas.js';
+export { uploadEnvironmentLevel } from './imported-environment-atlas.js';
 import { StrataError } from '../errors.js';
 import type { ImportedEnvironment } from './imported-types.js';
 import { environmentCubeData, environmentDfgData, environmentMetadata } from './imported-environment-data.js';
@@ -39,16 +41,14 @@ export function createEnvironmentResources(device: GPUDevice): {
 } {
   let cube: GPUTexture | undefined, dfg: GPUTexture | undefined, uniform: GPUBuffer | undefined;
   try {
-    cube = device.createTexture({ label: 'Strata generated studio/sky GGX radiance', size: [64, 64, 12], mipLevelCount: 7,
+    cube = device.createTexture({ label: 'Strata generated studio/sky GGX radiance', size: [environmentAtlasWidth, environmentAtlasHeight, 12],
       format: 'rgba16float', usage: 0x2 | 0x4 });
-    for (const [index, preset] of (['studio', 'sky'] as const).entries()) {
-      const bytes = decode(environmentCubeData[preset], 262128); let offset = 0;
-      for (let level = 0; level < 7; level++) {
-        const edge = 64 >> level, length = edge * edge * 6 * 8;
-        device.queue.writeTexture({ texture: cube, mipLevel: level, origin: [0, 0, index * 6] }, bytes.subarray(offset, offset + length),
-          { bytesPerRow: edge * 8, rowsPerImage: edge }, [edge, edge, 6]);
-        offset += length;
-      }
+    const presets = [decode(environmentCubeData.studio, 262128),decode(environmentCubeData.sky, 262128)];
+    let offset=0;
+    for(let level=0;level<7;level++) {
+      const edge=64>>level,length=edge*edge*6*8, combined=new Uint8Array(length*2);
+      presets.forEach((bytes,index)=>combined.set(bytes.subarray(offset,offset+length),index*length));
+      uploadEnvironmentLevel(device,cube,level,new Uint16Array(combined.buffer));offset+=length;
     }
     dfg = device.createTexture({ label: 'Strata generated correlated GGX DFG', size: [64, 64], format: 'rg16float', usage: 0x2 | 0x4 });
     device.queue.writeTexture({ texture: dfg }, decode(environmentDfgData, 16384), { bytesPerRow: 64 * 4 }, [64, 64]);

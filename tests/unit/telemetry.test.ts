@@ -373,7 +373,7 @@ describe('engine telemetry and scene ownership', () => {
     expect(f.adapter.requestDevice).toHaveBeenCalledWith(expect.objectContaining({ requiredFeatures: ['timestamp-query'] }));
     expect(engine.info.profiling.reason).toBe('available');
     const frame = engine.render();
-    expect(frame.allocatedGpuBufferBytes).toBe(1280);
+    expect(frame.allocatedGpuBufferBytes).toBe(5120);
     expect(engine.getTelemetry().pendingGpuSamples).toBe(1);
     expect(f.encoder.beginRenderPass).toHaveBeenCalledWith(expect.objectContaining({ timestampWrites: expect.any(Object) }));
     f.buffers[1]!.mapping.resolve();
@@ -729,4 +729,19 @@ describe('engine telemetry and scene ownership', () => {
     expect(internalSignal?.aborted).toBe(false);
     expect(value.dispose).not.toHaveBeenCalled();
   });
+});
+
+it('distinguishes readback pressure, failed maps, cancellation and result eviction', async () => {
+  const f = fixture(), profiler = new GpuProfiler(f.device as unknown as GPUDevice, 2, 1);
+  const first = profiler.begin(1, ['raster'])!, second = profiler.begin(2, ['raster'])!;
+  expect(profiler.begin(3, ['raster'])).toBeNull();
+  expect(profiler.diagnostics).toMatchObject({pendingFrames:2,skippedFrames:1,failedReadbacks:0});
+  profiler.submitted(first); f.buffers[1]!.mapping.reject(Error('failed map'));
+  await profiler.flush(); profiler.cancel(second);
+  expect(profiler.diagnostics).toMatchObject({pendingFrames:0,failedReadbacks:1,cancelledFrames:1});
+  profiler.dispose();
+  const other = fixture(), queue = new GpuProfiler(other.device as unknown as GPUDevice, 1, 1);
+  for (const frameId of [1,2]) {const slot=queue.begin(frameId,['raster'])!;queue.submitted(slot);other.buffers[1]!.mapping.resolve();await queue.flush();}
+  expect(queue.diagnostics).toMatchObject({evictedFrames:1,skippedFrames:0,failedReadbacks:0});
+  expect(queue.drain().map(sample=>sample.frameId)).toEqual([2]);queue.dispose();
 });

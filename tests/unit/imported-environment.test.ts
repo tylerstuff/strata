@@ -38,7 +38,7 @@ describe('generated distant environment numeric contract', () => {
       expect(sha(cube)).toBe(environmentMetadata.environments[preset].sha256); total += cube.length;
       for (let index = 0; index < cube.length; index += 2) expect(cube.readUInt16LE(index)).toBeLessThan(0x7c00);
     }
-    expect(total).toBe(environmentTextureBytes); expect(total).toBeLessThan(529 * 1024);
+    expect(total).toBe(540640); expect(environmentTextureBytes).toBe(66*141*12*8+16384);
     for (let index = 0; index < bytes.length; index += 4) {
       const a = decodeHalf(bytes.readUInt16LE(index)), b = decodeHalf(bytes.readUInt16LE(index + 2));
       expect(a).toBeGreaterThanOrEqual(0); expect(b).toBeGreaterThanOrEqual(0); expect(a + b).toBeLessThan(1.02);
