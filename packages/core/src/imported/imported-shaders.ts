@@ -107,7 +107,7 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   if (importedMaterial.alpha.y > 0.5 && alpha < importedMaterial.alpha.x) { discard; }
 }
 @fragment fn importedFragment(input: ImportedVertexOutput, @builtin(front_facing) front: bool) -> GBufferOutput {
-  let shadow = shadowVisibility(input.world);
+  let shadowGradient = shadowReceiverGradient(input.world);
   let baseSample = textureSample(importedBase, importedBaseSampler, input.uv);
   let mr = textureSample(importedMr, importedMrSampler, input.uv);
   let normalSample = textureSample(importedNormal, importedNormalSampler, input.uv).xyz * 2.0 - 1.0;
@@ -115,6 +115,7 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let emission = textureSample(importedEmissive, importedEmissiveSampler, input.uv).rgb * importedMaterial.emissive.rgb * importedMaterial.emissive.a;
   let base = baseSample * importedMaterial.base * input.color;
   if (importedMaterial.alpha.y > 0.5 && base.a < importedMaterial.alpha.x) { discard; }
+  let shadow = shadowVisibilityPrepared(input.world, shadowGradient);
   let relit = importedMaterial.alpha.w > 0.5 && importedEnvironmentSettings.modes.x > 0.5;
   let unlit = importedMaterial.alpha.w > 0.5 && !relit;
   let roughness = select(clamp(mr.g * importedMaterial.factors.y, 0.06, 1.0), 0.65, relit);

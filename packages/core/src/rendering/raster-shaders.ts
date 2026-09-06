@@ -1,5 +1,7 @@
 export const legacyShadowShader = /* wgsl */ `
-fn shadowVisibility(world: vec3f) -> f32 {
+fn shadowReceiverGradient(world: vec3f) -> vec2f { return vec2f(0.0); }
+fn shadowVisibility(world: vec3f) -> f32 { return shadowVisibilityPrepared(world, vec2f(0.0)); }
+fn shadowVisibilityPrepared(world: vec3f, gradient: vec2f) -> f32 {
   let clip = frame.lightViewProjection * vec4f(world, 1.0);
   let ndc = clip.xyz / clip.w;
   let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
@@ -16,7 +18,7 @@ fn shadowVisibility(world: vec3f) -> f32 {
 `;
 
 export const receiverPlaneShadowShader = /* wgsl */ `
-fn shadowVisibility(world: vec3f) -> f32 {
+fn shadowReceiverGradient(world: vec3f) -> vec2f {
   let clip = frame.lightViewProjection * vec4f(world, 1.0);
   let ndc = clip.xyz / clip.w;
   let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
@@ -32,6 +34,15 @@ fn shadowVisibility(world: vec3f) -> f32 {
   if (abs(determinant) > max(1e-30, length(dx.xy) * length(dy.xy) * 1e-5)) {
     gradient = vec2f(dx.z * dy.y - dy.z * dx.y, dx.x * dy.z - dy.x * dx.z) / determinant;
   }
+  return gradient;
+}
+fn shadowVisibility(world: vec3f) -> f32 {
+  return shadowVisibilityPrepared(world, shadowReceiverGradient(world));
+}
+fn shadowVisibilityPrepared(world: vec3f, gradient: vec2f) -> f32 {
+  let clip = frame.lightViewProjection * vec4f(world, 1.0);
+  let ndc = clip.xyz / clip.w;
+  let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
   if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z <= 0.0 || ndc.z >= 1.0) { return 1.0; }
   let dimensions = vec2i(textureDimensions(shadowTexture));
   let position = uv * vec2f(dimensions) - vec2f(0.5);

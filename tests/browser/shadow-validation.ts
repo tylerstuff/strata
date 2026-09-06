@@ -29,7 +29,11 @@ export async function validateReceiverPlaneShadows() {
           @group(0) @binding(0) var shadowTexture: texture_depth_2d;
           @group(0) @binding(1) var shadowSampler: sampler_comparison;
           ${vertex} ${code}
-          @fragment fn fragment(v: V) -> @location(0) vec4f { return vec4f(shadowVisibility(v.world)); }` });
+          @fragment fn fragment(v: V) -> @location(0) vec4f {
+            let gradient = shadowReceiverGradient(v.world);
+            if (v.world.x > 0.5) { discard; }
+            return vec4f(shadowVisibilityPrepared(v.world, gradient));
+          }` });
         const layout = device.createBindGroupLayout({ entries: [
           { binding: 0, visibility: 2, texture: { sampleType: 'depth' } },
           { binding: 1, visibility: 2, sampler: { type: 'comparison' } },
@@ -46,11 +50,12 @@ export async function validateReceiverPlaneShadows() {
         encoder.copyTextureToBuffer({ texture: output }, { buffer: readback, bytesPerRow: 64 * 16 }, [64, 64]);
         device.queue.submit([encoder.finish()]); await readback.mapAsync(1);
         const values = new Float32Array(readback.getMappedRange()); let sum = 0, count = 0;
-        for (let y = 4; y < 60; y++) for (let x = 4; x < 60; x++) {
+        for (let y = 4; y < 60; y++) for (let x = 4; x < 44; x++) {
           const value = values[(y * 64 + x) * 4]!;
           if (!Number.isFinite(value)) throw new Error('Non-finite shadow visibility.');
           sum += value; count++;
         }
+        if (values[(32 * 64 + 60) * 4] !== 0) throw new Error('Masked receiver must preserve the cleared output.');
         readback.unmap(); const mean = sum / count;
         results[`${name}/${slope}/${separation}`] = mean;
         if (name === 'corrected' && Math.abs(mean - (separation === 0 ? 1 : 0)) > 0.001) throw new Error(`Receiver plane regression: ${JSON.stringify(results)}`);
