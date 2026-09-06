@@ -30,6 +30,17 @@ struct ImportedLight { direction: vec4f, radiance: vec4f, ambient: vec4f, };
 @group(1) @binding(10) var importedEmissiveSampler: sampler;
 @group(1) @binding(11) var<uniform> importedLight: ImportedLight;
 @group(1) @binding(16) var importedLightmap: texture_2d<f32>;
+@group(1) @binding(22) var importedBakedPoint: texture_2d<f32>;
+fn bakedPointTexel(p: vec2i) -> vec3f {
+  let extent=vec2i(textureDimensions(importedBakedPoint));
+  let value=textureLoad(importedBakedPoint,clamp(p,vec2i(0),extent-1),0);
+  return value.rgb*value.a*importedMaterial.lightmap.w;
+}
+fn bakedPointDiffuse(uv: vec2f) -> vec3f {
+  let p=clamp(uv,vec2f(0.0),vec2f(1.0))*vec2f(textureDimensions(importedBakedPoint))-0.5;
+  let cell=vec2i(floor(p));let f=fract(p);
+  return mix(mix(bakedPointTexel(cell),bakedPointTexel(cell+vec2i(1,0)),f.x),mix(bakedPointTexel(cell+vec2i(0,1)),bakedPointTexel(cell+vec2i(1,1)),f.x),f.y);
+}
 fn lightmapTexel(p: vec2i) -> vec3f {
   let extent = vec2i(textureDimensions(importedLightmap));
   let encoded = textureLoad(importedLightmap, clamp(p, vec2i(0), extent - vec2i(1)), 0);
@@ -162,7 +173,15 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   let fill = base.rgb * (1.0 - metallic) * importedLight.ambient.rgb * materialAo;
   let environment = importedEnvironmentLight(base.rgb, roughness, metallic, normal, view, materialAo);
   var lightmapped = vec3f(0.0);
-  if (importedMaterial.lightmap.x > 0.0) { lightmapped = base.rgb * (1.0 - metallic) * lightmapDiffuse(input.lightmapUv); }
+  if (importedMaterial.lightmap.x > 0.0) {
+    var irradiance=lightmapDiffuse(input.lightmapUv);
+    let distance=length(input.world-importedPoint.positionRange.xyz);
+    if (importedMaterial.lightmap.w > 0.0 && importedPoint.controls.w > 0.5 && distance >= importedPoint.controls.y && distance < importedPoint.positionRange.w) {
+      let contribution=min(irradiance,bakedPointDiffuse(input.lightmapUv));
+      if (any(contribution > vec3f(0.0))) { irradiance-=contribution*(1.0-pointVisibility(input.world,worldDx,worldDy,true)); }
+    }
+    lightmapped=base.rgb*(1.0-metallic)*irradiance;
+  }
   if (importedMaterial.lightmap.y > 0.5) { lightmapped += base.rgb * (1.0 - metallic) * bakedProbeDiffuse(input.world, normal); }
   var local = vec3f(0.0);
   if (importedMaterial.lightmap.z > 0.5) { local = pointDirect(input.world, worldDx, worldDy, base.rgb, roughness, metallic, normal, view); }

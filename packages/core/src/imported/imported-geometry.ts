@@ -93,6 +93,13 @@ function validateMaterial(material: ImportedMaterial): void {
     if (!Array.isArray(value) || value.length !== length) fail(`${name} must contain exactly ${length} components.`);
     for (const component of value) factor(component, name, 0, 1);
   };
+  if (material.bakedPointLightTexture) {
+    if (!material.lightmapTexture || !material.bakedPointLight) fail('baked lamp layers require a combined lightmap and fixed light descriptor.');
+    factor(material.bakedPointLightRange, 'bakedPointLightRange', .000001, 65536);
+    snapshotPointLight(material.bakedPointLight);
+    const s=material.bakedPointLightTexture.sampler;
+    if (!s || s.wrapS!==33071 || s.wrapT!==33071 || s.magFilter!==9729 || s.minFilter!==9729) fail('baked lamp layers require clamp bilinear sampling without mipmaps.');
+  } else if (material.bakedPointLightRange!==undefined || material.bakedPointLight!==undefined) fail('baked lamp descriptors require a contribution texture.');
   if (material.localLighting !== undefined && typeof material.localLighting !== 'boolean') fail('localLighting must be boolean.');
   if (material.localLighting && (material.lightmapTexture || material.unlit)) fail('local receivers must be lit without combined static lightmaps.');
   if (material.bakedProbeLighting !== undefined && typeof material.bakedProbeLighting !== 'boolean') fail('bakedProbeLighting must be boolean.');
@@ -185,7 +192,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (!Number.isSafeInteger(asset.maxTextureDimension) || asset.maxTextureDimension < 1 || asset.maxTextureDimension > 16384) fail('invalid texture edge cap.');
     vector(asset.bounds.min, 'bounds min', 1024); vector(asset.bounds.max, 'bounds max', 1024);
     if (asset.bounds.min.some((v, i) => v > asset.bounds.max[i]!)) fail('bounds are inverted.');
-    if (device.limits.maxSampledTexturesPerShaderStage < 10 || device.limits.maxSamplersPerShaderStage < 7 || device.limits.maxBindGroups < 2) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported PBR/environment needs ten sampled textures, seven samplers and two bind groups.');
+    if (device.limits.maxSampledTexturesPerShaderStage < 12 || device.limits.maxSamplersPerShaderStage < 7 || device.limits.maxBindGroups < 2) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported PBR/environment needs twelve sampled textures, seven samplers and two bind groups.');
     const probeState = prepareBakedProbes(bakedProbes);
     const lightCandidate = pointLight === undefined ? undefined : snapshotPointLight(pointLight);
     if (lightCandidate && lightCandidate.shadowMapSize! > device.limits.maxTextureDimension2D) throw new StrataError('UNSUPPORTED_LIMIT', 'Point shadow edge exceeds device limits.');
@@ -193,6 +200,9 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (asset.materials.some(m => m.localLighting && m.bakedProbeLighting) && bakedProbes?.transport !== 'indirect') fail('local direct lighting requires indirect-only probes.');
     if (device.limits.maxStorageBuffersPerShaderStage < 1 || probeState.data.byteLength > device.limits.maxStorageBufferBindingSize || probeState.data.byteLength > device.limits.maxBufferSize) throw new StrataError('UNSUPPORTED_LIMIT', 'Baked probe storage exceeds device limits.');
     if (asset.materials.some(m => m.bakedProbeLighting) && !bakedProbes) fail('probe receivers need a baked volume.');
+    for (const m of asset.materials) if (m.bakedPointLight) {
+      if (!lightCandidate || JSON.stringify(snapshotPointLight({...m.bakedPointLight,shadowMapSize:512})) !== JSON.stringify(snapshotPointLight({...lightCandidate,shadowMapSize:512}))) fail('baked lamp descriptor must match the fixed scene point light.');
+    }
     const evaluator = createImportedPoseEvaluator(asset);
     const initialPose = evaluator.evaluate();
     const initialPalettes = [initialPose.nodeMatrices, ...initialPose.skinMatrices];
@@ -207,7 +217,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
       format: record.format, sourceMip: record.sourceMip, image: record.image, srgb: record.colorSpace === 'srgb', extent: { width: record.uploadWidth, height: record.uploadHeight, mipLevels: record.mipLevels, bytes: record.gpuBytes },
     } ]));
     const definitions = [...asset.materials, groundMaterial];
-    const roles = (m: ImportedMaterial) => [m.baseColorTexture, m.metallicRoughnessTexture, m.normalTexture, m.occlusionTexture, m.emissiveTexture, m.lightmapTexture];
+    const roles = (m: ImportedMaterial) => [m.baseColorTexture, m.metallicRoughnessTexture, m.normalTexture, m.occlusionTexture, m.emissiveTexture, m.lightmapTexture, m.bakedPointLightTexture];
     for (const material of definitions) {
       validateMaterial(material);
       for (const ref of roles(material)) {
@@ -316,10 +326,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
         const normalImage = m.normalTexture ? asset.images[m.normalTexture.image] : undefined;
         const normalPlan = m.normalTexture ? textureRequests.get(`${m.normalTexture.image}/false`) : undefined;
         const normalEncoding = normalPlan?.format === 'bc5-rg-unorm' ? (normalImage?.compressed?.normalY === 'down' ? 3 : 2) : Number(Boolean(m.normalTexture));
-        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), normalEncoding, Number(Boolean(m.unlit)), m.lightmapRange ?? 0, Number(Boolean(m.bakedProbeLighting)), Number(Boolean(m.localLighting)), 0]);
+        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), normalEncoding, Number(Boolean(m.unlit)), m.lightmapRange ?? 0, Number(Boolean(m.bakedProbeLighting)), Number(Boolean(m.localLighting)), m.bakedPointLightRange ?? 0]);
         if (data.byteLength !== materialBytes || !data.every(Number.isFinite)) fail('material factors must be finite.');
         return { buffer: buffer('Strata imported material', data, 0x40), textures: roles(m).map((ref, role) => ref ? gpuImages.get(`${ref.image}/${role === 0 || role === 4}`)! : fallbacks[Number(role === 0 || role === 4)]!), samplers: roles(m).map(sampler), doubleSided: m.doubleSided,
-          definition: { ...m, baseColorFactor: [...m.baseColorFactor] as const, emissiveFactor: [...m.emissiveFactor] as const } };
+          definition: { ...m, ...(m.bakedPointLight ? {bakedPointLight:snapshotPointLight({...m.bakedPointLight,shadowMapSize:512})}:{}), baseColorFactor: [...m.baseColorFactor] as const, emissiveFactor: [...m.emissiveFactor] as const } };
       });
       const palettes = initialPalettes.map((data, index) => ({ current: buffer(`Strata imported current palette ${index}`, data.length ? data : new Float32Array(16), 0x80),
         previous: buffer(`Strata imported previous palette ${index}`, data.length ? data : new Float32Array(16), 0x80), data: data.slice(), committed: data.slice() }));
@@ -414,6 +424,9 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
     const next = snapshot(controls, this.settings);
     const pointCandidate = this.point.candidate(controls.pointLight);
+    const fixed = this.materials.find(m=>m.definition.bakedPointLight)?.definition.bakedPointLight;
+    if (fixed && JSON.stringify(snapshotPointLight({...fixed,shadowMapSize:512})) !== JSON.stringify(snapshotPointLight({...pointCandidate!,shadowMapSize:512}))) fail('baked lamp controls are fixed; rebake before changing the light.');
+    if (controls.bakedShadows !== undefined && (typeof controls.bakedShadows !== 'boolean' || !fixed)) fail('bakedShadows requires a baked lamp layer and a boolean.');
     const probeControl = controls.bakedProbes;
     if (probeControl !== undefined && (!probeControl || this.probes.state.revision === undefined || typeof probeControl.revision !== 'string' || probeControl.revision !== this.probes.state.revision || typeof probeControl.enabled !== 'boolean')) fail('baked probe revision must match the scene bake.');
     if (next.bakedVertexLighting && this.materials.some(m => m.definition.lightmapTexture || m.definition.bakedProbeLighting || m.definition.localLighting)) fail('vertex bakes cannot be combined with lightmaps.');
@@ -441,8 +454,9 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const changedLighting = JSON.stringify(next.lighting) !== JSON.stringify(this.settings.lighting);
     const changedShading = next.shading !== this.settings.shading || JSON.stringify(next.bakedVertexLighting) !== JSON.stringify(this.settings.bakedVertexLighting);
     const changedPoint = this.point.commit(pointCandidate);
+    const changedBakedShadows = controls.bakedShadows === undefined ? false : this.point.setBakedShadows(controls.bakedShadows);
     if (next.presentation !== this.settings.presentation) this.point.invalidate();
-    const cut = changedPoint || changedLighting || changedShading || next.skybox !== this.settings.skybox || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
+    const cut = changedBakedShadows || changedPoint || changedLighting || changedShading || next.skybox !== this.settings.skybox || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
     this.environmentDirty ||= changedShading || JSON.stringify(next.lighting.environment) !== JSON.stringify(this.settings.lighting.environment);
     if (next.presentation !== this.settings.presentation || JSON.stringify(next.lighting.directionToLight) !== JSON.stringify(this.settings.lighting.directionToLight)) this.shadowVersion++;
     if (probeControl && this.probes.state.uniform[12] !== Number(probeControl.enabled)) { this.probes.state.uniform[12] = Number(probeControl.enabled); this.probeDirty = true; }
@@ -515,10 +529,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
   materialBindings(pipeline: GPURenderPipeline, shadow: boolean): readonly GPUBindGroup[] {
     return this.materials.map(m => this.device.createBindGroup({ label: 'Strata imported material bindings', layout: pipeline.getBindGroupLayout(1), entries: shadow ? [
       { binding: 0, resource: { buffer: m.buffer } }, { binding: 1, resource: m.textures[0]!.createView() }, { binding: 2, resource: m.samplers[0]! },
-    ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => i === 5 ? [{ binding: 16, resource: texture.createView() }] : [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } },
+    ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => i === 6 ? [{ binding: 22, resource: texture.createView() }] : i === 5 ? [{ binding: 16, resource: texture.createView() }] : [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } },
       { binding: 12, resource: this.environment.cube.createView({ dimension: '2d-array', arrayLayerCount: 12 }) },
       { binding: 13, resource: this.environment.dfg.createView() }, { binding: 14, resource: this.environment.sampler },
-      { binding: 15, resource: { buffer: this.environment.uniform } }, { binding: 17, resource: { buffer: this.probes.data } }, { binding: 18, resource: { buffer: this.probes.uniform } }, { binding: 19, resource: { buffer: this.point.uniform } }, { binding: 20, resource: this.point.texture.createView({ dimension: '2d-array', arrayLayerCount: 6 }) }] }));
+      { binding: 15, resource: { buffer: this.environment.uniform } }, { binding: 17, resource: { buffer: this.probes.data } }, { binding: 18, resource: { buffer: this.probes.uniform } }, { binding: 19, resource: { buffer: this.point.uniform } }, { binding: 20, resource: this.point.texture.createView({ dimension: '2d-array', arrayLayerCount: 6 }) }, { binding: 21, resource: (this.point.cache ?? this.point.texture).createView({ dimension: '2d-array', arrayLayerCount: 6 }) }] }));
   }
   selectedMeshes(doubleSided: boolean, mode: DeformationMode): readonly Mesh[] { return this.meshes.filter(mesh => mesh.mode === mode && this.materials[mesh.material]!.doubleSided === doubleSided && (!mesh.ground || this.settings.presentation === 'ground')); }
   dispose(): void { if (this.disposed) return; this.disposed = true; for (const resource of [...this.owned.buffers, ...this.owned.textures]) resource.destroy(); this.current = undefined; }

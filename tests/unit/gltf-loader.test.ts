@@ -384,6 +384,13 @@ describe('static lightmap glTF contract', () => {
     expect(a.materials[0]!.lightmapRange).toBe(32);
     expect(a.stats.geometryBytes).toBe(3*72+3*4);
   });
+  it('loads a separate version-2 baked lamp contribution on the same UV set',async()=>{
+    const {f}=lightmapped();const lm=((f.document.materials as GltfObject[])[0]!.extensions as GltfObject).EXT_strata_lightmap as GltfObject;
+    lm.version=2;lm.pointLight={texture:{index:0,texCoord:1},range:4,light:{id:'lamp',position:[0,1,0],color:[1,1,1],intensity:1,range:4}};
+    const a=await f.load();expect(a.materials[0]!.bakedPointLightRange).toBe(4);expect(a.materials[0]!.bakedPointLight!.id).toBe('lamp');
+    expect(a.materials[0]!.bakedPointLightTexture!.image).toBe(0);
+    lm.pointLight={texture:{index:0,texCoord:0},range:4,light:{}};await expect(f.load()).rejects.toThrow();
+  });
   it('rejects missing UVs and animated receivers',async()=>{
     const {f,p}=lightmapped();delete (p.attributes as GltfObject).TEXCOORD_1;
     await expect(f.load()).rejects.toThrow('TEXCOORD_1');

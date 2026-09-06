@@ -38,6 +38,39 @@ export async function validatePointShadow() {
     if(shadowPixels<15)throw Error('No visible point shadow on fixed receiver: '+shadowPixels);
     const off=render(0,{...point,intensity:0}).pixels;
     if(off.some((v,i)=>i%4!==3&&v>1))throw Error('Disabled local light remained visible');
+    // A baked receiver retains unrelated colored light when an actor blocks one lamp.
+    const encodedImage=async(name:string,pixel:number[],size=1)=>{
+      const c=document.createElement('canvas');c.width=c.height=size;const cc=c.getContext('2d')!;cc.putImageData(new ImageData(new Uint8ClampedArray(pixel),size,size),0,0);
+      const blob=await new Promise<Blob>(resolve=>c.toBlob(b=>resolve(b!),'image/png'));
+      return {name,mimeType:'image/png',width:size,height:size,bytes:new Uint8Array(await blob.arrayBuffer())};
+    };
+    const sampler={wrapS:33071,wrapT:33071,magFilter:9729,minFilter:9729};
+    const {shadowMapSize,...fixedPoint}=point;
+    const layered={...receiver,images:[await encodedImage('combined',[153,77,51,255]),await encodedImage('lamp only',[204,52,0,128,102,26,0,255,204,52,0,128,102,26,0,255],2)],
+      materials:[{...mat,localLighting:false,lightmapTexture:{image:0,sampler},lightmapRange:1,bakedPointLightTexture:{image:1,sampler},bakedPointLightRange:1,bakedPointLight:fixedPoint}],
+      primitives:receiver.primitives.map((p:any)=>({...p,lightmapUvs:new Float32Array([.5,.5,.5,.5,.5,.5])}))};
+    const layeredMixed=combineImportedAssets(layered,actor,{localLighting:true});
+    await engine.setScene({renderer:'imported',asset:layeredMixed,pointLight:point,shadowMapSize:1024});
+    const bakedCapture=(x:number,enabled:boolean)=>{engine.render({timeSeconds:tick++/60,temporal:false,imported:{...controls,bakedShadows:enabled,placement:new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,0,0,1])}});ctx.drawImage(canvas,0,0);return [...ctx.getImageData(0,0,128,128).data];};
+    const bakedOn=bakedCapture(0,true),bakedOff=bakedCapture(0,false);
+    let preserved=0;
+    const display=(v:number)=>{const a=Math.max(0,Math.min(1,v*(2.51*v+.03)/(v*(2.43*v+.59)+.14)));return 255*(a<=.0031308?12.92*a:1.055*a**(1/2.4)-.055);};
+    const expected=[51,51,51].map(v=>display(v/255*.6));
+    for(let y=45;y<83;y++)for(let x=28;x<48;x++) {
+      const i=(y*128+x)*4;
+      if(bakedOff[i]!>bakedOn[i]!+25 && expected.every((v,c)=>Math.abs(v-bakedOn[i+c]!)<3))preserved++;
+    }
+    if(preserved<15)throw Error('Baked shadow removed other lamps/bounce or lacked a shadow '+preserved);
+    const moved=bakedCapture(.6,true),returned=bakedCapture(0,true);
+    if(bakedOn.some((v,i)=>v!==returned[i]))throw Error('Baked shadow left stale silhouettes');
+    if(moved.every((v,i)=>v===returned[i]))throw Error('Baked shadow did not move');
+    let fixedRejected=false;try{render(0,{...point,intensity:0});}catch{fixedRejected=true;}if(!fixedRejected)throw Error('Changed baked light accepted');
+    const afterRejected=bakedCapture(0,true);if(afterRejected.some((v,i)=>v!==bakedOn[i]))throw Error('Rejected baked light corrupted state');
+    // Static shadow depth must not darken a contribution that already contains static visibility.
+    await engine.setScene({renderer:'imported',asset:layered,pointLight:point,shadowMapSize:1024});
+    const noActorOn=bakedCapture(0,true),noActorOff=bakedCapture(0,false);
+    if(noActorOn.some((v,i)=>v!==noActorOff[i]))throw Error('Empty dynamic depth darkened the bake');
+    observations.push({bakedShadowPreservedPixels:preserved});
     // All six signed directions: lit receiver center must survive face projection and self-shadowing.
     const axes=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1],[1,0,1],[1,1,0],[0,-1,-1],[1,1,1]].map(d=>{const l=Math.hypot(...d);return d.map(v=>v/l);});
     for(const [face,d] of axes.entries()) {
