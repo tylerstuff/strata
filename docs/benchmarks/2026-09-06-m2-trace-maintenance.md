@@ -8,6 +8,12 @@ Independent 720p screenshots contain lighting differences, so this result does
 not establish equality of every performance capture or completion of the visual
 quality work.
 
+A subsequent instrumented [phase comparison](2026-09-06-m2-trace-phase.md)
+matches both updater arms at each controlled GI phase and reproduces the wall
+brightness change by changing the phase alone. That separate correctness proof
+does not alter this timed session, reconstruct its missing per-image state or
+close the lighting-quality work.
+
 ## Source and workload
 
 Measured source is clean `c91c285489a9befe8ce27d7264dfc56a295d12d5`, tree

@@ -5,8 +5,12 @@ maintenance for the legacy GI, selected-reflection and integrated courtyard
 fixtures. Browser correctness and performance are separate gates. The
 [matched M2 comparison](benchmarks/2026-09-06-m2-trace-maintenance.md) meets the
 reviewed CPU and upload targets; its independent 720p captures contain lighting
-differences that remain a separate visual qualification. Work and byte counters
-alone do not establish elapsed cost or presented frame rate.
+differences. A separate instrumented [phase comparison](benchmarks/2026-09-06-m2-trace-phase.md)
+now matches state and pixels between updaters at both controlled GI phases;
+changing the phase changes the wall identically in both arms. This qualifies
+the controlled updater comparison, without repairing the existing lighting
+quality issues. Work and byte counters alone do not establish elapsed cost or
+presented frame rate.
 
 ## Representation and ownership
 
@@ -315,5 +319,6 @@ Single opposite-order pairs do not establish statistical significance, overall
 visual quality, whole VRAM use or a general 60 FPS result.
 
 CPU tooling checks are `npm run test:trace-updates:launcher`,
-`npm run test:trace-performance:unit`, focused trace control/plan tests and both
-TypeScript configurations. The actual asset/hardware qualification remains local.
+`npm run test:trace-performance:unit`, `npm run test:trace-phase:unit`, focused
+trace control/plan tests and both TypeScript configurations. The actual
+asset/hardware qualification remains local.

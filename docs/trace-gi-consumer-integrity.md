@@ -71,4 +71,6 @@ qualifies non-observability examples on unmodified built-ins. This proof does
 not establish garbage collection as the cause of earlier cancellations or
 performance equivalence to uninstrumented execution. Historical raw failures
 remain failed. A new source/plan freeze and separately allocated run are needed
-before any instrumented same-phase result can be claimed.
+before any instrumented same-phase result can be claimed. The subsequent
+[c74ae66 M2 result](benchmarks/2026-09-06-m2-trace-phase.md) records the separately
+frozen run, independent audit, exact same-phase result and preserved raw failures.
