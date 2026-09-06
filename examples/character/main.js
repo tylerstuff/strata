@@ -53,12 +53,18 @@ try{
    if(Math.hypot(state.velocity[0],state.velocity[2])>.01)yaw=Math.atan2(state.velocity[0],state.velocity[2]);
    const c=Math.cos(yaw),s=Math.sin(yaw),stride=state.motion==='walk'?Math.sin(state.tick/60*11)*.12:0;
    parts.forEach((part,i)=>{const lift=i<2?0:(i%2?stride:-stride);transforms.set([c,0,-s,0,0,1,0,0,s,0,c,0,p[0],p[1]+Math.max(0,lift),p[2],1],(courseMeshes.length+i)*16);});
-   metrics=engine.render({timeSeconds:state.tick/60,temporal:true,cameraCut:cut,imported:{transforms,camera:{eye:[p[0]+5,p[1]+5,p[2]+7],target:[p[0],p[1]+.8,p[2]],verticalFov:Math.PI/3},lighting:{directionToLight:[-.5,.85,.4],color:[1,.93,.82],intensity:3,ambient:[.08,.1,.12]},background:[.035,.055,.08]}});cut=false;
+   const target=[p[0],p[1]+.8,p[2]],desiredEye=[p[0]+5,p[1]+5,p[2]+7];
+   const offset=desiredEye.map((v,i)=>v-target[i]),length=Math.hypot(...offset);
+   const hit=capsuleMode?controller.sweepSphere(target,desiredEye,.2):null;
+   // No outward smoothing: it could interpolate the camera through a new obstruction.
+   const distance=hit===null?length:Math.max(.001,hit-.02);
+   const eye=target.map((v,i)=>v+offset[i]*distance/length);
+   metrics=engine.render({timeSeconds:state.tick/60,temporal:true,cameraCut:cut,imported:{transforms,camera:{eye,target,verticalFov:Math.PI/3},lighting:{directionToLight:[-.5,.85,.4],color:[1,.93,.82],intensity:3,ambient:[.08,.1,.12]},background:[.035,.055,.08]}});cut=false;
    stats.textContent=`${state.motion} · ${state.grounded?'grounded':'airborne'} · tick ${state.tick} · ${metrics.drawCalls} draws · ${state.droppedSeconds.toFixed(3)} s discarded`;
    frame=requestAnimationFrame(tick);
   }catch(error){document.querySelector('#error').textContent=String(error);dispose();}
  };
- window.characterCourse={ready:true,collisionDiagnostics:()=>controller.diagnostics?.(),snapshot:()=>controller.snapshot(),input:value=>{override=value;},reset,teleport:p=>{controller.teleport(p);cut=true;},telemetry:()=>engine.getTelemetry(),metrics:()=>metrics,dispose};
+ window.characterCourse={ready:true,sweepSphere:(...args)=>controller.sweepSphere(...args),collisionDiagnostics:()=>controller.diagnostics?.(),snapshot:()=>controller.snapshot(),input:value=>{override=value;},reset,teleport:p=>{controller.teleport(p);cut=true;},telemetry:()=>engine.getTelemetry(),metrics:()=>metrics,dispose};
  frame=requestAnimationFrame(tick);
 }catch(error){document.querySelector('#error').textContent=String(error);dispose();}
 window.addEventListener('pagehide',dispose,{once:true});

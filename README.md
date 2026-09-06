@@ -28,7 +28,7 @@ Application code can now [create fixed-topology mesh assets and submit batched r
 
 For local imported models and animation, configure `STRATA_BENCHMARK_ASSET_DIR` and run `npm run gallery`. The [gallery guide](docs/gallery.md) covers lighting, playback and scripted captures. Models and derived files remain outside Git. An experimental static progressive diffuse preview has a narrow source contract and has not passed actual-house visual acceptance; general imported GI and reflections remain unimplemented.
 
-An optional [gameplay foundation](docs/gameplay.md) adds fixed-step character movement, authored box colliders and an optional internally initialized WASM capsule/triangle backend with slope and step handling. A generated playable course and offline collision cooker exercise the public APIs. Collision simplification/streaming, skinned animation blending and camera obstruction remain pending under #71.
+An optional [gameplay foundation](docs/gameplay.md) adds fixed-step character movement, authored box colliders and an optional internally initialized WASM capsule/triangle backend with slope and step handling. A generated playable course and offline collision cooker exercise the public APIs. Static sphere sweeps support follow-camera obstruction using the same collision world. Collision simplification/streaming, skinned animation blending and broader camera behavior remain pending under #71.
 
 ## Product requirements
 

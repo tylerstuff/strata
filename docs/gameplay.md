@@ -157,7 +157,7 @@ simulation into the scene's render normalization. It keeps the existing skin and
 walk clip; idle/jump do not yet blend to distinct clips. Its explicit collision
 material subset includes architectural surfaces, pavement and selected furniture,
 while excluding foliage. Closed doors are static geometry, not interactive doors.
-Camera obstruction, production collision simplification/streaming, and broader
+Broader camera behavior, production collision simplification/streaming, and broader
 route acceptance remain #71 work. This does not complete the entire M4 milestone.
 
 ### Lossless snapshot transport
@@ -192,3 +192,29 @@ against the raw snapshot byte-for-byte; unit tests cover corruption, truncation,
 size limits, cancellation and mutation isolation. Geometry simplification remains
 separate work: the smaller experimental Bistro meshes failed route-preservation
 checks and were not activated.
+
+### Reusable camera obstruction query
+
+The capsule controller exports `sweepSphere(origin, target, radius = 0.2)`.
+It queries the existing static collision index in application units, excluding
+its own character capsule. No second world, renderer dependency or asset-specific
+code is required. A result is travel distance to first contact; `null` means
+clear and `0` means the starting volume overlaps a triangle surface. Zero-length
+segments still check initial overlap. Queries do not advance simulation.
+
+For a follow camera, sweep from a clear head-height pivot toward the desired eye,
+then shorten the distance to the hit minus a small margin. The generated capsule
+course demonstrates this through the public package. Select a sphere radius that
+covers your near-plane corners for your FOV, aspect ratio and near distance; the
+example's 0.2-unit radius is not a universal clipping guarantee. Invalid starting
+pivots require application recovery (for example, another pivot or camera mode);
+a surface-based triangle world cannot classify enclosed solid volumes. The demo
+collapses to 0.001 units when blocked at the pivot to keep its look direction
+finite, which is not a guaranteed collision-free fallback.
+
+This first query covers static collision surfaces only. It adds no camera
+smoothing, orbit input, dynamic occluders or physics memory reduction. The local
+Bistro adapter uses this query in metre units before render normalization. Unit coverage includes both wall
+directions, thin walls, grazing volume hits, initial overlap, zero travel, invalid
+inputs, unchanged simulation state and disposal. The packed capsule browser test
+checks ground obstruction and clear travel through the exported method.

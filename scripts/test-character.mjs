@@ -25,6 +25,10 @@ try{
  const page=await browser.newPage({viewport:{width:1000,height:800}}),errors=[];page.on('pageerror',e=>errors.push(String(e)));
  await page.goto(server.url+'/course/index.html'+(capsuleMode?'?capsule'+(process.argv.includes('--gzip')?'&gzip':''):''));await page.waitForFunction(()=>window.characterCourse?.ready,{},{timeout:60000});
  await page.waitForFunction(()=>window.characterCourse.metrics(),{},{timeout:60000});
+ if(capsuleMode){
+  const sweep=await page.evaluate(()=>({hit:characterCourse.sweepSphere([0,1,4],[0,-2,4],.2),clear:characterCourse.sweepSphere([0,2,4],[0,4,4],.2)}));
+  assert(Math.abs(sweep.hit-.8)<.001);assert.equal(sweep.clear,null);
+ }
  const initial=await page.evaluate(()=>({state:characterCourse.snapshot(),metrics:characterCourse.metrics(),telemetry:characterCourse.telemetry()}));
  await page.locator('canvas').focus();await page.keyboard.down('KeyW');
  await page.waitForFunction(t=>characterCourse.snapshot().tick>=t+20,initial.state.tick,{timeout:60000});await page.keyboard.up('KeyW');
