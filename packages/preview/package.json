@@ -19,6 +19,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./project": {
+      "types": "./dist/project.d.ts",
+      "import": "./dist/project.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
@@ -37,6 +41,7 @@
     "directory": "packages/preview"
   },
   "bin": {
-    "strata-preview": "./dist/bin.js"
+    "strata-preview": "./dist/bin.js",
+    "strata-project": "./dist/project-bin.js"
   }
 }

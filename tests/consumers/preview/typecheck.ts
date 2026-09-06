@@ -1,5 +1,7 @@
 import { createProceduralScene, sceneRevision, type SceneDocument } from '@strata-engine/authoring';
 import type { AuthoredFrameMetadata, BoxSceneDescriptor, FrameMetrics, SceneCommitReceipt } from '@strata-engine/core';
+import { initProject, inspectProject, validateProject, buildProject,
+  type ProjectInitResult, type ProjectInspection, type ProjectBuildResult } from '@strata-engine/preview/project';
 import {
   PreviewError, PreviewSession, createPreviewSession, prepareAuthoredPreviewLoad, publishCapture,
   type AuthoredPreviewLoadInput, type AuthoredPreviewView,
@@ -83,3 +85,15 @@ function authoredMotionTypes(frame: PreviewDriverFrame<SceneCommitReceipt, Frame
   void [previousSubmittedFrameId, valid, resetReason];
 }
 void authoredMotionTypes;
+
+async function projectTypes(directory: string, outputDirectory: string): Promise<ProjectBuildResult> {
+  const initialized: ProjectInitResult = await initProject({ directory, id: 'typed-project' });
+  const published: true = initialized.publicationOccurred;
+  const inspected: ProjectInspection = await inspectProject({ projectPath: initialized.projectPath });
+  await validateProject({ projectPath: inspected.projectPath, checkAssets: true });
+  // @ts-expect-error A build must pin the exact inspected input revision.
+  void buildProject({ projectPath: inspected.projectPath, outputDirectory });
+  void published;
+  return buildProject({ projectPath: inspected.projectPath, outputDirectory, expectedInputRevision: inspected.identity.inputRevision });
+}
+void projectTypes;
