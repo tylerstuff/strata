@@ -45,6 +45,11 @@ assert.equal(help.status, 0); assert.equal(help.stderr, '');
 assert.equal(help.stdout.trim().split('\n').length, 1);
 assert.equal(JSON.parse(help.stdout).status, 'help');
 assert.equal(JSON.parse(help.stdout).usage.help, 'strata-preview-connection --help');
+// The browser harness pins Node while retaining this exact installed CLI entry.
+const pinnedHelp = spawnSync(process.execPath, [cliPath, '--help'], { encoding: 'utf8', timeout: 15_000 });
+if (pinnedHelp.error) throw pinnedHelp.error;
+assert.equal(pinnedHelp.status, 0); assert.equal(pinnedHelp.signal, null); assert.equal(pinnedHelp.stderr, '');
+assert.deepEqual(JSON.parse(pinnedHelp.stdout), JSON.parse(help.stdout));
 const usage = cli(['--unknown']);
 assert.equal(usage.status, 2); assert.equal(usage.stdout, '');
 assert.equal(JSON.parse(usage.stderr).error.code, 'CONNECTION_CLI_USAGE');

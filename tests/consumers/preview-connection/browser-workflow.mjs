@@ -127,7 +127,10 @@ class StdioClient {
     const args = ['--project-root', projectRoot, '--output-root', outputRoot, '--browser', browser.channel, '--width', '512', '--height', '512', '--timeout-ms', '60000', '--cleanup-timeout-ms', '5000'];
     if (!browser.headless) args.push('--headed'); if (browser.softwareGpu) args.push('--software-gpu');
     this.requests = []; this.responses = []; this.stdout = []; this.stderr = []; this.stdoutBytes = 0; this.stderrBytes = 0; this.nextId = 1; this.pending = new Map(); this.exit = deferred(); this.closed = false; this.exiting = false; this.failure = null;
-    this.child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Execute the installed CLI with the pinned Node runtime. Invoking its
+    // shebang directly can expose a transient /usr/bin/env process identity.
+    this.executable = process.execPath; this.argv = [binary, ...args];
+    this.child = spawn(this.executable, this.argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     this.pid = this.child.pid; this.binary = binary; this.args = args;
     this.parser = new Responses(response => {
       const pending = this.pending.get(response.id); assert.ok(pending, 'Response ID was not outstanding');
@@ -447,6 +450,7 @@ async function run() {
     if (aborted) throw aborted;
     client = new StdioClient(join(output, 'project'), join(output, 'captures'), browser);
     report.process.cliPid = client.pid; report.process.binary = client.binary; report.process.arguments = client.args;
+    report.process.executable = client.executable; report.process.argv = client.argv;
     const discover = await client.success('discover');
     assert.equal(discover.protocol, 'strata.preview.connection'); assert.equal(discover.version, 1); assert.equal(discover.transport, 'stdio-jsonl');
     assert.deepEqual(Object.keys(discover.methods).sort(), ['cancel', 'capture', 'discover', 'dispose', 'inspect', 'load', 'resize']);

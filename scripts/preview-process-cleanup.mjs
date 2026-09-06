@@ -78,14 +78,15 @@ export function createProcessTracker({ rootPid, rootCommand, pollIntervalMs = 25
   nativeProvider = process.platform === 'linux' && readProcesses === census ? createLinuxProcessProvider() : null }) {
   if (nativeProvider) return createNativeProcessTracker({ rootPid, rootCommand, pollIntervalMs,
     readProcesses, signalProcess, nativeProvider, rootIsRunning, censusMs: CENSUS_MS, maxProcesses: MAX_PROCESSES });
-  return createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, readProcesses, signalProcess });
+  return createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, readProcesses, signalProcess, rootIsRunning });
 }
 
-function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, readProcesses, signalProcess }) {
+function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, readProcesses, signalProcess, rootIsRunning }) {
   assert.ok(Number.isSafeInteger(rootPid) && rootPid > 0 && typeof rootCommand === 'string' && rootCommand.length > 0);
   assert.ok(Number.isInteger(pollIntervalMs) && pollIntervalMs >= 1 && pollIntervalMs <= 1000);
+  assert.ok(rootIsRunning === undefined || typeof rootIsRunning === 'function');
   const owned = new Map(), retired = new Set(), mismatched = new Set();
-  let latest = new Map(), started = false, initialAttempted = false, initialObserved = false, stopping = false, timer, sampling, closing;
+  let latest = new Map(), started = false, initialAttempted = false, initialObserved = false, rootExited = false, stopping = false, timer, sampling, closing;
   let deadline = Infinity;
   const report = { rootPid, cleanupUnknown: false, observed: [], signals: [], remaining: [],
     identityMismatches: [], censusErrors: [], limitations: [
@@ -100,9 +101,20 @@ function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, read
     if (!mismatched.has(expected.pid)) report.identityMismatches.push({ expected, current });
     mismatched.add(expected.pid);
   }
+  function observeRootExit() {
+    if (!rootExited && rootIsRunning !== undefined) {
+      const running = rootIsRunning();
+      assert.equal(typeof running, 'boolean', 'Root ChildProcess liveness must be an explicit boolean');
+      if (!running) { rootExited = true; retired.add(rootPid); }
+    }
+    return rootExited;
+  }
   async function takeSample() {
     try {
       const rows = await bounded(Promise.resolve().then(readProcesses), Math.min(CENSUS_MS, deadline - Date.now()));
+      // A census can settle after the exact ChildProcess has exited. Its old
+      // root row cannot revive that process or authorize new descendants.
+      observeRootExit();
       assert.ok(Array.isArray(rows), 'Process census must return an array');
       const current = new Map();
       for (const row of rows) {
@@ -119,9 +131,9 @@ function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, read
         if (initialAttempted) return;
         initialAttempted = true;
         const root = current.get(rootPid);
-        if (!root || !live(root) || (root.command !== rootCommand && root.command !== basename(rootCommand))) {
+        if (rootExited || !root || !live(root) || (root.command !== rootCommand && root.command !== basename(rootCommand))) {
           report.initialRootObservation = { expected: { pid: rootPid, command: diagnosticText(rootCommand) }, observed: diagnosticIdentity(root),
-            reason: !root ? 'missing' : !live(root) ? 'not-live' : 'command-mismatch' };
+            reason: rootExited ? 'root-exit-observed' : !root ? 'missing' : !live(root) ? 'not-live' : 'command-mismatch' };
           unknown('The spawned root identity was unavailable before initial observation.');
           return;
         }
@@ -129,6 +141,7 @@ function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, read
       }
       const parents = new Set();
       for (const [pid, expected] of owned) {
+        if (pid === rootPid && rootExited) continue;
         const value = current.get(pid);
         if (!value || !live(value)) { retired.add(pid); continue; }
         if (retired.has(pid) || !same(expected, value)) { mismatch(expected, value); continue; }
@@ -183,6 +196,9 @@ function createLegacyProcessTracker({ rootPid, rootCommand, pollIntervalMs, read
       const current = latest.get(expected.pid);
       if (!live(current) || retired.has(expected.pid) || mismatched.has(expected.pid) || !same(expected, current)) continue;
       try {
+        // Recheck after the awaited sample, immediately before signaling only
+        // the root whose actual ChildProcess handle supplies this observation.
+        if (expected.pid === rootPid && observeRootExit()) continue;
         // Synchronous primitive avoids a gap inside an asynchronous signal seam.
         signalProcess(expected.pid, signal);
         report.signals.push({ pid: expected.pid, pgid: current.pgid, start: current.start, command: current.command, signal });

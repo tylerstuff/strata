@@ -114,6 +114,112 @@ async function trackerFor(context, fixture, options = {}) {
   return tracker;
 }
 
+function legacyRows() {
+  const root = { pid: 101, ppid: 1, pgid: 101, start: 'Sun Sep 6 02:00:00 2026', command: '/pinned/node', state: 'R' };
+  return { root, child: { ...root, pid: 102, ppid: 101, command: '/child' },
+    newChild: { ...root, pid: 103, ppid: 101, command: '/new-child' } };
+}
+
+test('a census settling after root exit cannot revive its label or acquire new descendants', async () => {
+  const { root, child, newChild } = legacyRows();
+  let rows = [root, child], running = true, release, entered;
+  const signals = [], began = new Promise(resolve => { entered = resolve; });
+  let hold = false;
+  const tracker = createProcessTracker({ rootPid: root.pid, rootCommand: root.command, pollIntervalMs: 1000,
+    rootIsRunning: () => running, readProcesses: () => hold
+      ? (hold = false, entered(), new Promise(resolve => { release = resolve; })) : rows,
+    signalProcess: (pid, signal) => { signals.push({ pid, signal }); rows = rows.filter(value => value.pid !== pid); } });
+  try {
+    await tracker.start(); hold = true;
+    const sample = tracker.sample(); await began;
+    running = false; rows = [{ ...root, command: '(node)' }, child, newChild]; release(rows); await sample;
+    // A later matching row or changed callback must not restore terminal authority.
+    running = true; rows = [root, child, newChild]; await tracker.sample();
+    const result = await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 });
+    assert.equal(result.cleanupUnknown, false); assert.deepEqual(result.identityMismatches, []);
+    assert.deepEqual(result.observed.map(value => value.pid), [101, 102]);
+    assert.deepEqual(signals, [{ pid: 102, signal: 'SIGKILL' }]);
+    assert.deepEqual(result.remaining, []);
+  } finally { await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 }); }
+});
+
+test('a first census settling after root exit remains unadmitted', async () => {
+  const { root, newChild } = legacyRows();
+  let running = true, release, entered, first = true;
+  const signals = [], began = new Promise(resolve => { entered = resolve; });
+  const tracker = createProcessTracker({ rootPid: root.pid, rootCommand: root.command, pollIntervalMs: 1000,
+    rootIsRunning: () => running, readProcesses: () => first
+      ? (first = false, entered(), new Promise(resolve => { release = resolve; })) : [root, newChild],
+    signalProcess: (...args) => signals.push(args) });
+  try {
+    const start = tracker.start(); await began; running = false; release([root, newChild]); await start;
+    running = true; await tracker.sample();
+    const result = await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 });
+    assert.equal(result.cleanupUnknown, true); assert.equal(result.initialRootObservation.reason, 'root-exit-observed');
+    assert.deepEqual(result.observed, []); assert.deepEqual(signals, []);
+  } finally { await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 }); }
+});
+
+test('a live root identity mismatch remains unknown after its later exit', async () => {
+  const { root } = legacyRows(); let rows = [root], running = true;
+  const signals = [];
+  const tracker = createProcessTracker({ rootPid: root.pid, rootCommand: root.command, pollIntervalMs: 1000,
+    rootIsRunning: () => running, readProcesses: () => rows, signalProcess: (...args) => signals.push(args) });
+  try {
+    await tracker.start(); rows = [{ ...root, command: '(node)' }]; await tracker.sample(); running = false;
+    const result = await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 });
+    assert.equal(result.cleanupUnknown, true); assert.equal(result.identityMismatches.length, 1); assert.deepEqual(signals, []);
+  } finally { await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 }); }
+});
+
+test('root exit does not waive a previously tracked descendant identity mismatch', async () => {
+  const { root, child } = legacyRows(); let rows = [root, child], running = true;
+  const signals = [];
+  const tracker = createProcessTracker({ rootPid: root.pid, rootCommand: root.command, pollIntervalMs: 1000,
+    rootIsRunning: () => running, readProcesses: () => rows, signalProcess: (...args) => signals.push(args) });
+  try {
+    await tracker.start(); running = false; rows = [root, { ...child, command: '/replacement' }];
+    const result = await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 });
+    assert.equal(result.cleanupUnknown, true); assert.equal(result.identityMismatches[0].expected.pid, child.pid);
+    assert.deepEqual(signals, []);
+  } finally { await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 }); }
+});
+
+test('the root ChildProcess is checked again after the last census before signaling', async () => {
+  const { root } = legacyRows(); let reads = 0, finalChecks = 0;
+  const signals = [];
+  const tracker = createProcessTracker({ rootPid: root.pid, rootCommand: root.command, pollIntervalMs: 1000,
+    readProcesses: () => { reads++; return [root]; },
+    // Start and cleanup samples see a live root. During signalOwned's sample it
+    // is live once, then its ChildProcess exit is observed before the signal.
+    rootIsRunning: () => reads < 3 || finalChecks++ === 0,
+    signalProcess: (...args) => signals.push(args) });
+  try {
+    await tracker.start();
+    const result = await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 });
+    assert.equal(result.cleanupUnknown, false); assert.deepEqual(signals, []); assert.deepEqual(result.remaining, []);
+    assert.equal(finalChecks, 2);
+  } finally { await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 }); }
+});
+
+for (const mode of ['throw', 'undefined', 'null']) {
+  test(`a supplied ${mode} liveness observation fails closed`, async () => {
+    const { root } = legacyRows(); let invalid = false;
+    const signals = [];
+    const tracker = createProcessTracker({ rootPid: root.pid, rootCommand: root.command, pollIntervalMs: 1000,
+      readProcesses: () => [root], rootIsRunning: () => {
+        if (!invalid) return true;
+        if (mode === 'throw') throw new Error('Liveness observation failed');
+        return mode === 'null' ? null : undefined;
+      }, signalProcess: (...args) => signals.push(args) });
+    try {
+      await tracker.start(); invalid = true;
+      const result = await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 });
+      assert.equal(result.cleanupUnknown, true); assert.ok(result.censusErrors.length > 0); assert.deepEqual(signals, []);
+    } finally { await tracker.cleanup({ reason: 'graceful', termGraceMs: 0, killGraceMs: 0 }); }
+  });
+}
+
 test('retains a detached child after killing only the workflow group and reparenting', { skip: unsupported, timeout: 8000 }, async context => {
   const fixture = await launchFixture(context);
   const control = await launchFixture(context, { parent: false });
