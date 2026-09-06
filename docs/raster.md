@@ -78,3 +78,31 @@ The browser raster check executes both production filters against independent
 flat and sloped depth fixtures, including a close occluder erased by legacy bias.
 
 Final presentation compensates the current projection jitter in pixel space. History remains on its existing jittered raster grid, with motion/depth reprojection unchanged. A bounded cubic reconstruction shifts resolved HDR back to the fixed display grid before exposure and tone mapping; the central footprint clamps ringing. Zero jitter uses the original exact texel load, and raw diagnostics remain unshifted. This removes deterministic whole-frame sample-phase wobble; it does not eliminate foliage/specular shimmer or establish a frame-performance target. The presentation pass adds up to 16 HDR reads per pixel when jitter is nonzero.
+
+### Imported static visibility
+
+Static imported primitives are conservatively culled against the current jittered
+WebGPU camera frustum. Primitives with at least 8,192 triangles are partitioned
+once at scene creation into at most 64 spatial index ranges. The index buffer is
+reordered by triangle centroid; each range bounds all triangle vertices, including
+triangles crossing cell boundaries. Vertex attributes, UV1 lightmaps, textures,
+and triangle winding are unchanged. Contiguous visible ranges share a draw.
+
+Camera visibility only reduces the main raster pass. The directional shadow pass
+retains every caster, and immutable shadow reuse keeps its existing revision
+contract. Animated primitives retain the full draw until conservative posed range
+bounds are available. Submitted triangle/draw counters include actual visible
+ranges and any shadow work executed that frame. This is conventional frustum
+culling, not occlusion culling, LOD, streaming, or virtual geometry. It adds bounded
+CPU range checks each frame and a one-time index partition/upload at scene load;
+GPU geometry allocation size is unchanged. Large triangles and broad material
+ranges can still conservatively include substantial invisible geometry.
+
+For a static viewer that does not need to recreate the scene or inspect source
+geometry, release its decoded `ImportedAsset` reference after `await
+engine.setScene(...)` succeeds. Keep only the camera normalization, bounds, and
+small UI metadata. Holding that asset also holds source PNGs, full DDS mip chains,
+and CPU vertex/index arrays even when the GPU upload uses a smaller texture cap.
+This does not reduce GPU texture quality or allocations; garbage collection timing
+remains browser-controlled. Applications that need source data for editing or
+reloading should retain it deliberately.

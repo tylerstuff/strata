@@ -1,3 +1,4 @@
+import { partitionImportedIndices, importedFrustumPlanes, importedBoundsVisible, type ImportedDrawRange } from './imported-visibility.js';
 import { createImportedSky, importedSkyUniformBytes } from './imported-sky.js';
 import type { RasterControls } from '../rendering/raster-types.js';
 import { blockBytes } from './imported-compression.js';
@@ -103,7 +104,7 @@ function validateMaterial(material: ImportedMaterial): void {
   if (typeof material.doubleSided !== 'boolean' || (material.unlit !== undefined && typeof material.unlit !== 'boolean')) fail('doubleSided and optional unlit must be booleans.');
 }
 type DeformationMode = 'static' | 'rigid' | 'skin';
-interface Mesh { vertices: GPUBuffer; indices: GPUBuffer; indexCount: number; material: number; ground: boolean;
+interface Mesh { ranges?: readonly ImportedDrawRange[] | undefined; vertices: GPUBuffer; indices: GPUBuffer; indexCount: number; material: number; ground: boolean;
   mode: DeformationMode; influences: GPUBuffer | undefined; deformationUniform: GPUBuffer | undefined; palette: number;
   bounds: readonly { matrix: number; bounds: ImportedBounds }[]; }
 interface Palette { current: GPUBuffer; previous: GPUBuffer; data: Float32Array<ArrayBuffer>; committed: Float32Array<ArrayBuffer>; }
@@ -321,7 +322,8 @@ export class ImportedGeometry implements RasterGeometryGroup {
         } else {
           const b = pointBounds(); for (let vertex = 0; vertex < vertices.length; vertex += 16) addPoint(b, vertices.subarray(vertex, vertex + 3)); bounds.set(d?.node ?? 0, b);
         }
-        return { vertices: buffer('Strata imported vertices', gpuVertices(vertices, primitive.lightmapUvs), 0x20), indices: buffer('Strata imported indices', primitive.indices, 0x10), indexCount: primitive.indices.length,
+        const partition = mode === 'static' ? partitionImportedIndices(vertices, primitive.indices, bounds.get(0)!) : undefined;
+        return { ranges: partition?.ranges, vertices: buffer('Strata imported vertices', gpuVertices(vertices, primitive.lightmapUvs), 0x20), indices: buffer('Strata imported indices', partition?.indices ?? primitive.indices, 0x10), indexCount: primitive.indices.length,
           material: primitive.material, ground: false, mode, influences, palette: mode === 'skin' ? d!.skin! + 1 : 0,
           deformationUniform: d ? buffer('Strata imported deformation mode', new Uint32Array([Number(mode === 'skin'), d.node, 0, 0]), 0x40) : undefined,
           bounds: [...bounds].map(([matrix, bounds]) => ({ matrix, bounds })) };
@@ -493,10 +495,37 @@ class ImportedBatch implements RasterGeometryProvider {
   get initialUploadBytes(): number { return this.accountsResources ? this.owner.initialUploadBytes : 0; }
   camera(width: number, height: number, time: number, jitter: readonly [number, number]): CameraFrame { return this.owner.camera(width, height, time, jitter); }
   attachPipelines(raster: GPURenderPipeline, shadow: GPURenderPipeline): void { this.bindings = { raster: this.owner.materialBindings(raster, false), shadow: this.owner.materialBindings(shadow, true) }; this.deformation = { raster: this.owner.deformationBindings(raster, this.mode, false), shadow: this.owner.deformationBindings(shadow, this.mode, true) }; }
-  prepare(_encoder: GPUCommandEncoder, _camera: CameraFrame, _width: number, _height: number, reset: boolean) { const meshes = this.owner.selectedMeshes(this.doubleSided, this.mode); return { dispatchCalls: 0, drawCalls: meshes.length * 2, triangles: meshes.reduce((n, mesh) => n + mesh.indexCount / 3 * 2, 0), uploadBytes: this.owner.prepare(this.accountsResources, reset) }; }
+  private rasterDraws: { mesh: Mesh; firstIndex: number; indexCount: number }[] = [];
+  prepare(_encoder: GPUCommandEncoder, camera: CameraFrame, _width: number, _height: number, reset: boolean) {
+    const meshes = this.owner.selectedMeshes(this.doubleSided, this.mode);
+    const planes = importedFrustumPlanes(camera.viewProjection);
+    this.rasterDraws = [];
+    for (const mesh of meshes) {
+      if (!mesh.ranges) { this.rasterDraws.push({ mesh, firstIndex: 0, indexCount: mesh.indexCount }); continue; }
+      for (const range of mesh.ranges) {
+        if (!importedBoundsVisible(range.bounds, planes)) continue;
+        const previous = this.rasterDraws.at(-1);
+        if (previous?.mesh === mesh && previous.firstIndex + previous.indexCount === range.firstIndex) previous.indexCount += range.indexCount;
+        else this.rasterDraws.push({ mesh, firstIndex: range.firstIndex, indexCount: range.indexCount });
+      }
+    }
+    return { dispatchCalls: 0, drawCalls: meshes.length + this.rasterDraws.length,
+      triangles: (meshes.reduce((n, mesh) => n + mesh.indexCount, 0) + this.rasterDraws.reduce((n, draw) => n + draw.indexCount, 0)) / 3,
+      uploadBytes: this.owner.prepare(this.accountsResources, reset) };
+  }
   draw(pass: GPURenderPassEncoder, phase: 'raster' | 'shadow'): void {
     if (!this.bindings) throw new StrataError('RENDER_FAILED', 'Imported material pipelines are not attached.');
-    for (const mesh of this.owner.selectedMeshes(this.doubleSided, this.mode)) { if (this.mode !== 'static') pass.setBindGroup(2, this.deformation![phase].get(mesh)!); if (mesh.influences) pass.setVertexBuffer(1, mesh.influences); pass.setBindGroup(1, this.bindings[phase][mesh.material]!); pass.setVertexBuffer(0, mesh.vertices); pass.setIndexBuffer(mesh.indices, 'uint32'); pass.drawIndexed(mesh.indexCount); }
+    // Offscreen casters remain in the light's pass; camera culling only affects raster work.
+    const draws = phase === 'raster' ? this.rasterDraws : this.owner.selectedMeshes(this.doubleSided, this.mode).map(mesh => ({ mesh, firstIndex: 0, indexCount: mesh.indexCount }));
+    let bound: Mesh | undefined;
+    for (const { mesh, firstIndex, indexCount } of draws) {
+      if (bound !== mesh) {
+        if (this.mode !== 'static') pass.setBindGroup(2, this.deformation![phase].get(mesh)!);
+        if (mesh.influences) pass.setVertexBuffer(1, mesh.influences);
+        pass.setBindGroup(1, this.bindings[phase][mesh.material]!); pass.setVertexBuffer(0, mesh.vertices); pass.setIndexBuffer(mesh.indices, 'uint32'); bound = mesh;
+      }
+      pass.drawIndexed(indexCount, 1, firstIndex);
+    }
   }
   dispose(): void { this.owner.dispose(); this.bindings = undefined; }
 }
