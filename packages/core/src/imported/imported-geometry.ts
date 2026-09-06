@@ -1,3 +1,4 @@
+import { blockBytes } from './imported-compression.js';
 import { snapshotMeshTransforms } from '../meshes/mesh-transforms.js';
 import { StrataError } from '../errors.js';
 import type { RasterGeometryGroup, RasterGeometryProvider } from '../rendering/geometry-provider.js';
@@ -162,11 +163,11 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (asset.primitives.some(p => p.deformation) && (device.limits.maxBindGroups < 3 || device.limits.maxStorageBuffersPerShaderStage < 2)) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported animation needs three bind groups and two vertex storage buffers.');
     for (const data of initialPalettes) if (data.byteLength > device.limits.maxStorageBufferBindingSize || data.byteLength > device.limits.maxBufferSize) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported animation palette exceeds device storage limits.');
     const owned: Owned = { buffers: [], textures: [], bufferBytes: 0, textureBytes: 0, initialUploadBytes: 0 };
-    const textureRecords: { image: number; sourceWidth: number; sourceHeight: number; uploadWidth: number; uploadHeight: number; colorSpace: 'srgb' | 'linear'; mipLevels: number; gpuBytes: number }[] = [];
+    const textureRecords: ImportedTelemetry['textures'][number][] = [];
     const texturePlan = estimateImportedTextureAllocation(asset, { maxTextureDimension: asset.maxTextureDimension,
-      maxTextureDimension2D: Math.min(16384, device.limits.maxTextureDimension2D) });
+      maxTextureDimension2D: Math.min(16384, device.limits.maxTextureDimension2D), textureCompressionBC: device.features.has('texture-compression-bc') });
     const textureRequests = new Map(texturePlan.textures.map(record => [ `${record.image}/${record.colorSpace === 'srgb'}`, {
-      image: record.image, srgb: record.colorSpace === 'srgb', extent: { width: record.uploadWidth, height: record.uploadHeight, mipLevels: record.mipLevels, bytes: record.gpuBytes },
+      format: record.format, sourceMip: record.sourceMip, image: record.image, srgb: record.colorSpace === 'srgb', extent: { width: record.uploadWidth, height: record.uploadHeight, mipLevels: record.mipLevels, bytes: record.gpuBytes },
     } ]));
     const definitions = [...asset.materials, groundMaterial];
     const roles = (m: ImportedMaterial) => [m.baseColorTexture, m.metallicRoughnessTexture, m.normalTexture, m.occlusionTexture, m.emissiveTexture];
@@ -224,6 +225,26 @@ export class ImportedGeometry implements RasterGeometryGroup {
       const gpuImages = new Map<string, GPUTexture>();
       for (const [key, request] of textureRequests) {
         checkSignal(signal); const image = asset.images[request.image]!; const e = request.extent;
+        if (request.format !== undefined) {
+          const variant = image.compressed!, first = request.sourceMip!;
+          const t = device.createTexture({ label: `Strata compressed imported image ${request.image}`, size: [e.width, e.height],
+            mipLevelCount: e.mipLevels, format: request.format, usage: 0x2 | 0x4 });
+          owned.textures.push(t); owned.textureBytes += e.bytes;
+          for (let level = 0; level < e.mipLevels; level++) {
+            checkSignal(signal);
+            const w = Math.max(1, e.width >> level), h = Math.max(1, e.height >> level);
+            const physicalWidth = Math.ceil(w / 4) * 4, physicalHeight = Math.ceil(h / 4) * 4;
+            const data = variant.mips[first + level]!;
+            device.queue.writeTexture({ texture: t, mipLevel: level }, data,
+              { bytesPerRow: physicalWidth / 4 * blockBytes(variant.format), rowsPerImage: physicalHeight / 4 }, [physicalWidth, physicalHeight]);
+            owned.initialUploadBytes += data.byteLength;
+          }
+          gpuImages.set(key, t);
+          textureRecords.push({ image: request.image, sourceWidth: image.width, sourceHeight: image.height, uploadWidth: e.width,
+            uploadHeight: e.height, colorSpace: request.srgb ? 'srgb' : 'linear', mipLevels: e.mipLevels, gpuBytes: e.bytes,
+            ...{ format: request.format, sourceMip: first } });
+          continue;
+        }
         let source: ImageBitmap | undefined, upload: ImageBitmap | undefined;
         try {
           source = await createImageBitmap(new Blob([image.bytes], { type: image.mimeType }), { colorSpaceConversion: 'none', premultiplyAlpha: 'none', imageOrientation: 'none' });
@@ -252,7 +273,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
       const samplers = new Map<string, GPUSampler>();
       const sampler = (ref: ImportedTexture | undefined): GPUSampler => { const descriptor = samplerDescriptor(ref?.sampler ?? defaultSampler); const key = JSON.stringify(descriptor); let value = samplers.get(key); if (!value) { value = device.createSampler(descriptor); samplers.set(key, value); } return value; };
       const materials = definitions.map(m => {
-        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), Number(Boolean(m.normalTexture)), Number(Boolean(m.unlit))]);
+        const normalImage = m.normalTexture ? asset.images[m.normalTexture.image] : undefined;
+        const normalPlan = m.normalTexture ? textureRequests.get(`${m.normalTexture.image}/false`) : undefined;
+        const normalEncoding = normalPlan?.format === 'bc5-rg-unorm' ? (normalImage?.compressed?.normalY === 'down' ? 3 : 2) : Number(Boolean(m.normalTexture));
+        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), normalEncoding, Number(Boolean(m.unlit))]);
         if (data.byteLength !== materialBytes || !data.every(Number.isFinite)) fail('material factors must be finite.');
         return { buffer: buffer('Strata imported material', data, 0x40), textures: roles(m).map((ref, role) => ref ? gpuImages.get(`${ref.image}/${role === 0 || role === 4}`)! : fallbacks[Number(role === 0 || role === 4)]!), samplers: roles(m).map(sampler), doubleSided: m.doubleSided,
           definition: { ...m, baseColorFactor: [...m.baseColorFactor] as const, emissiveFactor: [...m.emissiveFactor] as const } };

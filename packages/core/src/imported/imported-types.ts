@@ -15,7 +15,16 @@ export interface ImportedTexture {
   readonly image: number;
   readonly sampler: ImportedSampler;
 }
+export interface ImportedBlockCompression {
+  readonly format: 'bc1-rgba-unorm' | 'bc3-rgba-unorm' | 'bc5-rg-unorm';
+  /** Complete mip chain, starting at the fallback image's dimensions. Caller-owned bytes. */
+  readonly mips: readonly Uint8Array<ArrayBuffer>[];
+  /** BC5 is restricted to normal maps; reconstruct positive Z. Default up (glTF), down for DirectX. */
+  readonly normalY?: 'up' | 'down';
+}
 export interface ImportedImage {
+  /** Optional GPU-native variant; PNG/JPEG remains the portable fallback. */
+  readonly compressed?: ImportedBlockCompression;
   readonly name: string;
   readonly mimeType: 'image/png' | 'image/jpeg';
   readonly bytes: Uint8Array<ArrayBuffer>;
@@ -188,6 +197,7 @@ export interface ImportedTelemetry {
   readonly shading: 'authored' | 'relit';
   readonly environment: Required<ImportedEnvironment> | null;
   readonly textures: readonly {
+    readonly format?: GPUTextureFormat; readonly sourceMip?: number;
     readonly image: number; readonly sourceWidth: number; readonly sourceHeight: number;
     readonly uploadWidth: number; readonly uploadHeight: number;
     readonly colorSpace: 'srgb' | 'linear'; readonly mipLevels: number; readonly gpuBytes: number;
