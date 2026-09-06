@@ -48,7 +48,7 @@ export function importedTextureExtent(width: number, height: number, edge: numbe
   return { width: w, height: h, mipLevels, bytes };
 }
 
-const textureRoles = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'occlusionTexture', 'emissiveTexture'] as const;
+const textureRoles = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'occlusionTexture', 'emissiveTexture', 'lightmapTexture'] as const;
 
 /**
  * Estimates retained imported-scene texture payload without decoding, allocating GPU resources or importing environment data.
@@ -70,6 +70,7 @@ export function estimateImportedTextureAllocation(
   const effectiveMaxTextureDimension = Math.min(requestedMaxTextureDimension, options.maxTextureDimension2D);
   const textures: ImportedTextureAllocationRecord[] = [], seen = new Set<string>();
   let gpuTextureBytes = 8 + importedEnvironmentTextureBytes;
+  const lightmaps = new Set(asset.materials.flatMap(m => m?.lightmapTexture ? [m.lightmapTexture.image] : []));
   for (const material of asset.materials) {
     if (!material || typeof material !== 'object' || Array.isArray(material)) fail('material must be an object.');
     for (const role of textureRoles) {
@@ -77,6 +78,8 @@ export function estimateImportedTextureAllocation(
       if (ref === undefined) continue;
       if (!ref || typeof ref !== 'object' || Array.isArray(ref)) fail('material texture reference must be an object.');
       if (!Number.isSafeInteger(ref.image) || ref.image < 0 || ref.image >= asset.images.length) fail('material references an absent image.');
+      const isLightmap = role === 'lightmapTexture';
+      if (!isLightmap && lightmaps.has(ref.image)) fail('lightmap images cannot be reused by other texture roles.');
       const colorSpace = role === 'baseColorTexture' || role === 'emissiveTexture' ? 'srgb' : 'linear';
       const key = `${ref.image}/${colorSpace}`;
       const image = asset.images[ref.image];
@@ -84,6 +87,10 @@ export function estimateImportedTextureAllocation(
       if (image.compressed?.format === 'bc5-rg-unorm' && role !== 'normalTexture') fail('BC5 variants may only be bound as normal maps.');
       if (seen.has(key)) continue;
       let extent = importedTextureExtent(image.width, image.height, effectiveMaxTextureDimension);
+      if (isLightmap) {
+        if (image.compressed || Math.max(image.width, image.height) > options.maxTextureDimension2D) fail('lightmaps require uncompressed PNGs within the device edge limit.');
+        extent = { width: image.width, height: image.height, mipLevels: 1, bytes: image.width * image.height * 4 };
+      }
       let format: GPUTextureFormat | undefined, sourceMip: number | undefined;
       if (image.compressed) {
         validateBlockCompression(image.compressed, image.width, image.height);

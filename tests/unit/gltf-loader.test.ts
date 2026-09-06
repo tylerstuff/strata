@@ -366,3 +366,28 @@ describe('generated glTF containers, animation and rejection boundaries', () => 
     setTimeout(() => controller.abort(),0); await expect(loadGltf(url,{signal:controller.signal})).rejects.toMatchObject({code:'SCENE_LOAD_ABORTED'});
   });
 });
+
+
+describe('static lightmap glTF contract', () => {
+  function lightmapped() {
+    const f=new Fixture(); const p=f.triangle(); p.material=0;
+    (p.attributes as GltfObject).TEXCOORD_1=f.add(new Float32Array([.1,.2,.8,.2,.1,.9]),'VEC2');
+    f.document.images=[{uri:'../texture.png'}]; f.document.textures=[{source:0}];
+    f.document.extensionsRequired=['EXT_strata_lightmap'];
+    f.document.materials=[{extensions:{EXT_strata_lightmap:{version:1,encoding:'rgbm',range:32,texture:{index:0,texCoord:1}}}}];
+    return {f,p};
+  }
+  it('preserves secondary UVs independently of albedo UV and accounts their bytes', async()=>{
+    const {f}=lightmapped();const a=await f.load();
+    expectVector(a.primitives[0]!.lightmapUvs!,[.1,.2,.8,.2,.1,.9]);
+    expect(a.primitives[0]!.vertices[6]).toBe(0);
+    expect(a.materials[0]!.lightmapRange).toBe(32);
+    expect(a.stats.geometryBytes).toBe(3*72+3*4);
+  });
+  it('rejects missing UVs and animated receivers',async()=>{
+    const {f,p}=lightmapped();delete (p.attributes as GltfObject).TEXCOORD_1;
+    await expect(f.load()).rejects.toThrow('TEXCOORD_1');
+    const other=lightmapped();translationClip(other.f);
+    await expect(other.f.load()).rejects.toThrow('no deformation');
+  });
+});

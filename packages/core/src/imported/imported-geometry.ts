@@ -14,13 +14,13 @@ import { estimateImportedTextureAllocation } from './imported-texture-plan.js';
 import type { ImportedIndirectMaterial } from './imported-indirect-types.js';
 export { importedTextureExtent } from './imported-texture-plan.js';
 
-const geometryBudget = 256 * 1024 * 1024;
-const materialBytes = 64;
+const geometryBudget = 384 * 1024 * 1024;
+const materialBytes = 80;
 const lightBytes = 48;
-const vertexLayout: GPUVertexBufferLayout[] = [{ arrayStride: 64, attributes: [
+const vertexLayout: GPUVertexBufferLayout[] = [{ arrayStride: 72, attributes: [
   { shaderLocation: 0, offset: 0, format: 'float32x3' }, { shaderLocation: 1, offset: 12, format: 'float32x3' },
   { shaderLocation: 2, offset: 24, format: 'float32x2' }, { shaderLocation: 3, offset: 32, format: 'float32x4' },
-  { shaderLocation: 4, offset: 48, format: 'float32x4' },
+  { shaderLocation: 4, offset: 48, format: 'float32x4' }, { shaderLocation: 7, offset: 64, format: 'float32x2' },
 ] }];
 const defaultSampler: ImportedSampler = { wrapS: 10497, wrapT: 10497, magFilter: 9729, minFilter: 9987 };
 export const importedDefaults = {
@@ -89,6 +89,12 @@ function validateMaterial(material: ImportedMaterial): void {
     if (!Array.isArray(value) || value.length !== length) fail(`${name} must contain exactly ${length} components.`);
     for (const component of value) factor(component, name, 0, 1);
   };
+  if (material.lightmapTexture !== undefined) {
+    factor(material.lightmapRange, 'lightmapRange', 0.000001, 65536);
+    if (material.unlit) fail('unlit materials cannot receive lightmaps.');
+    const s = material.lightmapTexture.sampler;
+    if (!s || s.wrapS !== 33071 || s.wrapT !== 33071 || s.magFilter !== 9729 || s.minFilter !== 9729) fail('lightmaps require clamp bilinear sampling without mipmaps.');
+  } else if (material.lightmapRange !== undefined) fail('lightmapRange requires a lightmap texture.');
   color(material.baseColorFactor, 4, 'baseColorFactor'); color(material.emissiveFactor, 3, 'emissiveFactor');
   factor(material.metallicFactor, 'metallicFactor', 0, 1); factor(material.roughnessFactor, 'roughnessFactor', 0, 1);
   factor(material.emissiveStrength, 'emissiveStrength', 0, 1e6); factor(material.normalScale, 'normalScale', -Infinity);
@@ -114,6 +120,11 @@ function transformedBounds(bounds: ImportedBounds, matrices: Float32Array, offse
 interface Material { buffer: GPUBuffer; textures: readonly GPUTexture[]; samplers: readonly GPUSampler[]; doubleSided: boolean; definition: ImportedMaterial; }
 interface Owned { buffers: GPUBuffer[]; textures: GPUTexture[]; bufferBytes: number; textureBytes: number; initialUploadBytes: number; }
 const groundMaterial: ImportedMaterial = { name: 'Strata explicit ground', baseColorFactor: [.22, .22, .22, 1], metallicFactor: 0, roughnessFactor: .9, emissiveFactor: [0, 0, 0], emissiveStrength: 1, normalScale: 1, occlusionStrength: 1, alphaMode: 'OPAQUE', alphaCutoff: .5, doubleSided: false };
+function gpuVertices(vertices: Float32Array<ArrayBuffer>, uv?: Float32Array<ArrayBuffer>): Float32Array<ArrayBuffer> {
+  const result = new Float32Array(vertices.length / 16 * 18);
+  for (let i = 0; i < vertices.length / 16; i++) { result.set(vertices.subarray(i * 16, i * 16 + 16), i * 18); if (uv) result.set(uv.subarray(i * 2, i * 2 + 2), i * 18 + 16); }
+  return result;
+}
 function groundVertices(): Float32Array<ArrayBuffer> {
   return new Float32Array([[-3, -.005, -3, 0, 0], [3, -.005, -3, 1, 0], [3, -.005, 3, 1, 1], [-3, -.005, 3, 0, 1]].flatMap(([x, y, z, u, v]) => [x!, y!, z!, 0, 1, 0, u!, v!, 1, 0, 0, -1, 1, 1, 1, 1]));
 }
@@ -164,7 +175,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     if (!Number.isSafeInteger(asset.maxTextureDimension) || asset.maxTextureDimension < 1 || asset.maxTextureDimension > 16384) fail('invalid texture edge cap.');
     vector(asset.bounds.min, 'bounds min', 1024); vector(asset.bounds.max, 'bounds max', 1024);
     if (asset.bounds.min.some((v, i) => v > asset.bounds.max[i]!)) fail('bounds are inverted.');
-    if (device.limits.maxSampledTexturesPerShaderStage < 8 || device.limits.maxSamplersPerShaderStage < 7 || device.limits.maxBindGroups < 2) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported PBR/environment needs eight sampled textures, seven samplers and two bind groups.');
+    if (device.limits.maxSampledTexturesPerShaderStage < 9 || device.limits.maxSamplersPerShaderStage < 7 || device.limits.maxBindGroups < 2) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported PBR/environment needs nine sampled textures, seven samplers and two bind groups.');
     const evaluator = createImportedPoseEvaluator(asset);
     const initialPose = evaluator.evaluate();
     const initialPalettes = [initialPose.nodeMatrices, ...initialPose.skinMatrices];
@@ -178,7 +189,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
       format: record.format, sourceMip: record.sourceMip, image: record.image, srgb: record.colorSpace === 'srgb', extent: { width: record.uploadWidth, height: record.uploadHeight, mipLevels: record.mipLevels, bytes: record.gpuBytes },
     } ]));
     const definitions = [...asset.materials, groundMaterial];
-    const roles = (m: ImportedMaterial) => [m.baseColorTexture, m.metallicRoughnessTexture, m.normalTexture, m.occlusionTexture, m.emissiveTexture];
+    const roles = (m: ImportedMaterial) => [m.baseColorTexture, m.metallicRoughnessTexture, m.normalTexture, m.occlusionTexture, m.emissiveTexture, m.lightmapTexture];
     for (const material of definitions) {
       validateMaterial(material);
       for (const ref of roles(material)) {
@@ -198,7 +209,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
         || !Number.isSafeInteger(primitive.material) || !definitions[primitive.material] || primitive.material >= asset.materials.length) fail('invalid primitive buffers/material.');
       const vertices = primitive.vertices.length / 16;
       if (!primitive.vertices.every(Number.isFinite) || primitive.indices.some((v: number) => v >= vertices)) fail('nonfinite geometry or out-of-range triangle index.');
-      geometryBytes += primitive.vertices.byteLength + primitive.indices.byteLength;
+      const uv = primitive.lightmapUvs;
+      if (uv !== undefined && (!(uv instanceof Float32Array) || uv.length !== vertices * 2 || !uv.every(v => Number.isFinite(v) && v >= 0 && v <= 1))) fail('lightmap UVs must be finite in [0, 1], two per vertex.');
+      if (definitions[primitive.material]!.lightmapTexture && (!uv || primitive.deformation)) fail('lightmaps require UVs and immutable geometry.');
+      geometryBytes += vertices * 72 + primitive.indices.byteLength;
       const deformation = primitive.deformation;
       if (deformation) {
         if (!Number.isSafeInteger(deformation.node) || deformation.node < 0 || deformation.node >= initialPose.nodeMatrices.length / 16
@@ -212,10 +226,10 @@ export class ImportedGeometry implements RasterGeometryGroup {
           geometryBytes += vertices * 32;
         }
       }
-      if (primitive.vertices.byteLength > device.limits.maxBufferSize || primitive.indices.byteLength > device.limits.maxBufferSize) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported mesh exceeds maxBufferSize.');
+      if (vertices * 72 > device.limits.maxBufferSize || primitive.indices.byteLength > device.limits.maxBufferSize) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported mesh exceeds maxBufferSize.');
     }
     geometryBytes += initialPalettes.reduce((sum, data) => sum + data.byteLength * 2, 0);
-    if (geometryBytes > geometryBudget) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported static GPU geometry exceeds 256 MiB.');
+    if (geometryBytes > geometryBudget) throw new StrataError('UNSUPPORTED_LIMIT', 'Imported static GPU geometry exceeds 384 MiB.');
     const buffer = (label: string, data: Float32Array<ArrayBuffer> | Uint32Array<ArrayBuffer>, usage: GPUBufferUsageFlags): GPUBuffer => {
       const value = device.createBuffer({ label, size: data.byteLength, usage: usage | 0x8 }); owned.buffers.push(value); owned.bufferBytes += data.byteLength;
       device.queue.writeBuffer(value, 0, data); owned.initialUploadBytes += data.byteLength; return value;
@@ -284,7 +298,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
         const normalImage = m.normalTexture ? asset.images[m.normalTexture.image] : undefined;
         const normalPlan = m.normalTexture ? textureRequests.get(`${m.normalTexture.image}/false`) : undefined;
         const normalEncoding = normalPlan?.format === 'bc5-rg-unorm' ? (normalImage?.compressed?.normalY === 'down' ? 3 : 2) : Number(Boolean(m.normalTexture));
-        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), normalEncoding, Number(Boolean(m.unlit))]);
+        const data = new Float32Array([...m.baseColorFactor, ...m.emissiveFactor, m.emissiveStrength, m.metallicFactor, m.roughnessFactor, m.normalScale, m.occlusionStrength, m.alphaCutoff, Number(m.alphaMode === 'MASK'), normalEncoding, Number(Boolean(m.unlit)), m.lightmapRange ?? 0, 0, 0, 0]);
         if (data.byteLength !== materialBytes || !data.every(Number.isFinite)) fail('material factors must be finite.');
         return { buffer: buffer('Strata imported material', data, 0x40), textures: roles(m).map((ref, role) => ref ? gpuImages.get(`${ref.image}/${role === 0 || role === 4}`)! : fallbacks[Number(role === 0 || role === 4)]!), samplers: roles(m).map(sampler), doubleSided: m.doubleSided,
           definition: { ...m, baseColorFactor: [...m.baseColorFactor] as const, emissiveFactor: [...m.emissiveFactor] as const } };
@@ -307,12 +321,12 @@ export class ImportedGeometry implements RasterGeometryGroup {
         } else {
           const b = pointBounds(); for (let vertex = 0; vertex < vertices.length; vertex += 16) addPoint(b, vertices.subarray(vertex, vertex + 3)); bounds.set(d?.node ?? 0, b);
         }
-        return { vertices: buffer('Strata imported vertices', vertices, 0x20), indices: buffer('Strata imported indices', primitive.indices, 0x10), indexCount: primitive.indices.length,
+        return { vertices: buffer('Strata imported vertices', gpuVertices(vertices, primitive.lightmapUvs), 0x20), indices: buffer('Strata imported indices', primitive.indices, 0x10), indexCount: primitive.indices.length,
           material: primitive.material, ground: false, mode, influences, palette: mode === 'skin' ? d!.skin! + 1 : 0,
           deformationUniform: d ? buffer('Strata imported deformation mode', new Uint32Array([Number(mode === 'skin'), d.node, 0, 0]), 0x40) : undefined,
           bounds: [...bounds].map(([matrix, bounds]) => ({ matrix, bounds })) };
       });
-      meshes.push({ vertices: buffer('Strata explicit ground vertices', groundVertices(), 0x20), indices: buffer('Strata explicit ground indices', new Uint32Array([0, 2, 1, 0, 3, 2]), 0x10), indexCount: 6,
+      meshes.push({ vertices: buffer('Strata explicit ground vertices', gpuVertices(groundVertices()), 0x20), indices: buffer('Strata explicit ground indices', new Uint32Array([0, 2, 1, 0, 3, 2]), 0x10), indexCount: 6,
         material: materials.length - 1, ground: true, mode: 'static', influences: undefined, deformationUniform: undefined, palette: 0, bounds: [{ matrix: 0, bounds: { min: [-3, -.005, -3], max: [3, -.005, 3] } }] });
       const lightData = new Float32Array(lightBytes / 4); const defaults = snapshot({ lighting: importedDefaults.lighting }, importedDefaults);
       lightData.set(defaults.lighting.directionToLight); lightData.set(defaults.lighting.color.map(v => v * defaults.lighting.intensity), 4); lightData.set(defaults.lighting.ambient, 8);
@@ -348,6 +362,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   get lighting(): NonNullable<ImportedControls['lighting']> { return snapshot({}, this.settings).lighting; }
   useIndirectBaseline(): void {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
+    if (this.materials.some(m => m.definition.lightmapTexture)) fail('lightmaps cannot be combined with progressive GI.');
     this.indirectBaseline = true; this.lightDirty = true; this.environmentDirty = true;
   }
   /** Borrowed resources remain owned by this geometry. No allocation, decode or upload is repeated. */
@@ -368,6 +383,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   update(controls: ImportedControls = {}): boolean {
     if (this.disposed) throw new StrataError('ENGINE_DISPOSED', 'Imported geometry is disposed.');
     const next = snapshot(controls, this.settings);
+    if (next.bakedVertexLighting && this.materials.some(m => m.definition.lightmapTexture)) fail('vertex bakes cannot be combined with lightmaps.');
     if (next.bakedVertexLighting && (this.indirectBaseline || this.meshes.some(mesh => mesh.mode !== 'static'))) fail('bakedVertexLighting requires immutable geometry without progressive GI.');
     if (controls.animation !== undefined && (!controls.animation || typeof controls.animation !== 'object' || Array.isArray(controls.animation))) fail('animation controls must be an object.');
     const animation = controls.animation === undefined ? this.animation : controls.animation;
@@ -453,7 +469,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   materialBindings(pipeline: GPURenderPipeline, shadow: boolean): readonly GPUBindGroup[] {
     return this.materials.map(m => this.device.createBindGroup({ label: 'Strata imported material bindings', layout: pipeline.getBindGroupLayout(1), entries: shadow ? [
       { binding: 0, resource: { buffer: m.buffer } }, { binding: 1, resource: m.textures[0]!.createView() }, { binding: 2, resource: m.samplers[0]! },
-    ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } },
+    ] : [{ binding: 0, resource: { buffer: m.buffer } }, ...m.textures.flatMap((texture, i) => i === 5 ? [{ binding: 16, resource: texture.createView() }] : [{ binding: i * 2 + 1, resource: texture.createView() }, { binding: i * 2 + 2, resource: m.samplers[i]! }]), { binding: 11, resource: { buffer: this.lightBuffer } },
       { binding: 12, resource: this.environment.cube.createView({ dimension: '2d-array', arrayLayerCount: 12 }) },
       { binding: 13, resource: this.environment.dfg.createView() }, { binding: 14, resource: this.environment.sampler },
       { binding: 15, resource: { buffer: this.environment.uniform } }] }));

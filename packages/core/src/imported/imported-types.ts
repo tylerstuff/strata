@@ -50,11 +50,16 @@ export interface ImportedMaterial {
   readonly normalTexture?: ImportedTexture;
   readonly occlusionTexture?: ImportedTexture;
   readonly emissiveTexture?: ImportedTexture;
+  /** Static diffuse irradiance/pi, RGBM PNG on lightmapUvs, with a positive decode range. */
+  readonly lightmapTexture?: ImportedTexture;
+  readonly lightmapRange?: number;
 }
 export interface ImportedPrimitive {
   readonly name: string;
   /** Interleaved static normalized world position3, normal3, UV2, tangent4, linear vertex color4 (64-byte stride). */
   readonly vertices: Float32Array<ArrayBuffer>;
+  /** Independent, nonoverlapping UVs for static lightmaps (two floats per vertex). */
+  readonly lightmapUvs?: Float32Array<ArrayBuffer>;
   readonly indices: Uint32Array<ArrayBuffer>;
   readonly material: number;
   /** Local pre-skin attributes for optional deterministic TRS animation. Static vertices above remain the rest pose. */

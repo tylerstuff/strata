@@ -125,3 +125,18 @@ describe('imported upload extent', () => {
     invalid(() => importedTextureExtent(1, 1, value));
   });
 });
+
+
+describe('static RGBM lightmap allocation', () => {
+  it('retains atlas resolution without mipmaps, counts its memory once', () => {
+    const m = {...material, lightmapTexture: texture(0), lightmapRange: 32};
+    const plan = estimateImportedTextureAllocation({materials: [m,m], images: [image(4096,4096)]}, {...options,maxTextureDimension:256});
+    expect(plan.textures).toHaveLength(1);
+    expect(plan.textures[0]).toMatchObject({uploadWidth:4096,uploadHeight:4096,mipLevels:1,gpuBytes:67108864,colorSpace:'linear'});
+  });
+  it('rejects incompatible role aliasing and unsupported device dimensions', () => {
+    const m = {...material, lightmapTexture: texture(0), lightmapRange:32};
+    invalid(()=>estimateImportedTextureAllocation({materials:[m,{...material,normalTexture:texture(0)}],images:[image(4096,4096)]},options));
+    invalid(()=>estimateImportedTextureAllocation({materials:[m],images:[image(4096,4096)]},{...options,maxTextureDimension2D:2048}));
+  });
+});
