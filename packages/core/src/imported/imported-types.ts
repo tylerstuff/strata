@@ -158,6 +158,11 @@ export interface ImportedControls {
   readonly indirect?: { readonly enabled: boolean; readonly denoise?: ImportedIndirectDenoise };
   /** Authored is the default. Relit changes only unlit materials to geometric-normal matte dielectric (roughness .65). */
   readonly shading?: 'authored' | 'relit';
+  /** Static bake profile: interpret vertex RGB as linear diffuse irradiance / pi,
+   * not albedo. Intensity 0 disables its contribution without changing material color.
+   * Null restores ordinary vertex albedo; omission retains the setting.
+   * Requires immutable geometry, model-only presentation, and no progressive GI. */
+  readonly bakedVertexLighting?: { readonly intensity: number } | null;
   /** verticalFov is in radians. Camera motion retains reprojection history. */
   readonly camera?: { readonly eye: ImportedVec3; readonly target: ImportedVec3; readonly verticalFov: number };
   readonly lighting?: {

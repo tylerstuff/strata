@@ -51,3 +51,4 @@ Strata-Benchmark-Assets/
 /benchmarks/browser/compressed-texture-validation.js
 
 /benchmarks/browser/imported-sky-validation.js
+/benchmarks/browser/imported-baked-validation.js

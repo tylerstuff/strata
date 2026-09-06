@@ -1,0 +1,25 @@
+import {parseArgs} from 'node:util';
+import {resolve,dirname,relative,isAbsolute,sep} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {realpath,mkdir,readFile,access} from 'node:fs/promises';
+import {spawn} from 'node:child_process';
+import {finalizeBake} from './finalize-imported-bake.mjs';
+const {values}=parseArgs({options:{input:{type:'string'},output:{type:'string'},blender:{type:'string',default:'blender'},samples:{type:'string',default:'32'},'emission-scale':{type:'string',default:'1'}}});
+if(!values.input||!values.output)throw Error('Usage: node scripts/bake-imported.mjs --input scene.gltf --output EXTERNAL_NEW_DIRECTORY --blender /path/to/blender [--samples 32] [--emission-scale 1]');
+const repository=await realpath(resolve(dirname(fileURLToPath(import.meta.url)),'..'));
+const input=await realpath(values.input),output=resolve(values.output);
+const samples=Number(values.samples),emissionScale=Number(values['emission-scale']);
+if(!Number.isInteger(samples)||samples<1||samples>4096||!Number.isFinite(emissionScale)||emissionScale<=0||emissionScale>1000)throw Error('Invalid sample count or emission scale.');
+const source=JSON.parse(await readFile(input,'utf8'));
+if(source.animations?.length||source.skins?.length||source.meshes?.some(m=>m.primitives.some(p=>p.attributes.COLOR_0!==undefined)))throw Error('Initial baker accepts static glTF without vertex albedo; preserve animated and vertex-painted assets separately.');
+if(!source.materials?.length||source.materials.some(m=>!m.name)||new Set(source.materials.map(m=>m.name)).size!==source.materials.length)throw Error('Initial bake profile requires unique named source materials.');
+if(source.images?.some(image=>!image.uri||image.uri.startsWith('data:')))throw Error('Initial bake profile requires external image files.');
+await mkdir(dirname(output),{recursive:true});const parent=await realpath(dirname(output));
+const relativeParent=relative(repository,parent);if(relativeParent===''||(relativeParent!=='..'&&!relativeParent.startsWith('..'+sep)&&!isAbsolute(relativeParent)))throw Error('Bake output must be outside the repository.');
+try{await access(output);throw Error('Bake output already exists; use a new directory.');}catch(e){if(e.code!=='ENOENT')throw e;}
+await mkdir(output);
+const child=spawn(values.blender,['--background','--factory-startup','--python-exit-code','1','--python',resolve(repository,'scripts/bake-imported.py'),'--',input,output,String(samples),String(emissionScale)],{stdio:'inherit'});
+const code=await new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',resolve);});
+if(code!==0)throw Error(`Cycles bake failed (${code}).`);
+await finalizeBake(input,output);
+console.log(`Strata baked scene ready: ${output}`);
