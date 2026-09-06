@@ -104,7 +104,7 @@ export function gltfImageDimensions(bytes: Uint8Array<ArrayBuffer>, maximum: num
 }
 
 function materialData(document: GltfObject): ImportedMaterial[] {
-  const textures = list(document.textures ?? [], 'textures', maximumItems); const images = list(document.images ?? [], 'images', 256);
+  const textures = list(document.textures ?? [], 'textures', maximumItems); const images = list(document.images ?? [], 'images', 1024);
   const samplers = list(document.samplers ?? [], 'samplers', maximumItems);
   const choose = <T extends number>(value: unknown, fallback: T, values: readonly T[]): T => {
     const result = value ?? fallback; if (!values.includes(result as T)) gltfError('Unsupported texture sampler enum.'); return result as T;
@@ -212,7 +212,7 @@ async function animationData(document: GltfObject, accessors: GltfAccessors, nod
 /** Optional bounded glTF/GLB loader: rest-pose flattening plus retained TRS/skin animation source. */
 export async function loadGltf(input: string | URL, options: LoadGltfOptions = {}): Promise<ImportedAsset> {
   if (!options || typeof options !== 'object') throw new StrataError('INVALID_OPTIONS', 'glTF load options must be an object.');
-  const maximumSource = integer(options.maxSourceBytes ?? 256 * 1024 * 1024, 'maxSourceBytes', 1, 1024 * 1024 * 1024);
+  const maximumSource = integer(options.maxSourceBytes ?? 256 * 1024 * 1024, 'maxSourceBytes', 1, 2 * 1024 * 1024 * 1024);
   const maximumGeometry = integer(options.maxGeometryBytes ?? 256 * 1024 * 1024, 'maxGeometryBytes', 1, 1024 * 1024 * 1024);
   const maxTextureDimension = integer(options.maxTextureDimension ?? 2048, 'maxTextureDimension', 1, 16384);
   const maxSourceDimension = integer(options.maxSourceImageDimension ?? 16384, 'maxSourceImageDimension', 1, 32768);
@@ -232,7 +232,7 @@ export async function loadGltf(input: string | URL, options: LoadGltfOptions = {
     }
     const accessors = new GltfAccessors(doc, buffers, budget.reserve, options.signal); const graph = await hierarchy(doc, budget.reserve, options.signal);
     const materials = materialData(doc); const images: ImportedImage[] = [];
-    for (const [index, value] of list(doc.images ?? [], 'images', 256).entries()) {
+    for (const [index, value] of list(doc.images ?? [], 'images', 1024).entries()) {
       const image = object(value, 'image'); let bytes: Uint8Array<ArrayBuffer>;
       if (image.uri !== undefined) { if (image.bufferView !== undefined || typeof image.uri !== 'string') gltfError('Image must choose URI or bufferView.'); bytes = await budget.fetch(new URL(image.uri, url)); }
       else { if (image.mimeType !== 'image/png' && image.mimeType !== 'image/jpeg') gltfError('Embedded images require PNG/JPEG mimeType.'); const source = accessors.view(image.bufferView); if (source.stride !== undefined) gltfError('Images cannot use strided bufferViews.'); budget.reserve(source.bytes.byteLength); bytes = source.bytes.slice(); }

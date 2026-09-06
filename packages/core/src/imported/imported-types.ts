@@ -111,7 +111,7 @@ export interface LoadGltfOptions {
   readonly signal?: AbortSignal;
   /** Defaults to 2048. Larger source images are resized in memory for upload and reported. */
   readonly maxTextureDimension?: number;
-  /** Aggregate fetched/decoded source limit; defaults to 256 MiB. */
+  /** Aggregate fetched/decoded source limit; defaults to 256 MiB, explicit maximum 2 GiB. Not a process-memory guarantee. */
   readonly maxSourceBytes?: number;
   /** Output geometry limit; defaults to 256 MiB. */
   readonly maxGeometryBytes?: number;
