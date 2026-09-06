@@ -20,6 +20,7 @@ describe('WASM capsule collision',()=>{
    // Centre ray misses the wall, but camera volume grazes its top.
    expect(c.sweepSphere([0,5.1,0],[4,5.1,0],.2)).toBeLessThan(2);
    expect(()=>c.sweepSphere([NaN,1,0],[0,1,0])).toThrow();
+   expect(()=>c.sweepSphere(new Array(3) as never,[0,1,0])).toThrow();
    expect(()=>c.sweepSphere([0,1,0],[0,1,0],0)).toThrow();
    expect(c.snapshot()).toEqual(before);
   }finally{c.dispose();}

@@ -6,7 +6,7 @@ let initialization:Promise<typeof Rapier>|undefined;
 async function runtime(){return initialization??=import('@dimforge/rapier3d-compat').then(async r=>{await r.init();return r;}).catch(e=>{initialization=undefined;throw e;});}
 const abort=(signal?:AbortSignal)=>signal?.throwIfAborted();
 function number(v:number,min:number,max:number){if(!Number.isFinite(v)||v<min||v>max)throw new RangeError('Invalid capsule setting.');return v;}
-function vector(v:Vec3):[number,number,number]{if(!Array.isArray(v)||v.length!==3)throw new RangeError('Expected three coordinates.');v.forEach(x=>number(x,-8192,8192));return [v[0],v[1],v[2]];}
+function vector(v:Vec3):[number,number,number]{if(!Array.isArray(v)||v.length!==3)throw new RangeError('Expected three coordinates.');for(let i=0;i<3;i++)number(v[i]!,-8192,8192);return [v[0],v[1],v[2]];}
 const xyz=(v:Vec3)=>({x:v[0],y:v[1],z:v[2]});
 export interface StaticCollisionData {readonly version:1;readonly backend:typeof backend;readonly triangles:number;readonly snapshot:Uint8Array<ArrayBuffer>}
 export interface CollisionMesh {readonly positions:Float32Array<ArrayBuffer>;readonly indices:Uint32Array<ArrayBuffer>}
