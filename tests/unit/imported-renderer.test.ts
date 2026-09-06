@@ -313,3 +313,15 @@ it('allocates the requested shadow edge, counts its bytes and rejects unsupporte
  await expect(ImportedRenderer.create(limited.device,'rgba8unorm',{renderer:'imported',asset:asset(),shadowMapSize:4096})).rejects.toMatchObject({code:'UNSUPPORTED_LIMIT'});
  expect(limited.textures).toHaveLength(0);expect(limited.buffers).toHaveLength(0);
 });
+
+it('pairs receiver-plane filtering with zero caster slope bias and rejects invalid filters before allocation', async () => {
+  const g = gpu();
+  const renderer = await ImportedRenderer.create(g.device, 'rgba8unorm', { renderer: 'imported', asset: asset(), shadowFilter: 'receiver-plane' });
+  const shadow = g.raw.createRenderPipelineAsync.mock.calls.map(([d]) => d).find(d => d.label === 'Strata directional shadow pipeline');
+  expect(shadow?.depthStencil).toMatchObject({ depthBias: 2, depthBiasSlopeScale: 0 });
+  renderer.dispose();
+  const invalid = gpu();
+  await expect(ImportedRenderer.create(invalid.device, 'rgba8unorm', { renderer: 'imported', asset: asset(), shadowFilter: 'invalid' as 'pcf' })).rejects.toMatchObject({ code: 'INVALID_OPTIONS' });
+  expect(invalid.raw.createBuffer).not.toHaveBeenCalled();
+  expect(invalid.raw.createTexture).not.toHaveBeenCalled();
+});

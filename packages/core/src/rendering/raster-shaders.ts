@@ -1,3 +1,75 @@
+export const legacyShadowShader = /* wgsl */ `
+fn shadowReceiverGradient(world: vec3f) -> vec2f { return vec2f(0.0); }
+fn shadowVisibility(world: vec3f) -> f32 { return shadowVisibilityPrepared(world, vec2f(0.0)); }
+fn shadowVisibilityPrepared(world: vec3f, gradient: vec2f) -> f32 {
+  let clip = frame.lightViewProjection * vec4f(world, 1.0);
+  let ndc = clip.xyz / clip.w;
+  let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
+  if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z <= 0.0 || ndc.z >= 1.0) { return 1.0; }
+  let texel = 1.0 / vec2f(textureDimensions(shadowTexture));
+  var visibility = 0.0;
+  for (var y = -1; y <= 1; y++) {
+    for (var x = -1; x <= 1; x++) {
+      visibility += textureSampleCompareLevel(shadowTexture, shadowSampler, uv + vec2f(f32(x), f32(y)) * texel, ndc.z - 0.00025);
+    }
+  }
+  return visibility / 9.0;
+}
+`;
+
+export const receiverPlaneShadowShader = /* wgsl */ `
+fn shadowReceiverGradient(world: vec3f) -> vec2f {
+  let clip = frame.lightViewProjection * vec4f(world, 1.0);
+  let ndc = clip.xyz / clip.w;
+  let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
+  // Derivatives must execute before the bounds branch and the caller's alpha discard.
+  // Transform position differences rather than differencing projected depth near
+  // 0.5; the latter loses precision for a small receiver in a large shadow volume.
+  let clipDx = frame.lightViewProjection * vec4f(dpdx(world), 0.0);
+  let clipDy = frame.lightViewProjection * vec4f(dpdy(world), 0.0);
+  let dx = (clipDx.xyz - ndc * clipDx.w) / clip.w * vec3f(0.5, -0.5, 1.0);
+  let dy = (clipDy.xyz - ndc * clipDy.w) / clip.w * vec3f(0.5, -0.5, 1.0);
+  let determinant = dx.x * dy.y - dx.y * dy.x;
+  var gradient = vec2f(0.0);
+  if (abs(determinant) > max(1e-30, length(dx.xy) * length(dy.xy) * 1e-5)) {
+    gradient = vec2f(dx.z * dy.y - dy.z * dx.y, dx.x * dy.z - dy.x * dx.z) / determinant;
+  }
+  return gradient;
+}
+fn shadowVisibility(world: vec3f) -> f32 {
+  return shadowVisibilityPrepared(world, shadowReceiverGradient(world));
+}
+fn shadowVisibilityPrepared(world: vec3f, gradient: vec2f) -> f32 {
+  let clip = frame.lightViewProjection * vec4f(world, 1.0);
+  let ndc = clip.xyz / clip.w;
+  let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
+  if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z <= 0.0 || ndc.z >= 1.0) { return 1.0; }
+  let dimensions = vec2i(textureDimensions(shadowTexture));
+  let position = uv * vec2f(dimensions) - vec2f(0.5);
+  let origin = vec2i(floor(position));
+  var visibility = 0.0;
+  var weightSum = 0.0;
+  // Compare at actual texel centers: hardware bilinear comparison would apply
+  // one receiver depth to four different points on the sloping surface.
+  for (var y = -1; y <= 2; y++) {
+    for (var x = -1; x <= 2; x++) {
+      let pixel = origin + vec2i(x, y);
+      let weight = max(vec2f(0.0), vec2f(2.0) - abs(vec2f(pixel) - position));
+      let w = weight.x * weight.y;
+      var lit = 1.0;
+      if (all(pixel >= vec2i(0)) && all(pixel < dimensions)) {
+        let offset = (vec2f(pixel) + vec2f(0.5)) / vec2f(dimensions) - uv;
+        let receiverDepth = ndc.z + dot(gradient, offset);
+        lit = select(0.0, 1.0, receiverDepth - 0.00002 <= textureLoad(shadowTexture, pixel, 0));
+      }
+      visibility += lit * w;
+      weightSum += w;
+    }
+  }
+  return visibility / weightSum;
+}
+`;
+
 /** Shared with the browser shader probe so numeric validation executes the production function. */
 export const ggxDistributionShader = /* wgsl */ `
 fn distributionGgx(roughness: f32, nDotH: f32) -> f32 {
@@ -85,20 +157,7 @@ fn worldPosition(input: VertexInput, time: f32) -> vec3f {
   output.debugColor = vec3f(0.0);
   return output;
 }
-fn shadowVisibility(world: vec3f) -> f32 {
-  let clip = frame.lightViewProjection * vec4f(world, 1.0);
-  let ndc = clip.xyz / clip.w;
-  let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
-  if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z <= 0.0 || ndc.z >= 1.0) { return 1.0; }
-  let texel = 1.0 / vec2f(textureDimensions(shadowTexture));
-  var visibility = 0.0;
-  for (var y = -1; y <= 1; y++) {
-    for (var x = -1; x <= 1; x++) {
-      visibility += textureSampleCompareLevel(shadowTexture, shadowSampler, uv + vec2f(f32(x), f32(y)) * texel, ndc.z - 0.00025);
-    }
-  }
-  return visibility / 9.0;
-}
+${legacyShadowShader}
 fn evaluateDirectLight(base: vec3f, roughness: f32, metallic: f32, n: vec3f, v: vec3f, l: vec3f, radiance: vec3f) -> vec3f {
   let h = normalize(v + l);
   let nl = max(dot(n, l), 0.0);
@@ -187,3 +246,5 @@ fn toneMap(value: vec3f) -> vec3f {
   return vec4f(color, 1.0);
 }
 `;
+
+export const receiverPlaneRasterShader = rasterShader.replace(legacyShadowShader, receiverPlaneShadowShader);

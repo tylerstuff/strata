@@ -355,7 +355,7 @@ export async function validateImportedPublicLifecycle() {
   try {
     engine.resize(256, 256); engine.render(); await engine.waitForIdle(); stages.push({ name: 'empty', telemetry: engine.getTelemetry() }); await loadingStage('empty');
     for (let cycle = 0; cycle < 2; cycle++) {
-      await engine.setScene({ renderer: 'imported', asset: input }); engine.render({ timeSeconds: 0, temporal: false, imported: controls }); await engine.waitForIdle();
+      await engine.setScene({ renderer: 'imported', asset: input, shadowFilter: cycle ? 'receiver-plane' : 'pcf' }); engine.render({ timeSeconds: 0, temporal: false, imported: controls }); await engine.waitForIdle();
       stages.push({ name: `imported-${cycle}`, telemetry: engine.getTelemetry() });
       if (cycle === 0) await loadingStage('imported');
       engine.resize(cycle ? 192 : 128, cycle ? 128 : 192); engine.render({ timeSeconds: 1 / 60, temporal: true, imported: controls }); await engine.waitForIdle();
