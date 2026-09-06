@@ -19,8 +19,8 @@ function invalid(run: () => unknown): void {
 
 describe('CPU imported texture allocation plan', () => {
   it('includes both fixed generated environments, the lookup and two white fallbacks with no material images', () => {
-    // Two six-face RGBA16F cubes at edges 64 through 1, plus one 64-square RG16F lookup.
-    const fixedBytes = 2 * 6 * 8 * (4096 + 1024 + 256 + 64 + 16 + 4 + 1) + 64 * 64 * 4;
+    // Two six-face RGBA16F bordered level atlases, plus one 64-square RG16F lookup.
+    const fixedBytes = 66 * 141 * 12 * 8 + 64 * 64 * 4;
     expect(importedEnvironmentTextureBytes).toBe(fixedBytes);
     expect(importedTextureBudget).toBe(536870912);
     expect(estimateImportedTextureAllocation(empty, options)).toEqual({
@@ -33,13 +33,13 @@ describe('CPU imported texture allocation plan', () => {
     const asset: Input = { materials: [{ ...material, baseColorTexture: texture(0), normalTexture: texture(1) }],
       images: [image(8192, 8192), image(8192, 8192)] };
     const full = estimateImportedTextureAllocation(asset, options);
-    expect(full.gpuTextureBytes).toBe(716368528);
+    expect(full.gpuTextureBytes).toBe(716737648);
     expect(full.fitsBudget).toBe(false);
     expect(full.textures.map(t => [t.colorSpace, t.mipLevels, t.gpuBytes])).toEqual([
       ['srgb', 14, 357913940], ['linear', 14, 357913940],
     ]);
     const capped = estimateImportedTextureAllocation(asset, { ...options, maxTextureDimension: 4096 });
-    expect(capped.gpuTextureBytes).toBe(179497616);
+    expect(capped.gpuTextureBytes).toBe(179866736);
     expect(capped.fitsBudget).toBe(true);
     expect(capped.textures.map(t => [t.sourceWidth, t.uploadWidth, t.mipLevels, t.gpuBytes])).toEqual([
       [8192, 4096, 13, 89478484], [8192, 4096, 13, 89478484],
@@ -59,7 +59,7 @@ describe('CPU imported texture allocation plan', () => {
       { image: 0, sourceWidth: 8, sourceHeight: 4, uploadWidth: 4, uploadHeight: 2, colorSpace: 'srgb', mipLevels: 3, gpuBytes: 44 },
       { image: 0, sourceWidth: 8, sourceHeight: 4, uploadWidth: 4, uploadHeight: 2, colorSpace: 'linear', mipLevels: 3, gpuBytes: 44 },
     ]);
-    expect(plan.gpuTextureBytes).toBe(540736);
+    expect(plan.gpuTextureBytes).toBe(909856);
   });
 
   it('uses the smaller device cap, preserves aspect ratio and does not count unreferenced images', () => {
@@ -70,7 +70,7 @@ describe('CPU imported texture allocation plan', () => {
     expect(plan.textures).toEqual([
       { image: 0, sourceWidth: 1, sourceHeight: 16384, uploadWidth: 1, uploadHeight: 1024, colorSpace: 'linear', mipLevels: 11, gpuBytes: 8188 },
     ]);
-    expect(plan.gpuTextureBytes).toBe(548836);
+    expect(plan.gpuTextureBytes).toBe(917956);
   });
 
   it('does not upscale images or depend on encoded bytes, samplers or unrelated material values', () => {
