@@ -75,6 +75,17 @@ export async function createCapsuleController(options:CapsuleOptions){
       teleport(target:Vec3){alive();const candidate=vector(target);if(!clear(candidate))throw new RangeError('Capsule teleport overlaps collision geometry.');position=candidate;previous=[...candidate];velocity=[0,0,0];body.setTranslation(center(position),true);body.setNextKinematicTranslation(center(position));world.step();controller.computeColliderMovement(collider,{x:0,y:-.02,z:0});grounded=controller.computedGrounded();accumulator=0;tick=0;droppedSeconds=0;jumpHeld=false;jumpPending=false;return snapshot();},
       /** Downward world query for spawn inspection. Returns the first triangle surface height. */
       groundHeight(origin:Vec3,distance=20){alive();const p=vector(origin);number(distance,0,16384);const hit=world.castRay(new r.Ray(xyz(p),{x:0,y:-1,z:0}),distance,true,undefined,undefined,collider);return hit?p[1]-hit.timeOfImpact:null;},
+      /** Sweep a sphere along a segment against static geometry, excluding this character.
+       * Returns travel distance to contact, zero for initial overlap, or null when clear. */
+      sweepSphere(origin:Vec3,target:Vec3,radius=.2){
+        alive();const start=vector(origin),end=vector(target);number(radius,.001,5);
+        const ball=new r.Ball(radius);
+        if(world.intersectionWithShape(xyz(start),rotation,ball,undefined,undefined,collider))return 0;
+        const delta=end.map((v,i)=>v-start[i]!) as [number,number,number],distance=Math.hypot(...delta);
+        if(distance===0)return null;
+        const hit=world.castShape(xyz(start),rotation,xyz(delta.map(v=>v/distance) as [number,number,number]),ball,0,distance,true,undefined,undefined,collider);
+        return hit?Math.max(0,Math.min(distance,hit.time_of_impact)):null;
+      },
       diagnostics(){return {disposed,backend,triangles,snapshotBytes:sourceBytes,ownedWorlds:disposed?0:1};},
       dispose(){if(!disposed){disposed=true;world.free();}},
     };

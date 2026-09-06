@@ -7,6 +7,24 @@ function boxesMesh(boxes:number[][]){
  return {positions:new Float32Array(positions),indices:new Uint32Array(indices)};
 }
 describe('WASM capsule collision',()=>{
+ it('sweeps camera volume against thin walls without moving or hitting the character',async()=>{
+  const collision=await cookStaticCollision(boxesMesh([[-20,-1,-20,20,0,20],[2,0,-5,2.001,5,5]]));
+  const c=await createCapsuleController({collision,position:[0,.02,0]});
+  try{
+   const before=c.snapshot();
+   expect(c.sweepSphere([0,1,0],[10,1,0],.2)).toBeCloseTo(1.8,3);
+   expect(c.sweepSphere([4,1,0],[0,1,0],.2)).toBeCloseTo(1.799,3);
+   expect(c.sweepSphere([0,1,0],[-5,1,0],.2)).toBeNull();
+   expect(c.sweepSphere([0,1,0],[0,1,0],.2)).toBeNull();
+   expect(c.sweepSphere([1.9,1,0],[0,1,0],.2)).toBe(0);
+   // Centre ray misses the wall, but camera volume grazes its top.
+   expect(c.sweepSphere([0,5.1,0],[4,5.1,0],.2)).toBeLessThan(2);
+   expect(()=>c.sweepSphere([NaN,1,0],[0,1,0])).toThrow();
+   expect(()=>c.sweepSphere([0,1,0],[0,1,0],0)).toThrow();
+   expect(c.snapshot()).toEqual(before);
+  }finally{c.dispose();}
+  expect(()=>c.sweepSphere([0,1,0],[1,1,0])).toThrow();
+ });
  it('blocks thin walls and ceilings, and climbs a low triangle step',async()=>{
   const collision=await cookStaticCollision(boxesMesh([[-20,-1,-20,20,0,20],[2,0,-5,2.001,5,5],[-2,2,-2,1,3,2],[-5,0,2,1,.2,3]]));
   const c=await createCapsuleController({collision,position:[0,.02,0],speed:128});

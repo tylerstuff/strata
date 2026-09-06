@@ -192,3 +192,28 @@ against the raw snapshot byte-for-byte; unit tests cover corruption, truncation,
 size limits, cancellation and mutation isolation. Geometry simplification remains
 separate work: the smaller experimental Bistro meshes failed route-preservation
 checks and were not activated.
+### Reusable camera obstruction query
+
+The capsule controller exports `sweepSphere(origin, target, radius = 0.2)`.
+It queries the existing static collision index in application units, excluding
+its own character capsule. No second world, renderer dependency or asset-specific
+code is required. A result is travel distance to first contact; `null` means
+clear and `0` means the starting volume overlaps a triangle surface. Zero-length
+segments still check initial overlap. Queries do not advance simulation.
+
+For a follow camera, sweep from a clear head-height pivot toward the desired eye,
+then shorten the distance to the hit minus a small margin. The generated capsule
+course demonstrates this through the public package. Select a sphere radius that
+covers your near-plane corners for your FOV, aspect ratio and near distance; the
+example's 0.2-unit radius is not a universal clipping guarantee. Invalid starting
+pivots require application recovery (for example, another pivot or camera mode);
+a surface-based triangle world cannot classify enclosed solid volumes. The demo
+collapses to 0.001 units when blocked at the pivot to keep its look direction
+finite, which is not a guaranteed collision-free fallback.
+
+This first query covers static collision surfaces only. It adds no camera
+smoothing, orbit input, dynamic occluders or physics memory reduction. The local
+Bistro adapter has not yet adopted this query. Unit coverage includes both wall
+directions, thin walls, grazing volume hits, initial overlap, zero travel, invalid
+inputs, unchanged simulation state and disposal. The packed capsule browser test
+checks ground obstruction and clear travel through the exported method.
