@@ -242,8 +242,8 @@ async function presentComposition(c: Context): Promise<Float32Array<ArrayBuffer>
   const module = device.createShaderModule({ label: 'Unmodified bright-emissive presentation', code: presentationShader });
   const pipeline = await bounded(device.createRenderPipelineAsync({ layout: 'auto', vertex: { module, entryPoint: 'vertexMain' },
     fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba32float' }] } }), 'Bright-emissive presentation pipeline');
-  const data = new ArrayBuffer(16); new Uint32Array(data).set([0, 1]); new Float32Array(data).set([8, 2 ** hdrWitness.exposureEV], 2);
-  const uniform = c.resources.buffer(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, data);
+  const data = new ArrayBuffer(32); new Uint32Array(data).set([0, 1]); new Float32Array(data).set([8, 2 ** hdrWitness.exposureEV], 2);
+  const uniform = c.resources.buffer(32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, data);
   // Only final-mode resolved is presented. Give other sampled bindings a
   // distinct valid texture so accidentally reading direct fails the RGB oracle.
   const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniform } },

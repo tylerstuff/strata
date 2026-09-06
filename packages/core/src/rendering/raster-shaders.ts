@@ -203,7 +203,7 @@ struct GBufferOutput {
 `;
 
 export const presentationShader = /* wgsl */ `
-struct Settings { mode: u32, padding: u32, far: f32, exposure: f32, };
+struct Settings { mode: u32, padding: u32, far: f32, exposure: f32, jitter: vec2f, reserved: vec2f, };
 @group(0) @binding(0) var<uniform> settings: Settings;
 @group(0) @binding(1) var resolved: texture_2d<f32>;
 @group(0) @binding(2) var hdr: texture_2d<f32>;
@@ -213,6 +213,32 @@ struct Settings { mode: u32, padding: u32, far: f32, exposure: f32, };
 @vertex fn vertexMain(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
   let uv = vec2f(f32((index << 1u) & 2u), f32(index & 2u));
   return vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+}
+// The temporal history uses the current jittered raster grid. Reconstruct the
+// fixed display grid without changing motion/depth history or raw diagnostics.
+fn presentationWeights(t: f32) -> vec4f {
+  let t2 = t * t; let t3 = t2 * t;
+  return vec4f(-0.5 * t + t2 - 0.5 * t3, 1.0 - 2.5 * t2 + 1.5 * t3,
+    0.5 * t + 2.0 * t2 - 1.5 * t3, -0.5 * t2 + 0.5 * t3);
+}
+fn stableResolved(pixel: vec2i) -> vec3f {
+  if (all(settings.jitter == vec2f(0.0))) { return textureLoad(resolved, pixel, 0).rgb; }
+  let size = vec2i(textureDimensions(resolved));
+  let coordinate = vec2f(pixel) + settings.jitter;
+  let base = vec2i(floor(coordinate));
+  let fraction = fract(coordinate);
+  let wx = presentationWeights(fraction.x); let wy = presentationWeights(fraction.y);
+  var color = vec3f(0.0);
+  var lower = vec3f(65504.0); var upper = vec3f(0.0);
+  for (var y = 0; y < 4; y++) {
+    for (var x = 0; x < 4; x++) {
+      let tap = textureLoad(resolved, clamp(base + vec2i(x - 1, y - 1), vec2i(0), size - vec2i(1)), 0).rgb;
+      color += tap * wx[x] * wy[y];
+      if (x >= 1 && x <= 2 && y >= 1 && y <= 2) { lower = min(lower, tap); upper = max(upper, tap); }
+    }
+  }
+  // Bound cubic ringing around bright lamps and silhouette discontinuities.
+  return clamp(color, lower, upper);
 }
 fn linearToSrgb(value: vec3f) -> vec3f {
   let color = max(value, vec3f(0.0));
@@ -241,7 +267,7 @@ fn toneMap(value: vec3f) -> vec3f {
     case 11u: { color = select(vec3f(0.0), linearToSrgb(toneMap(textureLoad(resolved, pixel, 0).rgb * 20.0)), settings.padding != 0u); }
     case 12u, 13u, 14u, 15u, 17u: { color = select(vec3f(0.0), textureLoad(resolved, pixel, 0).rgb, settings.padding != 0u); }
     case 16u: { color = select(vec3f(0.0), linearToSrgb(toneMap(textureLoad(resolved, pixel, 0).rgb)), settings.padding != 0u); }
-    default: { color = linearToSrgb(toneMap(textureLoad(resolved, pixel, 0).rgb)); }
+    default: { color = linearToSrgb(toneMap(stableResolved(pixel))); }
   }
   return vec4f(color, 1.0);
 }

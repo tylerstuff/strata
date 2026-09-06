@@ -10,6 +10,7 @@ await build({ entryPoints: ['tests/browser/temporal-validation.ts'], outfile: 'b
 await build({ entryPoints: ['tests/browser/temporal-detail-validation.ts'], outfile: 'benchmarks/browser/temporal-detail-validation.js', bundle: true, format: 'esm', platform: 'browser', target: 'es2022' });
 await build({ entryPoints: ['tests/browser/exposure-validation.ts'], outfile: 'benchmarks/browser/exposure-validation.js', bundle: true, format: 'esm', platform: 'browser', target: 'es2022' });
 await build({ entryPoints: ['tests/browser/shadow-validation.ts'], outfile: 'benchmarks/browser/shadow-validation.js', bundle: true, format: 'esm', platform: 'browser', target: 'es2022' });
+await build({ entryPoints: ['tests/browser/presentation-jitter-validation.ts'], outfile: 'benchmarks/browser/presentation-jitter-validation.js', bundle: true, format: 'esm', platform: 'browser', target: 'es2022' });
 const directory = resolve(homedir(), 'Downloads/Strata-Benchmark-Results', `${new Date().toISOString().replaceAll(':', '-')}-raster-validation`);
 await mkdir(directory, { recursive: true });
 const args = ['--enable-unsafe-webgpu'];
@@ -29,6 +30,7 @@ try {
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
   await page.goto(server.url);
   await page.waitForFunction(() => globalThis.strataBenchmark?.ready);
+  report.results.presentationJitter = await page.evaluate(async () => (await import('/benchmarks/browser/presentation-jitter-validation.js')).validatePresentationJitter());
   report.results.temporalShader = await page.evaluate(async () => (await import('/benchmarks/browser/temporal-validation.js')).validateTemporalShader());
   report.results.temporalDetail = await page.evaluate(async () => (await import('/benchmarks/browser/temporal-detail-validation.js')).validateTemporalDetail());
   report.results.exposure = await page.evaluate(async () => (await import('/benchmarks/browser/exposure-validation.js')).validateExposureShader());

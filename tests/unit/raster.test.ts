@@ -148,6 +148,21 @@ describe('raster frame orchestration and ownership', () => {
     } satisfies RasterGeometryProvider;
   }
 
+  it('passes the signed camera jitter to final presentation and zeroes diagnostic/bypass offsets', async () => {
+    const gpu = fixture();
+    const renderer = await RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm');
+    for (let frame = 0; frame < 8; frame++) renderer.encode(gpu.encoder as unknown as GPUCommandEncoder,
+      {} as GPUTextureView, 640, 360, frame / 60, { temporal: true });
+    const offsets = gpu.writes.filter(write => write.label === 'Strata presentation settings')
+      .map(write => Array.from(new Float32Array(write.bytes.buffer).subarray(4, 6)));
+    expect(offsets).toEqual(Array.from({ length: 8 }, (_, i) => cameraJitter(i).map(Math.fround)));
+    for (const controls of [{ temporal: false }, { temporal: true, debugView: 'normal' as const }]) {
+      renderer.encode(gpu.encoder as unknown as GPUCommandEncoder, {} as GPUTextureView, 640, 360, 1, controls);
+      expect(Array.from(new Float32Array(gpu.writes.filter(write => write.label === 'Strata presentation settings').at(-1)!.bytes.buffer).subarray(4, 6))).toEqual([0, 0]);
+    }
+    renderer.dispose();
+  });
+
   it('changes only presentation exposure while preserving temporal history and resource ownership', async () => {
     const gpu = fixture();
     const renderer = await RasterRenderer.create(gpu.device as unknown as GPUDevice, 'bgra8unorm');
@@ -188,7 +203,7 @@ describe('raster frame orchestration and ownership', () => {
     const selection = {} as GPUComputePassTimestampWrites;
     const result = renderer.encode(gpu.encoder as unknown as GPUCommandEncoder, {} as GPUTextureView, 640, 360, 0,
       { temporal: false }, { selection });
-    expect(result).toMatchObject({ drawCalls: 9, triangles: 33, dispatchCalls: 2, uploadBytes: 386 });
+    expect(result).toMatchObject({ drawCalls: 9, triangles: 33, dispatchCalls: 2, uploadBytes: 402 });
     expect(group.camera).toHaveBeenCalledOnce(); expect(a.camera).not.toHaveBeenCalled(); expect(b.camera).not.toHaveBeenCalled();
     expect(a.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false, exposureEV: 0 }, selection);
     expect(b.prepare).toHaveBeenCalledWith(gpu.encoder, camera, 640, 360, true, { temporal: false, debugView: 'final', cameraCut: false, exposureEV: 0 }, undefined);
@@ -234,7 +249,7 @@ describe('raster frame orchestration and ownership', () => {
     expect(renderer.passNames({ temporal: false })).toEqual(['shadow', 'raster', 'presentation']);
     const render = (time: number, controls = {}) => renderer.encode(gpu.encoder as unknown as GPUCommandEncoder, {} as GPUTextureView, 640, 360, time, controls);
     const first = render(0);
-    expect(first).toMatchObject({ drawCalls: 4, triangles: 74, dispatchCalls: 0, uploadBytes: 384 });
+    expect(first).toMatchObject({ drawCalls: 4, triangles: 74, dispatchCalls: 0, uploadBytes: 400 });
     expect(renderer.gpuTextureBytes).toBe(staticTextures + 640 * 360 * 48);
     expect(gpu.encoder.beginRenderPass.mock.calls.map(([descriptor]) => descriptor.label)).toEqual([
       'Strata directional shadow', 'Strata PBR and shared geometry outputs', 'Strata HDR temporal resolve', 'Strata tone mapping and debug presentation',
@@ -242,7 +257,7 @@ describe('raster frame orchestration and ownership', () => {
     render(0.016); render(0.032, { cameraCut: true }); render(0.048);
     render(0.064, { debugView: 'normal' }); render(0.080, { debugView: 'normal' });
     const bypass = render(0.096, { temporal: false });
-    expect(bypass).toMatchObject({ drawCalls: 3, triangles: 73, uploadBytes: 368 });
+    expect(bypass).toMatchObject({ drawCalls: 3, triangles: 73, uploadBytes: 384 });
     render(0.112);
     const historyFlags = gpu.writes.filter(write => write.label === 'Strata temporal options').map(write => new Uint32Array(write.bytes.buffer)[2]);
     expect(historyFlags).toEqual([0, 1, 0, 1, 0, 1, 0]);

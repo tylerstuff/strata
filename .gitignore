@@ -43,6 +43,7 @@ Strata-Benchmark-Assets/
 /benchmarks/browser/temporal-detail-validation.js
 /benchmarks/browser/shadow-validation.js
 /benchmarks/browser/exposure-validation.js
+/benchmarks/browser/presentation-jitter-validation.js
 /benchmarks/browser/gi-validation.js
 /examples/gallery/app.js
 /examples/gallery/app.js.map
