@@ -3,6 +3,8 @@ import bpy,sys,pathlib,json,math,hashlib,time
 import numpy as np
 from mathutils import Vector
 source,config_path,output=map(pathlib.Path,sys.argv[sys.argv.index('--')+1:]);cfg=json.loads(config_path.read_text());start=time.time()
+transport=cfg.get('transport','combined')
+if transport not in ['combined','indirect']:raise ValueError('Invalid probe transport')
 origin=np.array(cfg['origin'],dtype=float);spacing=np.array(cfg['spacing'],dtype=float);counts=cfg['counts'];samples=int(cfg.get('samples',64));power=float(cfg.get('emissionScale',1))
 if origin.shape!=(3,) or spacing.shape!=(3,) or not np.isfinite(origin).all() or not np.isfinite(spacing).all() or min(spacing)<=0:raise ValueError('Invalid grid')
 if len(counts)!=3 or any(not isinstance(v,int) or v<2 or v>64 for v in counts) or math.prod(counts)>4096 or not 1<=samples<=4096 or not 0<power<=1000:raise ValueError('Invalid bake bounds')
@@ -72,11 +74,11 @@ mat=bpy.data.materials.new('Probe diffuse');mat.use_nodes=True;bsdf=mat.node_tre
 for name in ['visible_shadow','visible_diffuse','visible_glossy','visible_transmission']:setattr(obj,name,False)
 attr=mesh.color_attributes.new(name='ProbeDiffuse',type='FLOAT_COLOR',domain='POINT');mesh.color_attributes.active_color=attr
 bpy.ops.object.select_all(action='DESELECT');obj.select_set(True);bpy.context.view_layer.objects.active=obj
-scene.render.bake.target='VERTEX_COLORS';scene.render.bake.use_pass_direct=True;scene.render.bake.use_pass_indirect=True;scene.render.bake.use_pass_color=False
-print('STRATA_PROBE_CYCLES',len(positions),scene.cycles.device,flush=True);bpy.ops.object.bake(type='DIFFUSE',pass_filter={'DIRECT','INDIRECT'})
+scene.render.bake.target='VERTEX_COLORS';scene.render.bake.use_pass_direct=transport=='combined';scene.render.bake.use_pass_indirect=True;scene.render.bake.use_pass_color=False
+print('STRATA_PROBE_CYCLES',len(positions),scene.cycles.device,flush=True);bpy.ops.object.bake(type='DIFFUSE',pass_filter={'DIRECT','INDIRECT'} if transport=='combined' else {'INDIRECT'})
 colors=np.empty(len(attr.data)*4,np.float32);attr.data.foreach_get('color',colors);irradiance=colors.reshape(len(positions),6,3,4)[:,:,:,:3].mean(axis=2)
 if not np.isfinite(irradiance).all() or irradiance.max()>65536:raise RuntimeError('Invalid or empty probe bake')
-volume={'version':1,'revision':cfg['revision'],'origin':origin.tolist(),'spacing':spacing.tolist(),'counts':counts,'irradiance':np.maximum(irradiance,0).reshape(-1).tolist(),'visibility':visibility,'valid':valid}
+volume={'version':1,'transport':transport,'revision':cfg['revision'],'origin':origin.tolist(),'spacing':spacing.tolist(),'counts':counts,'irradiance':np.maximum(irradiance,0).reshape(-1).tolist(),'visibility':visibility,'valid':valid}
 (output/'probes.json').write_text(json.dumps(volume,separators=(',',':')))
-manifest={'version':1,'backend':'Cycles','blender':bpy.app.version_string,'device':scene.cycles.device,'sourceSha256':hashlib.sha256(source.read_bytes()).hexdigest(),'normalization':{'scale':scale,'translation':translation.tolist()},'samples':samples,'emissionScale':power,'elapsedSeconds':time.time()-start,'validProbes':sum(valid),'probes':len(valid),'maximumIrradiance':float(irradiance.max()),'scope':'Six-axis emission-only diffuse irradiance/pi. 16x16 first-hit visibility is approximate; no sun/sky, dynamic occlusion, or baked specular.'}
+manifest={'version':1,'transport':transport,'backend':'Cycles','blender':bpy.app.version_string,'device':scene.cycles.device,'sourceSha256':hashlib.sha256(source.read_bytes()).hexdigest(),'normalization':{'scale':scale,'translation':translation.tolist()},'samples':samples,'emissionScale':power,'elapsedSeconds':time.time()-start,'validProbes':sum(valid),'probes':len(valid),'maximumIrradiance':float(irradiance.max()),'scope':'Six-axis emission-only diffuse irradiance/pi. 16x16 first-hit visibility is approximate; no sun/sky, dynamic occlusion, or baked specular.'}
 (output/'bake.json').write_text(json.dumps(manifest,indent=2));print('STRATA_PROBES_COMPLETE',json.dumps(manifest),flush=True)

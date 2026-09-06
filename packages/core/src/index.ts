@@ -23,3 +23,5 @@ export { prepareMeshTangents } from './meshes/mesh-tangents.js';
 
 export { combineImportedAssets } from './meshes/mixed-asset.js';
 export type { BakedProbeVolume } from './imported/baked-probes.js';
+
+export type { ImportedPointLight, ImportedPointLightControl } from './imported/imported-point-light.js';

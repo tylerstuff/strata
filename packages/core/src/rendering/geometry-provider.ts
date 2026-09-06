@@ -2,7 +2,16 @@ import type { CameraFrame } from './raster-math.js';
 import type { RasterControls } from './raster-types.js';
 
 /** Providers draw into one shared camera, shadow map and MRT set. At most one owns selection timestamps. */
+export interface RasterPointShadowPlan {
+  readonly texture: GPUTexture; readonly cache: GPUTexture;
+  readonly views: readonly GPUTextureView[]; readonly cacheViews: readonly GPUTextureView[];
+  readonly matrices: readonly Float32Array<ArrayBuffer>[];
+  readonly size: number; readonly revision: number; readonly enabled: boolean;
+  readonly staticDrawCalls: number; readonly staticTriangles: number;
+  readonly dynamicDrawCalls: number; readonly dynamicTriangles: number;
+}
 export interface RasterGeometryGroup {
+  readonly pointShadowPlan?: RasterPointShadowPlan | undefined;
   readonly mixedShadowCache?: boolean;
   /** Counts the immutable casters; providers in a mixed cache must declare staticShadow. */
   readonly shadowCache?: { readonly revision: number; readonly drawCalls: number; readonly triangles: number } | undefined;

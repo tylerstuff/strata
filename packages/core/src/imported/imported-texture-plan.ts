@@ -4,6 +4,8 @@ import type { ImportedAsset } from './imported-types.js';
 import { importedEnvironmentTextureBytes, importedTextureBudget } from './imported-limits.js';
 
 export interface ImportedTextureAllocationOptions {
+  /** Optional six-face local shadow edge, including immutable and working depth. */
+  readonly pointShadowMapSize?: 512 | 1024;
   /** True only when the requested device enabled texture-compression-bc. */
   readonly textureCompressionBC?: boolean;
   /** Requested upload edge, a positive integer up to 16384. */
@@ -28,7 +30,7 @@ export interface ImportedTextureAllocationRecord {
 export interface ImportedTextureAllocationEstimate {
   readonly requestedMaxTextureDimension: number;
   readonly effectiveMaxTextureDimension: number;
-  /** Texture payload only: all role copies and mip levels, white fallbacks and generated environments. */
+  /** Texture payload only: all role copies and mip levels, white fallbacks, disabled point-light placeholder and generated environments. */
   readonly gpuTextureBytes: number;
   readonly textureBudgetBytes: number;
   readonly fitsBudget: boolean;
@@ -69,7 +71,8 @@ export function estimateImportedTextureAllocation(
   const requestedMaxTextureDimension = options.maxTextureDimension;
   const effectiveMaxTextureDimension = Math.min(requestedMaxTextureDimension, options.maxTextureDimension2D);
   const textures: ImportedTextureAllocationRecord[] = [], seen = new Set<string>();
-  let gpuTextureBytes = 8 + importedEnvironmentTextureBytes;
+  if (options.pointShadowMapSize !== undefined && options.pointShadowMapSize !== 512 && options.pointShadowMapSize !== 1024) fail('point shadow edge must be 512 or 1024.');
+  let gpuTextureBytes = 8 + importedEnvironmentTextureBytes + (options.pointShadowMapSize ? options.pointShadowMapSize ** 2 * 48 : 24);
   const lightmaps = new Set(asset.materials.flatMap(m => m?.lightmapTexture ? [m.lightmapTexture.image] : []));
   for (const material of asset.materials) {
     if (!material || typeof material !== 'object' || Array.isArray(material)) fail('material must be an object.');

@@ -1,3 +1,4 @@
+import { importedPointShader } from './imported-point-shader.js';
 import { bakedProbeShader } from './baked-probes.js';
 import { importedEnvironmentShader } from './imported-environment.js';
 import { importedTransformShader } from './imported-transform.js';
@@ -7,6 +8,7 @@ export const importedShader = /* wgsl */ `
 ${importedEnvironmentShader}
 ${importedTransformShader}
 ${bakedProbeShader}
+${importedPointShader}
 struct ImportedMaterial {
   base: vec4f,
   emissive: vec4f,
@@ -126,6 +128,7 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
 }
 @fragment fn importedFragment(input: ImportedVertexOutput, @builtin(front_facing) front: bool) -> GBufferOutput {
   let shadowGradient = shadowReceiverGradient(input.world);
+  let worldDx = dpdx(input.world); let worldDy = dpdy(input.world);
   let baseSample = textureSample(importedBase, importedBaseSampler, input.uv);
   let mr = textureSample(importedMr, importedMrSampler, input.uv);
   var normalSample = textureSample(importedNormal, importedNormalSampler, input.uv).xyz * 2.0 - 1.0;
@@ -161,9 +164,11 @@ fn importedDeformedVertex(input: ImportedVertexInput, current: mat4x4f, previous
   var lightmapped = vec3f(0.0);
   if (importedMaterial.lightmap.x > 0.0) { lightmapped = base.rgb * (1.0 - metallic) * lightmapDiffuse(input.lightmapUv); }
   if (importedMaterial.lightmap.y > 0.5) { lightmapped += base.rgb * (1.0 - metallic) * bakedProbeDiffuse(input.world, normal); }
+  var local = vec3f(0.0);
+  if (importedMaterial.lightmap.z > 0.5) { local = pointDirect(input.world, worldDx, worldDy, base.rgb, roughness, metallic, normal, view); }
   let baked = select(vec3f(0.0), base.rgb * (1.0 - metallic) * input.color.rgb * importedEnvironmentSettings.modes.z, bakedMode);
   var output: GBufferOutput;
-  output.hdr = vec4f(select(direct + fill + baked + lightmapped + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
+  output.hdr = vec4f(select(direct + local + fill + baked + lightmapped + select(emission, vec3f(0.0), relit) + environment, base.rgb, unlit), shadow);
   output.normal = vec4f(select(normal, n * select(-1.0, 1.0, front), unlit), roughness);
   output.material = vec4f(base.rgb, metallic);
   let currentUv = input.currentClip.xy / input.currentClip.w * vec2f(0.5, -0.5) + vec2f(0.5);

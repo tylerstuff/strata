@@ -1,3 +1,4 @@
+import type { ImportedPointLight, ImportedPointLightControl } from './imported-point-light.js';
 import type { BakedProbeVolume } from './baked-probes.js';
 import type { ImportedIndirectDenoise, ImportedIndirectOptions, ImportedIndirectProgress, ImportedIndirectReadback } from './imported-indirect-types.js';
 
@@ -35,6 +36,8 @@ export interface ImportedImage {
 export interface ImportedMaterial {
   /** Receive the scene baked probe volume; mutually exclusive with static lightmaps. */
   readonly bakedProbeLighting?: boolean;
+  /** Explicit local direct-light receiver; static combined lightmaps are incompatible. */
+  readonly localLighting?: boolean;
   readonly name: string;
   /** KHR_materials_unlit: base color bypasses lighting, metallic/roughness, normal, AO and emission. */
   readonly unlit?: boolean;
@@ -137,6 +140,7 @@ export interface LoadGltfOptions {
 }
 export interface ImportedSceneOptions {
   readonly renderer: 'imported';
+  readonly pointLight?: ImportedPointLight;
   readonly bakedProbes?: BakedProbeVolume;
   /** Directional shadow edge; default 2048. 4096 uses 64 MiB of depth storage. */
   readonly shadowMapSize?: 1024 | 2048 | 4096;
@@ -157,6 +161,7 @@ export interface ImportedEnvironment {
   readonly rotationRadians?: number;
 }
 export interface ImportedControls {
+  readonly pointLight?: ImportedPointLightControl;
   /** Explicit revision must match the scene bake; omission retains the enable state. */
   readonly bakedProbes?: { readonly revision: string; readonly enabled: boolean };
   /** Whole-actor affine placement after animation/normalization; omission is identity. Static primitives are unaffected. */
@@ -195,6 +200,7 @@ export interface ImportedControls {
   readonly animation?: { readonly clipId: string | null; readonly timeSeconds: number; readonly loop: boolean };
 }
 export interface ImportedTelemetry {
+  readonly pointLight?: ImportedPointLight | null;
   readonly indirect?: {
     readonly mode: 'progressive-diffuse';
     /** Both enabled and disabled comparisons use no TAA, ambient fill or unoccluded environment illumination. */

@@ -41,7 +41,7 @@ export class ImportedRenderer {
   static async create(device: GPUDevice, format: GPUTextureFormat, options: ImportedSceneOptions, context?: CreationContext): Promise<ImportedRenderer> {
     if (!options || options.renderer !== 'imported') throw new StrataError('INVALID_OPTIONS', 'Imported rendering requires a decoded glTF asset.');
     checkAbort(options.signal);
-    if (options.indirect && options.bakedProbes) throw new StrataError('INVALID_OPTIONS', 'Baked probes cannot be combined with progressive GI.');
+    if (options.indirect && (options.bakedProbes || options.pointLight)) throw new StrataError('INVALID_OPTIONS', 'Baked probes or local point lights cannot be combined with progressive GI.');
     if (options.shadowFilter !== undefined && options.shadowFilter !== 'pcf' && options.shadowFilter !== 'receiver-plane') {
       throw new StrataError('INVALID_OPTIONS', 'shadowFilter must be pcf or receiver-plane.');
     }
@@ -71,7 +71,7 @@ export class ImportedRenderer {
       await source.validateImportedStaticBvh(prepared, result, options.signal); checkAbort(options.signal);
       effectModule = await import('./imported-indirect-effect.js'); checkAbort(options.signal);
     }
-    const geometry = await ImportedGeometry.create(device, options.asset, options.signal, options.bakedProbes);
+    const geometry = await ImportedGeometry.create(device, options.asset, options.signal, options.bakedProbes, options.pointLight);
     let raster: RasterRenderer | undefined;
     let indirect: ImportedIndirectEffect | undefined;
     try {

@@ -4,6 +4,8 @@ import type { ImportedVec3 } from './imported-types.js';
 /** Fixed scene-space grid. Six-axis diffuse irradiance/pi and octahedral first-hit distances. */
 export interface BakedProbeVolume {
   readonly version: 1;
+  /** Omission means combined emission direct plus indirect transport. */
+  readonly transport?: 'combined' | 'indirect';
   readonly revision: string;
   readonly origin: ImportedVec3;
   readonly spacing: ImportedVec3;
@@ -17,6 +19,7 @@ export interface BakedProbeVolume {
 export function prepareBakedProbes(volume?: BakedProbeVolume): { data: Float32Array<ArrayBuffer>; uniform: Float32Array<ArrayBuffer>; revision?: string } {
   const fail = (): never => { throw new StrataError('INVALID_OPTIONS', 'Invalid baked probe volume: finite bounded version-1 grid and complete HDR/visibility payload required.'); };
   if (!volume) return { data: new Float32Array(280), uniform: new Float32Array(16) };
+  if (volume.transport !== undefined && volume.transport !== 'combined' && volume.transport !== 'indirect') fail();
   if (volume.version !== 1 || typeof volume.revision !== 'string' || !volume.revision.length || volume.revision.length > 128) fail();
   for (const vector of [volume.origin, volume.spacing, volume.counts]) if (!Array.isArray(vector) || vector.length !== 3 || !vector.every(Number.isFinite)) fail();
   if (volume.origin.some(v => Math.abs(v) > 1024) || volume.spacing.some(v => v <= 0 || v > 1024)

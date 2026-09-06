@@ -60,6 +60,7 @@ interface GeometryPipeline {
   readonly provider: RasterGeometryProvider | undefined;
   readonly rasterBindings: GPUBindGroup;
   readonly shadowBindings: GPUBindGroup;
+  readonly pointBindings: readonly GPUBindGroup[];
   readonly rasterPipeline: GPURenderPipeline;
   readonly shadowPipeline: GPURenderPipeline;
 }
@@ -71,6 +72,7 @@ interface StaticResources {
   readonly indices: GPUBuffer | undefined;
   readonly instances: GPUBuffer | undefined;
   readonly frameUniform: GPUBuffer;
+  readonly pointFrames: readonly GPUBuffer[];
   readonly presentationUniform: GPUBuffer;
   readonly shadowView: GPUTextureView;
   readonly shadowTexture: GPUTexture;
@@ -91,7 +93,8 @@ export class RasterRenderer {
   private historyReady = false;
   private disposed = false;
   private cachedShadowRevision: number | undefined;
-  invalidateShadowCache(): void { this.cachedShadowRevision = undefined; }
+  private cachedPointRevision: number | undefined;
+  invalidateShadowCache(): void { this.cachedShadowRevision = undefined; this.cachedPointRevision = undefined; }
   private readonly lightMatrix: Float32Array<ArrayBuffer>;
 
   private constructor(
@@ -175,6 +178,7 @@ export class RasterRenderer {
       const indices = data ? buffer('Strata PBR indices', data.indices.byteLength, bufferUsage.index) : undefined;
       const instances = data ? buffer('Strata PBR instances', data.instances.byteLength, bufferUsage.vertex) : undefined;
       const frameUniform = buffer('Strata current and previous transforms', frameUniformBytes, bufferUsage.uniform);
+      const pointFrames = geometry && 'pointShadowPlan' in geometry && geometry.pointShadowPlan ? Array.from({length:6},(_,i)=>buffer(`Strata point face ${i}`, frameUniformBytes, bufferUsage.uniform)) : [];
       const presentationUniform = buffer('Strata presentation settings', presentationUniformBytes, bufferUsage.uniform);
       if (data) {
         device.queue.writeBuffer(vertices!, 0, data.vertices);
@@ -202,15 +206,16 @@ export class RasterRenderer {
             { binding: 3, resource: materialSampler },
           ]), { binding: 4, resource: shadowView }, ...(receiverPlaneShadows ? [] : [{ binding: 5, resource: shadowSampler }]),
         ] });
-        return { provider, rasterPipeline, shadowPipeline, rasterBindings, shadowBindings };
+        const pointBindings = pointFrames.map(frame => device.createBindGroup({ label: 'Strata point shadow frame', layout: shadowPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: frame } }] }));
+        return { provider, rasterPipeline, shadowPipeline, rasterBindings, shadowBindings, pointBindings };
       });
       temporal = await TemporalResolve.create(device);
       for (const pair of geometryPipelines) pair.provider?.attachPipelines(pair.rasterPipeline, pair.shadowPipeline);
       const geometryBytes = data ? data.vertices.byteLength + data.indices.byteLength + data.instances.byteLength : 0;
       return new RasterRenderer(device, {
-        buffers, textures, vertices, indices, instances, frameUniform, presentationUniform,
+        buffers, textures, vertices, indices, instances, frameUniform, pointFrames, presentationUniform,
         shadowView, shadowTexture, staticShadowTexture, geometryPipelines, presentationPipeline,
-        bufferBytes: geometryBytes + frameUniformBytes + presentationUniformBytes,
+        bufferBytes: geometryBytes + frameUniformBytes * (1 + pointFrames.length) + presentationUniformBytes,
         initialUploadBytes: geometryBytes + material.baseColor.byteLength + material.metallicRoughness.byteLength,
       }, temporal, data?.instanceCount ?? 0, geometry?.halfExtent ?? data!.halfExtent, geometry, gi, shadowSize);
     } catch (cause) {
@@ -237,7 +242,7 @@ export class RasterRenderer {
   passNames(controls: RasterControls = {}): readonly RasterPassName[] {
     const geometryPass: RasterPassName[] = this.resources.geometryPipelines.some(pair => pair.provider?.selectionPass) ? ['selection'] : [];
     return [
-      ...(this.gi?.active ? this.gi.preparePassNames ?? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, ...(this.resources.staticShadowTexture ? ['shadow-static'] as const : []), 'shadow', 'raster',
+      ...(this.gi?.active ? this.gi.preparePassNames ?? ['gi-trace', 'gi-update'] as const : []), ...geometryPass, ...(this.resources.staticShadowTexture ? ['shadow-static'] as const : []), 'shadow', ...(this.resources.pointFrames.length ? ['point-shadow-static', 'point-shadow'] as const : []), 'raster',
       ...(this.gi?.active ? this.gi.composePassNames ?? ['gi-shade'] as const : []),
       ...(normalizeRasterControls(controls).temporal ? ['temporal'] as const : []), 'presentation',
     ];
@@ -303,11 +308,11 @@ export class RasterRenderer {
     // History remains on the jittered raster grid; undo that phase only for display.
     new Float32Array(presentationData).set(jitter, 4);
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
-    const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow', staticOnly?: boolean): void => {
+    const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow', staticOnly?: boolean, pointFace?: number): void => {
       for (const pair of this.resources.geometryPipelines) {
         if (staticOnly !== undefined && pair.provider?.staticShadow !== staticOnly) continue;
         pass.setPipeline(phase === 'shadow' ? pair.shadowPipeline : pair.rasterPipeline);
-        pass.setBindGroup(0, phase === 'shadow' ? pair.shadowBindings : pair.rasterBindings);
+        pass.setBindGroup(0, phase === 'shadow' ? (pointFace === undefined ? pair.shadowBindings : pair.pointBindings[pointFace]!) : pair.rasterBindings);
         if (pair.provider) pair.provider.draw(pass, phase);
         else {
           pass.setVertexBuffer(0, this.resources.vertices!); pass.setVertexBuffer(1, this.resources.instances!);
@@ -339,6 +344,35 @@ export class RasterRenderer {
         ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
       drawGeometry(shadow, 'shadow'); this.cachedShadowRevision = shadowRevision;
     }
+    const point = this.geometry && 'pointShadowPlan' in this.geometry ? this.geometry.pointShadowPlan : undefined;
+    let pointDraws = 0, pointTriangles = 0, pointUpload = 0;
+    const pointSkipped: RasterPassName[] = [];
+    if (point) {
+      const rebuild = this.cachedPointRevision !== point.revision;
+      const moving = point.dynamicDrawCalls > 0;
+      if (point.enabled) {
+        if (rebuild) for (let face = 0; face < 6; face++) {
+          this.device.queue.writeBuffer(this.resources.pointFrames[face]!, 256, point.matrices[face]!); pointUpload += 64;
+        }
+        const faces = (cached: boolean): void => {
+          const name = cached ? 'point-shadow-static' : 'point-shadow';
+          const stamp = timestamps[name];
+          for (let face = 0; face < 6; face++) {
+            const writes = stamp && (face === 0 || face === 5) ? { querySet: stamp.querySet,
+              ...(face === 0 ? { beginningOfPassWriteIndex: stamp.beginningOfPassWriteIndex! } : { endOfPassWriteIndex: stamp.endOfPassWriteIndex! }) } : undefined;
+            const pass = encoder.beginRenderPass({ label: `Strata ${name} face ${face}`, colorAttachments: [],
+              depthStencilAttachment: { view: (cached ? point.cacheViews : point.views)[face]!, depthClearValue: 1,
+                depthLoadOp: cached ? 'clear' : 'load', depthStoreOp: 'store' }, ...(writes ? { timestampWrites: writes } : {}) });
+            drawGeometry(pass, 'shadow', cached, face);
+          }
+          pointDraws += 6 * (cached ? point.staticDrawCalls : point.dynamicDrawCalls);
+          pointTriangles += 6 * (cached ? point.staticTriangles : point.dynamicTriangles);
+        };
+        if (rebuild) { faces(true); this.cachedPointRevision = point.revision; } else pointSkipped.push('point-shadow-static');
+        if (rebuild || moving) encoder.copyTextureToTexture({ texture: point.cache }, { texture: point.texture }, [point.size, point.size, 6]);
+        if (moving) faces(false); else pointSkipped.push('point-shadow');
+      } else pointSkipped.push('point-shadow-static', 'point-shadow');
+    }
     const raster = encoder.beginRenderPass({ label: 'Strata PBR and shared geometry outputs', colorAttachments: [
       { view: targets.views.hdr, clearValue: this.geometry?.background ? [...this.geometry.background, 1] : { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.normal, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
@@ -350,16 +384,17 @@ export class RasterRenderer {
       ? this.geometry.drawBackground?.(raster, camera, width, height, jitter, settings) : undefined;
     drawGeometry(raster, 'raster');
     let resolved = targets.views.hdr;
-    let drawCalls = (background?.drawCalls ?? 0) + prepared.reduce((sum, value) => sum + (value?.drawCalls ?? 2), 0) + 1;
+    let drawCalls = pointDraws + (background?.drawCalls ?? 0) + prepared.reduce((sum, value) => sum + (value?.drawCalls ?? 2), 0) + 1;
     let dispatchCalls = prepared.reduce((sum, value) => sum + (value?.dispatchCalls ?? 0), 0) + (giPrepared?.dispatchCalls ?? 0);
-    let uploadBytes = (background?.uploadBytes ?? 0) + frameUniformBytes + presentationUniformBytes + prepared.reduce((sum, value) => sum + (value?.uploadBytes ?? 0), 0) + (giPrepared?.uploadBytes ?? 0);
-    let triangles = (background?.drawCalls ?? 0) + prepared.reduce((sum, value) => sum + (value?.triangles ?? this.instanceCount * 24), 0) + 1;
+    let uploadBytes = pointUpload + (background?.uploadBytes ?? 0) + frameUniformBytes + presentationUniformBytes + prepared.reduce((sum, value) => sum + (value?.uploadBytes ?? 0), 0) + (giPrepared?.uploadBytes ?? 0);
+    let triangles = pointTriangles + (background?.drawCalls ?? 0) + prepared.reduce((sum, value) => sum + (value?.triangles ?? this.instanceCount * 24), 0) + 1;
     // Providers explicitly account for the omitted immutable shadow work.
     if (reuseShadow) {
       drawCalls -= shadowCache!.drawCalls;
       triangles -= shadowCache!.triangles;
     }
-    let skippedGpuPasses: readonly RasterPassName[] | undefined = reuseShadow ? [staticDepth ? 'shadow-static' : 'shadow'] : undefined;
+    let skippedGpuPasses: readonly RasterPassName[] | undefined = [...pointSkipped, ...(reuseShadow ? [staticDepth ? 'shadow-static' as const : 'shadow' as const] : [])];
+    if (!skippedGpuPasses.length) skippedGpuPasses = undefined;
     if (this.gi?.active) {
       const composed = this.gi.compose(encoder, targets.views, camera, width, height, timeSeconds, settings, timestamps);
       resolved = composed.view; dispatchCalls += composed.dispatchCalls; uploadBytes += composed.uploadBytes;
