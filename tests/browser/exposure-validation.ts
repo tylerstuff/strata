@@ -44,7 +44,7 @@ export async function validateExposureShader() {
   device.addEventListener('uncapturederror', onError);
   const width = hdrSamples.length, rawViews = [['shadow', 2], ['depth', 3], ['normal', 4], ['motion', 5], ['material', 6]] as const;
   const cases = [['final', 0], ['direct', 1], ...rawViews].flatMap(([view, mode]) => exposureStops.map(exposureEV => ({ view, mode: Number(mode), exposureEV })));
-  const stride = Math.max(16, device.limits.minUniformBufferOffsetAlignment), bytesPerRow = width * 16;
+  const stride = Math.max(32, device.limits.minUniformBufferOffsetAlignment), bytesPerRow = width * 16;
   require(bytesPerRow === 256, 'Readback rows must meet WebGPU alignment.');
   let scope = true; device.pushErrorScope('validation');
   try {
@@ -70,13 +70,13 @@ export async function validateExposureShader() {
     cases.forEach((test, index) => { const offset = index * stride / 4; words.set([test.mode, 1], offset); floats.set([8, 2 ** test.exposureEV], offset + 2); });
     device.queue.writeBuffer(uniform, 0, uniforms);
     const layout = device.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: 0x02, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 16 } },
+      { binding: 0, visibility: 0x02, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 32 } },
       ...Array.from({ length: 5 }, (_, index) => ({ binding: index + 1, visibility: 0x02, texture: { sampleType: 'float' as const } })),
     ] });
     const module = device.createShaderModule({ label: 'Unmodified production exposure presentation', code: presentationShader });
     const pipeline = await bounded(device.createRenderPipelineAsync({ label: 'Presentation numeric float witness', layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
       vertex: { module, entryPoint: 'vertexMain' }, fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba32float' }] }, primitive: { topology: 'triangle-list' } }), 'Exposure pipeline');
-    const group = device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: uniform, size: 16 } },
+    const group = device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: uniform, size: 32 } },
       ...[resolved, direct, normal, material, motion].map((resource, index) => ({ binding: index + 1, resource })),
     ] });
     const encoder = device.createCommandEncoder({ label: '49 bounded production exposure cases' });

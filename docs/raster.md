@@ -76,3 +76,5 @@ map: it does not add cascades, contact rays, variable penumbrae, or local ambien
 occlusion. Degenerate receiver projections fall back to zero depth gradient.
 The browser raster check executes both production filters against independent
 flat and sloped depth fixtures, including a close occluder erased by legacy bias.
+
+Final presentation compensates the current projection jitter in pixel space. History remains on its existing jittered raster grid, with motion/depth reprojection unchanged. A bounded cubic reconstruction shifts resolved HDR back to the fixed display grid before exposure and tone mapping; the central footprint clamps ringing. Zero jitter uses the original exact texel load, and raw diagnostics remain unshifted. This removes deterministic whole-frame sample-phase wobble; it does not eliminate foliage/specular shimmer or establish a frame-performance target. The presentation pass adds up to 16 HDR reads per pixel when jitter is nonzero.

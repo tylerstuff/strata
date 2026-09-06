@@ -21,7 +21,7 @@ export function validateShadowMapSize(value: unknown, maximum: number): 1024 | 2
 }
 const materialSize = 64;
 const frameUniformBytes = 352;
-const presentationUniformBytes = 16;
+const presentationUniformBytes = 32;
 const debugViews = ['final', 'direct', 'shadow', 'depth', 'normal', 'motion', 'material', 'clusters', 'lod', 'residency', 'coverage', 'indirect', 'trace', 'probe-age', 'probe-irradiance', 'probe-visibility', 'reflections', 'reflection-source'] as const;
 
 export function normalizeRasterControls(controls: RasterControls = {}): Required<RasterControls> {
@@ -294,6 +294,8 @@ export class RasterRenderer {
     const presentationData = new ArrayBuffer(presentationUniformBytes);
     new Uint32Array(presentationData).set([debugIndex, this.gi?.active ? 1 : 0]);
     new Float32Array(presentationData).set([camera.far, 2 ** settings.exposureEV], 2);
+    // History remains on the jittered raster grid; undo that phase only for display.
+    new Float32Array(presentationData).set(jitter, 4);
     this.device.queue.writeBuffer(this.resources.presentationUniform, 0, presentationData);
     const drawGeometry = (pass: GPURenderPassEncoder, phase: 'raster' | 'shadow'): void => {
       for (const pair of this.resources.geometryPipelines) {
