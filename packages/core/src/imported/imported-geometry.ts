@@ -120,6 +120,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
   readonly halfExtent = 4;
   readonly providers: readonly RasterGeometryProvider[];
   private settings: Settings = snapshot({ lighting: importedDefaults.lighting }, importedDefaults);
+  private shadowVersion = 0;
   private lightDirty = false;
   private environmentDirty = false;
   private indirectBaseline = false;
@@ -329,6 +330,11 @@ export class ImportedGeometry implements RasterGeometryGroup {
     this.sky.draw(pass, camera, width, height, jitter, snapshotEnvironment(this.settings.lighting.environment)!);
     return { drawCalls: 1, uploadBytes: importedSkyUniformBytes };
   }
+  get shadowCache(): { revision: number; drawCalls: number; triangles: number } | undefined {
+    if (!this.meshes.every(mesh => mesh.mode === 'static')) return undefined;
+    const meshes = this.meshes.filter(mesh => !mesh.ground || this.settings.presentation === 'ground');
+    return { revision: this.shadowVersion, drawCalls: meshes.length, triangles: meshes.reduce((sum, mesh) => sum + mesh.indexCount / 3, 0) };
+  }
   get background(): ImportedVec3 { return this.settings.background; }
   get lightMatrix(): Float32Array<ArrayBuffer> { return this.light; }
   get currentCamera(): CameraFrame | undefined { return this.current; }
@@ -375,6 +381,7 @@ export class ImportedGeometry implements RasterGeometryGroup {
     const changedShading = next.shading !== this.settings.shading;
     const cut = changedLighting || changedShading || next.skybox !== this.settings.skybox || next.presentation !== this.settings.presentation || JSON.stringify(next.background) !== JSON.stringify(this.settings.background) || next.camera.verticalFov !== this.settings.camera.verticalFov;
     this.environmentDirty ||= changedShading || JSON.stringify(next.lighting.environment) !== JSON.stringify(this.settings.lighting.environment);
+    if (next.presentation !== this.settings.presentation || JSON.stringify(next.lighting.directionToLight) !== JSON.stringify(this.settings.lighting.directionToLight)) this.shadowVersion++;
     this.settings = next; this.lightDirty ||= changedLighting;
     this.visibleBounds = fit.bounds; this.light = fit.matrix; return cut || animationCut;
   }

@@ -88,6 +88,8 @@ export class RasterRenderer {
   private jitterIndex = 0;
   private historyReady = false;
   private disposed = false;
+  private cachedShadowRevision: number | undefined;
+  invalidateShadowCache(): void { this.cachedShadowRevision = undefined; }
   private readonly lightMatrix: Float32Array<ArrayBuffer>;
 
   private constructor(
@@ -309,10 +311,16 @@ export class RasterRenderer {
       }
       pass.end();
     };
-    const shadow = encoder.beginRenderPass({ label: 'Strata directional shadow', colorAttachments: [],
-      depthStencilAttachment: { view: this.resources.shadowView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
-      ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
-    drawGeometry(shadow, 'shadow');
+    const shadowCache = this.geometry && 'shadowCache' in this.geometry ? this.geometry.shadowCache : undefined;
+    const shadowRevision = shadowCache?.revision;
+    const reuseShadow = !reset && shadowRevision !== undefined && shadowRevision === this.cachedShadowRevision;
+    if (!reuseShadow) {
+      const shadow = encoder.beginRenderPass({ label: 'Strata directional shadow', colorAttachments: [],
+        depthStencilAttachment: { view: this.resources.shadowView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        ...(timestamps.shadow ? { timestampWrites: timestamps.shadow } : {}) });
+      drawGeometry(shadow, 'shadow');
+      this.cachedShadowRevision = shadowRevision;
+    }
     const raster = encoder.beginRenderPass({ label: 'Strata PBR and shared geometry outputs', colorAttachments: [
       { view: targets.views.hdr, clearValue: this.geometry?.background ? [...this.geometry.background, 1] : { r: 0.02, g: 0.035, b: 0.055, a: 1 }, loadOp: 'clear', storeOp: 'store' },
       { view: targets.views.normal, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
@@ -328,11 +336,16 @@ export class RasterRenderer {
     let dispatchCalls = prepared.reduce((sum, value) => sum + (value?.dispatchCalls ?? 0), 0) + (giPrepared?.dispatchCalls ?? 0);
     let uploadBytes = (background?.uploadBytes ?? 0) + frameUniformBytes + presentationUniformBytes + prepared.reduce((sum, value) => sum + (value?.uploadBytes ?? 0), 0) + (giPrepared?.uploadBytes ?? 0);
     let triangles = (background?.drawCalls ?? 0) + prepared.reduce((sum, value) => sum + (value?.triangles ?? this.instanceCount * 24), 0) + 1;
-    let skippedGpuPasses: readonly RasterPassName[] | undefined;
+    // Providers explicitly account for the omitted immutable shadow work.
+    if (reuseShadow) {
+      drawCalls -= shadowCache!.drawCalls;
+      triangles -= shadowCache!.triangles;
+    }
+    let skippedGpuPasses: readonly RasterPassName[] | undefined = reuseShadow ? ['shadow'] : undefined;
     if (this.gi?.active) {
       const composed = this.gi.compose(encoder, targets.views, camera, width, height, timeSeconds, settings, timestamps);
       resolved = composed.view; dispatchCalls += composed.dispatchCalls; uploadBytes += composed.uploadBytes;
-      skippedGpuPasses = composed.skippedGpuPasses;
+      skippedGpuPasses = [...(skippedGpuPasses ?? []), ...(composed.skippedGpuPasses ?? [])];
     }
     const unfiltered = resolved;
     if (settings.temporal) {

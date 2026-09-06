@@ -79,7 +79,7 @@ function harness() {
     setDenoise: vi.fn((denoise: 'off' | 'spatial') => { if (denoise !== progress.denoise) progress = { ...progress, denoise, presentationRevision: progress.presentationRevision + 1 }; }),
     setEnabled: vi.fn((enabled: boolean) => { progress = { ...progress, enabled }; }), submitted: vi.fn(), cancelFrame: vi.fn(), dispose: vi.fn() };
   const stats = { drawCalls: 2, dispatchCalls: 1, triangles: 2, uploadBytes: 288, gpuBufferBytes: 4096, gpuTextureBytes: 1024 };
-  const raster = { initialUploadBytes: 300, gpuBufferBytes: 4096, gpuTextureBytes: 1024,
+  const raster = { invalidateShadowCache: vi.fn(), initialUploadBytes: 300, gpuBufferBytes: 4096, gpuTextureBytes: 1024,
     passNames: vi.fn((_controls: RasterControls): readonly RasterPassName[] => ['shadow', 'raster', 'presentation']),
     encode: vi.fn<RasterRenderer['encode']>(() => stats),
     // Once created, the raster owns the geometry and the borrowed-resource effect.
@@ -215,7 +215,8 @@ describe('imported progressive GI CPU orchestration', () => {
     renderer.submitted(8); expect(h.effect.submitted).toHaveBeenCalledOnce(); expect(h.geometry.submitted).toHaveBeenCalledOnce();
     renderer.encode({} as GPUCommandEncoder, {} as GPUTextureView, 8, 8, 0);
     expect(h.raster.encode.mock.calls.at(-1)![5]).toMatchObject({ cameraCut: false, temporal: false });
-    renderer.cancelFrame(); expect(h.effect.cancelFrame).toHaveBeenCalledOnce(); expect(h.geometry.cancelFrame).toHaveBeenCalledOnce();
+    renderer.cancelFrame();
+    expect(h.raster.invalidateShadowCache).toHaveBeenCalled(); expect(h.effect.cancelFrame).toHaveBeenCalledOnce(); expect(h.geometry.cancelFrame).toHaveBeenCalledOnce();
     renderer.encode({} as GPUCommandEncoder, {} as GPUTextureView, 8, 8, 0);
     expect(h.raster.encode.mock.calls.at(-1)![5]).toMatchObject({ cameraCut: true, temporal: false });
     h.raster.encode.mockImplementationOnce(() => { throw Error('encode failure'); });
