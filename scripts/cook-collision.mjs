@@ -1,10 +1,11 @@
+import {gzipSync} from 'node:zlib';
 import {parseArgs} from 'node:util';
 import {readFile,writeFile,mkdir,realpath,stat} from 'node:fs/promises';
 import {resolve,dirname,relative,isAbsolute,sep} from 'node:path';
 import {createHash} from 'node:crypto';
 import {cookStaticCollision} from '../packages/core/dist/gameplay.js';
-const {values}=parseArgs({options:{input:{type:'string'},output:{type:'string'},'include-material':{type:'string'}}});
-if(!values.input||!values.output)throw Error('Use --input static.gltf --output NEW_EXTERNAL_DIRECTORY [--include-material REGEXP]');
+const {values}=parseArgs({options:{gzip:{type:'boolean',default:false},input:{type:'string'},output:{type:'string'},'include-material':{type:'string'}}});
+if(!values.input||!values.output)throw Error('Use --input static.gltf --output NEW_EXTERNAL_DIRECTORY [--include-material REGEXP] [--gzip]');
 const root=await realpath(resolve(import.meta.dirname,'..')),input=await realpath(values.input),output=resolve(values.output);
 await mkdir(dirname(output),{recursive:true});const parent=await realpath(dirname(output)),rel=relative(root,parent);
 if(rel===''||(!isAbsolute(rel)&&rel!=='..'&&!rel.startsWith('..'+sep)))throw Error('Collision output must be external.');
@@ -30,6 +31,8 @@ function visit(id,parent){if(visited.has(id))throw Error('Repeated/cyclic scene 
  for(const child of n.children??[])visit(child,matrix);}
 for(const id of doc.scenes[doc.scene??0].nodes)visit(id,identity());
 await mkdir(output);const started=performance.now();const cooked=await cookStaticCollision({positions:new Float32Array(positions),indices:new Uint32Array(indices)});
-await writeFile(resolve(output,'world.bin'),cooked.snapshot);
-const manifest={version:cooked.version,backend:cooked.backend,triangles:cooked.triangles,snapshotBytes:cooked.snapshot.byteLength,sha256:createHash('sha256').update(cooked.snapshot).digest('hex'),sourceSha256:createHash('sha256').update(docBytes).digest('hex'),bufferHashes,units:'source glTF units; Y up; node world transforms applied',materials:[...materials],excludedPrimitives:excluded,degenerateTriangles:degenerate,sourceBytes,cookMilliseconds:performance.now()-started};
+const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
+let transport;
+if(values.gzip){const encoded=gzipSync(cooked.snapshot,{level:9});if(encoded.byteLength>256*1024*1024)throw Error('Encoded collision exceeds 256 MiB.');transport={encoding:'gzip',file:'world.bin.gz',bytes:encoded.byteLength,sha256:sha(encoded),decodedBytes:cooked.snapshot.byteLength,decodedSha256:sha(cooked.snapshot)};await writeFile(resolve(output,transport.file),encoded);}else await writeFile(resolve(output,'world.bin'),cooked.snapshot);
+const manifest={...(transport?{transport}:{}),version:cooked.version,backend:cooked.backend,triangles:cooked.triangles,snapshotBytes:cooked.snapshot.byteLength,sha256:createHash('sha256').update(cooked.snapshot).digest('hex'),sourceSha256:createHash('sha256').update(docBytes).digest('hex'),bufferHashes,units:'source glTF units; Y up; node world transforms applied',materials:[...materials],excludedPrimitives:excluded,degenerateTriangles:degenerate,sourceBytes,cookMilliseconds:performance.now()-started};
 await writeFile(resolve(output,'collision.json'),JSON.stringify(manifest,null,2));console.log(JSON.stringify(manifest));

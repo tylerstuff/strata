@@ -1,5 +1,5 @@
 import {createEngine,createMeshAsset} from '/packages/core/dist/index.js';
-import {createCharacterController,cookStaticCollision,createCapsuleController} from '/packages/core/dist/gameplay.js';
+import {createCharacterController,cookStaticCollision,createCapsuleController,decodeCollisionSnapshot} from '/packages/core/dist/gameplay.js';
 import {mesh,cube,material} from './geometry.js';
 const canvas=document.querySelector('canvas'),stats=document.querySelector('#stats'),keys=new Set();
 const boxes=[
@@ -27,7 +27,7 @@ const courseMeshes=boxes.map((b,i)=>boxMesh('course '+i,b.min,b.max,i===0?0:i>2?
 const asset=createMeshAsset({meshes:[...courseMeshes,...parts.map(p=>boxMesh(p.name,p.min,p.max,p.color))],materials:[
  material('stone',[.24,.31,.35]),material('walls',[.15,.3,.4]),material('steps',[.65,.32,.1]),material('jacket',[.08,.48,.68]),material('skin',[.65,.4,.24]),material('trousers',[.09,.13,.2])
 ]});
-if(capsuleMode){const positions=[],indices=[];for(const m of courseMeshes){const base=positions.length/3;for(let i=0;i<m.vertices.length;i+=16)positions.push(...m.vertices.slice(i,i+3));indices.push(...m.indices.map(i=>i+base));}const collision=await cookStaticCollision({positions:new Float32Array(positions),indices:new Uint32Array(indices)});controller=await createCapsuleController({collision,position:spawn});}else controller=createCharacterController({boxes,position:spawn});
+if(capsuleMode){const positions=[],indices=[];for(const m of courseMeshes){const base=positions.length/3;for(let i=0;i<m.vertices.length;i+=16)positions.push(...m.vertices.slice(i,i+3));indices.push(...m.indices.map(i=>i+base));}let collision=await cookStaticCollision({positions:new Float32Array(positions),indices:new Uint32Array(indices)});if(new URLSearchParams(location.search).has('gzip')){const raw=collision.snapshot;const encoded=new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());const hash=async b=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',b))].map(v=>v.toString(16).padStart(2,'0')).join('');collision={...collision,snapshot:await decodeCollisionSnapshot(encoded,{encoding:'gzip',bytes:encoded.length,sha256:await hash(encoded),decodedBytes:raw.length,decodedSha256:await hash(raw)})};}controller=await createCapsuleController({collision,position:spawn});}else controller=createCharacterController({boxes,position:spawn});
 const transforms=new Float32Array(asset.rig.nodes.length*16);for(let i=0;i<asset.rig.nodes.length;i++)transforms.set(identity(),i*16);
 let engine,frame,last,paused=false,override=null,yaw=0,cut=true,disposed=false,metrics;
 const reset=()=>{controller.teleport(spawn);last=undefined;keys.clear();cut=true;};
